@@ -1,0 +1,13 @@
+-- ADR-0012 (Slice 7), symbol-level anchoring. ONE additive column on MemoryNote:
+-- `symbols` holds the note's `<module>#<name>` symbol-anchor ids (Json string[]),
+-- defaulted to [] centrally via lib/db.ts $extends (SQLite can't express a Json
+-- default), exactly like `modules`/`topics`. A symbol-anchored note is ALWAYS
+-- also module-anchored (the module is auto-derived from each id prefix at ingest),
+-- so this refines the module anchor rather than adding a new recall axis. The
+-- `{kind:"symbol"}` MemoryAnchor rows need NO schema change, `kind` is free-form
+-- (precedent: MemoryEdge.kind's `related`/`proposes_supersede` additions).
+--
+-- Inert if unused (an empty array, like an empty `modules`); the graph Symbol node
+-- + ABOUT_SYMBOL edge + scalar `n.symbols` are all rebuildable from this column by
+-- projectLedgerToGraph, so a `.lbug` wipe restores every symbol anchor.
+ALTER TABLE "MemoryNote" ADD COLUMN "symbols" JSONB NOT NULL DEFAULT '[]';

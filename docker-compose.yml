@@ -1,0 +1,69 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: muon
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - muon_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d muon"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - muon_redis:/data
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    environment:
+      PORT: 4000
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/muon
+      REDIS_URL: redis://redis:6379
+      FRONTEND_ORIGIN: http://localhost:3050
+      MUON_GRAPH_DIR: /data/graph
+      MUON_API_TOKEN: local-dev-token-min-8-chars
+      NODE_ENV: production
+    volumes:
+      - muon_graph:/data
+    ports:
+      - "4000:4000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  frontend:
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_MUON_API_BASE: http://localhost:4000
+        MUON_API_BASE: http://backend:4000
+    environment:
+      NEXT_PUBLIC_MUON_API_BASE: http://localhost:4000
+      MUON_API_BASE: http://backend:4000
+      MUON_API_TOKEN: local-dev-token-min-8-chars
+      NODE_ENV: production
+      PORT: "3050"
+    ports:
+      - "3050:3050"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  muon_db:
+  muon_redis:
+  muon_graph:

@@ -1,0 +1,245 @@
+{
+  "name": "@muon/client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./paths": {
+      "types": "./dist/paths.d.ts",
+      "import": "./dist/paths.js",
+      "default": "./dist/paths.js"
+    },
+    "./ensure-brain": {
+      "types": "./dist/ensure-brain.d.ts",
+      "import": "./dist/ensure-brain.js",
+      "default": "./dist/ensure-brain.js"
+    },
+    "./onboarding": {
+      "types": "./dist/onboarding.d.ts",
+      "import": "./dist/onboarding.js",
+      "default": "./dist/onboarding.js"
+    },
+    "./preedit-view": {
+      "types": "./dist/preedit-view.d.ts",
+      "import": "./dist/preedit-view.js",
+      "default": "./dist/preedit-view.js"
+    },
+    "./refusal": {
+      "types": "./dist/refusal.d.ts",
+      "import": "./dist/refusal.js",
+      "default": "./dist/refusal.js"
+    },
+    "./convergence-preflight": {
+      "types": "./dist/convergence-preflight.d.ts",
+      "import": "./dist/convergence-preflight.js",
+      "default": "./dist/convergence-preflight.js"
+    },
+    "./capability-preflight": {
+      "types": "./dist/capability-preflight.d.ts",
+      "import": "./dist/capability-preflight.js",
+      "default": "./dist/capability-preflight.js"
+    },
+    "./agent-preedit-context": {
+      "types": "./dist/agent-preedit-context.d.ts",
+      "import": "./dist/agent-preedit-context.js",
+      "default": "./dist/agent-preedit-context.js"
+    },
+    "./approval-review": {
+      "types": "./dist/approval-review.d.ts",
+      "import": "./dist/approval-review.js",
+      "default": "./dist/approval-review.js"
+    },
+    "./approvable-inbox": {
+      "types": "./dist/approvable-inbox.d.ts",
+      "import": "./dist/approvable-inbox.js",
+      "default": "./dist/approvable-inbox.js"
+    },
+    "./autonomy-commitments": {
+      "types": "./dist/autonomy-commitments.d.ts",
+      "import": "./dist/autonomy-commitments.js",
+      "default": "./dist/autonomy-commitments.js"
+    },
+    "./session-governance": {
+      "types": "./dist/session-governance.d.ts",
+      "import": "./dist/session-governance.js",
+      "default": "./dist/session-governance.js"
+    },
+    "./memory-library": {
+      "types": "./dist/memory-library.d.ts",
+      "import": "./dist/memory-library.js",
+      "default": "./dist/memory-library.js"
+    },
+    "./memory-tier": {
+      "types": "./dist/memory-tier.d.ts",
+      "import": "./dist/memory-tier.js",
+      "default": "./dist/memory-tier.js"
+    },
+    "./audit-trail": {
+      "types": "./dist/audit-trail.d.ts",
+      "import": "./dist/audit-trail.js",
+      "default": "./dist/audit-trail.js"
+    },
+    "./dispatch-view": {
+      "types": "./dist/dispatch-view.d.ts",
+      "import": "./dist/dispatch-view.js",
+      "default": "./dist/dispatch-view.js"
+    },
+    "./mission-root": {
+      "types": "./dist/mission-root.d.ts",
+      "import": "./dist/mission-root.js",
+      "default": "./dist/mission-root.js"
+    },
+    "./crew-liveness": {
+      "types": "./dist/crew-liveness.d.ts",
+      "import": "./dist/crew-liveness.js",
+      "default": "./dist/crew-liveness.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js",
+      "default": "./dist/types.js"
+    },
+    "./budget-view": {
+      "types": "./dist/budget-view.d.ts",
+      "import": "./dist/budget-view.js",
+      "default": "./dist/budget-view.js"
+    },
+    "./loop-status": {
+      "types": "./dist/loop-status.d.ts",
+      "import": "./dist/loop-status.js",
+      "default": "./dist/loop-status.js"
+    },
+    "./repo-map": {
+      "types": "./dist/repo-map.d.ts",
+      "import": "./dist/repo-map.js",
+      "default": "./dist/repo-map.js"
+    },
+    "./diff-impact": {
+      "types": "./dist/diff-impact.d.ts",
+      "import": "./dist/diff-impact.js",
+      "default": "./dist/diff-impact.js"
+    },
+    "./data-boundaries": {
+      "types": "./dist/data-boundaries.d.ts",
+      "import": "./dist/data-boundaries.js",
+      "default": "./dist/data-boundaries.js"
+    },
+    "./flow-scope": {
+      "types": "./dist/flow-scope.d.ts",
+      "import": "./dist/flow-scope.js",
+      "default": "./dist/flow-scope.js"
+    },
+    "./gitnexus-index-lock": {
+      "types": "./dist/gitnexus-index-lock.d.ts",
+      "import": "./dist/gitnexus-index-lock.js",
+      "default": "./dist/gitnexus-index-lock.js"
+    },
+    "./vendors": {
+      "types": "./dist/vendors.d.ts",
+      "import": "./dist/vendors.js",
+      "default": "./dist/vendors.js"
+    },
+    "./mcp-drift": {
+      "types": "./dist/mcp-drift.d.ts",
+      "import": "./dist/mcp-drift.js",
+      "default": "./dist/mcp-drift.js"
+    },
+    "./mcp-status": {
+      "types": "./dist/mcp-status.d.ts",
+      "import": "./dist/mcp-status.js",
+      "default": "./dist/mcp-status.js"
+    },
+    "./mcp-probe": {
+      "types": "./dist/mcp-probe.d.ts",
+      "import": "./dist/mcp-probe.js",
+      "default": "./dist/mcp-probe.js"
+    },
+    "./handoff-view": {
+      "types": "./dist/handoff-view.d.ts",
+      "import": "./dist/handoff-view.js",
+      "default": "./dist/handoff-view.js"
+    },
+    "./mcp-vendor-config": {
+      "types": "./dist/mcp-vendor-config.d.ts",
+      "import": "./dist/mcp-vendor-config.js",
+      "default": "./dist/mcp-vendor-config.js"
+    },
+    "./attached-coordinator-capability": {
+      "types": "./dist/attached-coordinator-capability.d.ts",
+      "import": "./dist/attached-coordinator-capability.js",
+      "default": "./dist/attached-coordinator-capability.js"
+    },
+    "./attached-coordinator-flow": {
+      "types": "./dist/attached-coordinator-flow.d.ts",
+      "import": "./dist/attached-coordinator-flow.js",
+      "default": "./dist/attached-coordinator-flow.js"
+    },
+    "./mcp-sdk": {
+      "types": "./dist/mcp-sdk.d.ts",
+      "import": "./dist/mcp-sdk.js",
+      "default": "./dist/mcp-sdk.js"
+    },
+    "./detection-manifest": {
+      "types": "./dist/detection-manifest.d.ts",
+      "import": "./dist/detection-manifest.js",
+      "default": "./dist/detection-manifest.js"
+    },
+    "./terminal-vendor-tabs": {
+      "types": "./dist/terminal-vendor-tabs.d.ts",
+      "import": "./dist/terminal-vendor-tabs.js",
+      "default": "./dist/terminal-vendor-tabs.js"
+    },
+    "./memory-decision": {
+      "types": "./dist/memory-decision.d.ts",
+      "import": "./dist/memory-decision.js",
+      "default": "./dist/memory-decision.js"
+    },
+    "./nav-destinations": {
+      "types": "./dist/nav-destinations.d.ts",
+      "import": "./dist/nav-destinations.js",
+      "default": "./dist/nav-destinations.js"
+    },
+    "./cost-cap": {
+      "types": "./dist/cost-cap.d.ts",
+      "import": "./dist/cost-cap.js",
+      "default": "./dist/cost-cap.js"
+    },
+    "./mcp-probe-spawn": {
+      "types": "./dist/mcp-probe-spawn.d.ts",
+      "import": "./dist/mcp-probe-spawn.js",
+      "default": "./dist/mcp-probe-spawn.js"
+    },
+    "./enrolment": {
+      "types": "./dist/enrolment.d.ts",
+      "import": "./dist/enrolment.js",
+      "default": "./dist/enrolment.js"
+    },
+    "./ledger-profile": {
+      "types": "./dist/ledger-profile.d.ts",
+      "import": "./dist/ledger-profile.js",
+      "default": "./dist/ledger-profile.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@muon/protocol": "file:../protocol",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

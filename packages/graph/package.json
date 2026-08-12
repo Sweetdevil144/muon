@@ -1,0 +1,32 @@
+{
+  "name": "@muon/graph",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "eval:graph-value": "npm run build && node dist/graph-value-eval.js",
+    "eval:activity": "npm run build && node dist/activity-eval.js"
+  },
+  "dependencies": {
+    "@ladybugdb/core": "^0.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "allowScripts": {
+    "@ladybugdb/core@0.17.1": true
+  }
+}

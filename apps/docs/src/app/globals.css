@@ -1,0 +1,553 @@
+/* MUON docs — the SAME Bauhaus system as getmuon.com (src/app/globals.css):
+   paper #f2efe6 / ink #11110f, blue-red-yellow accents, 48px grid fields,
+   2px ink borders, hard offset shadows, 900-weight uppercase eyebrows, Geist
+   Sans + Geist Mono. Hand-rolled (this app deliberately carries no Tailwind);
+   values are copied from the marketing stylesheet, not approximated. */
+
+:root {
+  --bauhaus-paper: #f2efe6;
+  --bauhaus-ink: #11110f;
+  --bauhaus-blue: #2146d0;
+  --bauhaus-red: #e43d2f;
+  --bauhaus-yellow: #f4c928;
+  --terminal-ink: #141414;
+  --terminal-text: #e8e8e8;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--bauhaus-paper);
+  color: var(--bauhaus-ink);
+  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--bauhaus-yellow);
+  color: var(--bauhaus-ink);
+}
+
+:focus-visible {
+  outline: 3px solid var(--bauhaus-blue);
+  outline-offset: 4px;
+}
+
+/* ── Grid field (the marketing site's .bauhaus-grid, verbatim) ─────────── */
+.bauhaus-grid {
+  background-color: var(--bauhaus-paper);
+  background-image:
+    linear-gradient(rgba(17, 17, 15, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(17, 17, 15, 0.08) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+/* ── Top bar: sticky, 2px ink rule, blurred paper — marketing-nav's shell ── */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  border-bottom: 2px solid var(--bauhaus-ink);
+  background: rgba(242, 239, 230, 0.94);
+  backdrop-filter: blur(24px);
+}
+
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  max-width: 80rem;
+  height: 4.75rem;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--bauhaus-ink);
+  text-decoration: none;
+}
+
+.brand img {
+  width: 2.25rem;
+  height: 2.25rem;
+}
+
+.brand-name {
+  font-size: 0.875rem;
+  font-weight: 900;
+  letter-spacing: 0.18em;
+}
+
+.brand-tag {
+  border: 2px solid var(--bauhaus-ink);
+  background: var(--bauhaus-yellow);
+  padding: 0.2rem 0.45rem;
+  font-size: 0.62rem;
+  font-weight: 900;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+/* ── Nav links: the marketing .bauhaus-nav-link contract, verbatim ───────── */
+.bauhaus-nav-link {
+  display: inline-block;
+  border: 2px solid transparent;
+  padding: 0.65rem 0.8rem;
+  color: var(--bauhaus-ink);
+  font-size: 0.76rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-decoration: none;
+  text-transform: uppercase;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease;
+}
+
+.bauhaus-nav-link:hover,
+.bauhaus-nav-link:focus-visible,
+.bauhaus-nav-link[aria-current="page"] {
+  border-color: var(--bauhaus-ink);
+  background: white;
+}
+
+/* ── Shell: sidebar + content ────────────────────────────────────────────── */
+.shell {
+  display: grid;
+  grid-template-columns: 16rem minmax(0, 1fr);
+  max-width: 80rem;
+  margin: 0 auto;
+  min-height: calc(100vh - 4.75rem);
+}
+
+.sidebar {
+  border-right: 2px solid var(--bauhaus-ink);
+  padding: 2rem 1.25rem 2rem 1.5rem;
+}
+
+.nav-group-label {
+  margin-bottom: 0.75rem;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: rgba(17, 17, 15, 0.5);
+}
+
+.nav-list {
+  display: grid;
+  gap: 0.2rem;
+  list-style: none;
+}
+
+.nav-list .bauhaus-nav-link {
+  display: block;
+}
+
+.sidebar-footer {
+  margin-top: 2.5rem;
+  border-top: 2px solid var(--bauhaus-ink);
+  padding-top: 1rem;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  color: rgba(17, 17, 15, 0.6);
+}
+
+.sidebar-footer a {
+  color: var(--bauhaus-ink);
+  font-weight: 900;
+  text-decoration: none;
+  border-bottom: 3px solid var(--bauhaus-red);
+}
+
+.content {
+  min-width: 0;
+}
+
+.page {
+  max-width: 46rem;
+  padding: 0 2.5rem 5rem;
+}
+
+/* ── Page intro: eyebrow + giant black uppercase title on the grid field ─── */
+.eyebrow {
+  padding-top: 3rem;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--bauhaus-red);
+}
+
+.page > h1 {
+  margin-top: 1.25rem;
+  font-size: clamp(2.4rem, 5vw, 3.6rem);
+  font-weight: 900;
+  letter-spacing: -0.045em;
+  line-height: 0.95;
+  text-transform: uppercase;
+  text-wrap: balance;
+}
+
+.lead {
+  margin-top: 1.5rem;
+  padding-bottom: 2.25rem;
+  border-bottom: 2px solid var(--bauhaus-ink);
+  font-size: 1.1rem;
+  line-height: 1.8;
+  color: rgba(0, 0, 0, 0.65);
+}
+
+/* ── Sections ────────────────────────────────────────────────────────────── */
+.page h2 {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 3rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 2px solid var(--bauhaus-ink);
+  font-size: 1.05rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.page h2::before {
+  content: "";
+  width: 0.7rem;
+  height: 0.7rem;
+  flex: 0 0 auto;
+  background: var(--bauhaus-yellow);
+  border: 2px solid var(--bauhaus-ink);
+}
+
+.page h3 {
+  margin-top: 2rem;
+  font-size: 0.92rem;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.page p {
+  margin-top: 1rem;
+}
+
+.page ul,
+.page ol {
+  margin-top: 1rem;
+  padding-left: 1.4rem;
+}
+
+.page li {
+  margin-top: 0.45rem;
+}
+
+.page a {
+  color: var(--bauhaus-ink);
+  font-weight: 700;
+  text-decoration: none;
+  border-bottom: 3px solid var(--bauhaus-red);
+  transition: background-color 160ms ease;
+}
+
+.page a:hover,
+.page a:focus-visible {
+  background: var(--bauhaus-yellow);
+}
+
+.page strong {
+  font-weight: 900;
+}
+
+/* ── Code: the dark terminal panel (presence-stage idiom) ────────────────── */
+.page pre {
+  overflow-x: auto;
+  margin-top: 1.25rem;
+  border: 2px solid var(--bauhaus-ink);
+  background: var(--terminal-ink);
+  color: var(--terminal-text);
+  padding: 1rem 1.25rem;
+  box-shadow: 6px 6px 0 var(--bauhaus-ink);
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.82rem;
+  line-height: 1.7;
+}
+
+.page pre code {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+}
+
+.page code {
+  border: 1px solid rgba(17, 17, 15, 0.35);
+  background: white;
+  padding: 0.1rem 0.35rem;
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.82em;
+}
+
+/* ── Link cards (overview grid): white panels, ink borders, hard shadows ── */
+.link-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+.link-card {
+  display: grid;
+  gap: 0.5rem;
+  border: 2px solid var(--bauhaus-ink);
+  background: white;
+  padding: 1.1rem 1.2rem;
+  color: var(--bauhaus-ink);
+  text-decoration: none;
+  transition:
+    box-shadow 160ms ease,
+    transform 160ms ease;
+}
+
+.link-card:hover,
+.link-card:focus-visible {
+  box-shadow: 6px 6px 0 var(--bauhaus-ink);
+  transform: translate(-2px, -2px);
+}
+
+.link-title {
+  font-size: 0.82rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.link-desc {
+  font-size: 0.88rem;
+  line-height: 1.55;
+  color: rgba(0, 0, 0, 0.65);
+}
+
+.link-desc code {
+  font-size: 0.8em;
+}
+
+/* ── Callouts: ink-bordered blocks with a colored band ───────────────────── */
+.callout {
+  margin-top: 1.5rem;
+  border: 2px solid var(--bauhaus-ink);
+  border-left: 10px solid var(--bauhaus-blue);
+  background: white;
+  padding: 1rem 1.25rem;
+}
+
+.callout.warn {
+  border-left-color: var(--bauhaus-red);
+}
+
+.callout.limit {
+  border-left-color: var(--bauhaus-yellow);
+}
+
+.callout-title {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.callout p {
+  margin-top: 0.35rem;
+}
+
+/* ── Step lists: numbered squares in the yellow/ink idiom ────────────────── */
+.step-list {
+  margin-top: 1.25rem;
+  padding-left: 0;
+  list-style: none;
+  counter-reset: step;
+  display: grid;
+  gap: 0.85rem;
+}
+
+.step-list > li {
+  position: relative;
+  margin-top: 0;
+  padding: 0.15rem 0 0.15rem 3rem;
+  counter-increment: step;
+  min-height: 2.1rem;
+}
+
+.step-list > li::before {
+  content: counter(step, decimal-leading-zero);
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: grid;
+  place-items: center;
+  width: 2.1rem;
+  height: 2.1rem;
+  border: 2px solid var(--bauhaus-ink);
+  background: var(--bauhaus-yellow);
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+}
+
+/* ── Tables ──────────────────────────────────────────────────────────────── */
+.page table {
+  width: 100%;
+  margin-top: 1.5rem;
+  border: 2px solid var(--bauhaus-ink);
+  border-collapse: collapse;
+  background: white;
+  font-size: 0.9rem;
+}
+
+.page th {
+  border-bottom: 2px solid var(--bauhaus-ink);
+  background: var(--bauhaus-yellow);
+  padding: 0.6rem 0.8rem;
+  text-align: left;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.page td {
+  border-bottom: 1px solid rgba(17, 17, 15, 0.2);
+  padding: 0.6rem 0.8rem;
+  vertical-align: top;
+}
+
+.page tr:last-child td {
+  border-bottom: 0;
+}
+
+/* ── Prev/next footer nav ────────────────────────────────────────────────── */
+.page-footer-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 3.5rem;
+  border-top: 2px solid var(--bauhaus-ink);
+  padding-top: 1.25rem;
+}
+
+.page-footer-nav a {
+  border-bottom: 0;
+  border: 2px solid transparent;
+  padding: 0.65rem 0.8rem;
+  font-size: 0.76rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease;
+}
+
+.page-footer-nav a:hover,
+.page-footer-nav a:focus-visible {
+  border-color: var(--bauhaus-ink);
+  background: white;
+}
+
+/* ── Site footer: ink field, white text (marketing-footer idiom) ─────────── */
+.site-footer {
+  border-top: 2px solid var(--bauhaus-ink);
+  background: var(--bauhaus-ink);
+  color: white;
+}
+
+.site-footer-inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  max-width: 80rem;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem;
+}
+
+.site-footer p {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.site-footer a {
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-decoration: none;
+  text-transform: uppercase;
+}
+
+.site-footer a:hover {
+  color: white;
+}
+
+/* ── Responsive ──────────────────────────────────────────────────────────── */
+@media (max-width: 860px) {
+  .shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 2px solid var(--bauhaus-ink);
+    padding: 1rem 1.5rem;
+  }
+
+  .nav-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.2rem;
+  }
+
+  .sidebar-footer {
+    display: none;
+  }
+
+  .page {
+    padding: 0 1.5rem 4rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
+  }
+}

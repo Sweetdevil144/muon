@@ -1,0 +1,11 @@
+**/node_modules
+**/dist
+.next
+coverage
+.git
+.gitignore
+*.log
+.env
+.env.local
+.muon
+**/.env

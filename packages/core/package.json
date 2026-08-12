@@ -1,0 +1,35 @@
+{
+  "name": "@muon/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./port-association": {
+      "types": "./dist/port-association.d.ts",
+      "import": "./dist/port-association.js",
+      "default": "./dist/port-association.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@muon/adapters": "file:../adapters",
+    "@muon/client": "file:../client",
+    "@muon/protocol": "file:../protocol"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

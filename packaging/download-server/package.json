@@ -1,0 +1,15 @@
+{
+  "name": "muon-download-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Static release-artifact host for download.getmuon.com (Railway service + volume)",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

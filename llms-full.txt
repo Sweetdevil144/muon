@@ -1,0 +1,106 @@
+# MUON — full overview for LLM consumption
+
+> MUON is a local-first, governed multi-agent orchestrator for third-party
+> coding-agent CLIs. This is the expanded companion to `llms.txt`: enough
+> inline context to reason about MUON without crawling the repository.
+
+## What MUON is
+
+MUON runs a **crew** of vendor coding agents (Claude Code, Codex, Cursor,
+OpenCode, and a growing long tail via the Agent Client Protocol) under one
+governance model, on the operator's machine, against the operator's own
+vendor logins. It is a control plane, not an agent: vendors keep their own
+loops, models, and credentials.
+
+The product stance (docs/design/agents-as-a-company.md) is that N concurrent
+agents are not a crew — a crew is mutually aware in ways that change behavior.
+Every feature is ranked against seven acceptance tests, including: a
+reviewer's finding reaches the implementer without a human relay; two agents
+about to touch the same symbol discover each other first; "has anyone here
+tried this?" is answerable from the current mission; finished work lands in
+one human action; the human inbox contains only what genuinely needs a person.
+
+## The authority model (what an agent may assume)
+
+- **Human gates fail closed.** Un-preauthorized tool calls become approval
+  requests; a timeout is a denial. Nothing auto-approves because a schedule or
+  an external event fired.
+- **Roles carry ceilings.** A 7-role taxonomy (orchestrator, architect,
+  implementer, reviewer, qa, scout, docs) over coordinate/write/read-only
+  authority tiers; an unknown tool is never assumed safe for a read-only role.
+- **Agent-authored text is data, never authority.** Peer messages, briefs, and
+  handoff prose never enter an approval gate's evidence chain as authority.
+- **Isolation is structural.** Governed edits happen in per-task git
+  worktrees; merges pass a review-certified, content-bound approval gate.
+- **Delegation is capped.** Depth, child-count, total-descendant, iteration,
+  and wall-clock budgets ride a signed manifest; a child cannot widen them.
+- **BYO-auth.** MUON never custodies, copies, or proxies vendor credentials.
+
+## Memory (the shared brain)
+
+One durable SQLite ledger, projected into an embedded graph (LadybugDB),
+holding typed notes (`decision | constraint | convention | attempt |
+question`) with provenance, supersession, contradiction, confirm/reject, and
+bitemporal validity. Retrieval is flat (RRF fusion of lexical, full-text,
+entity, and optional loopback-only dense arms) — graph structure explains and
+expands results but never ranks them (ADR-0021).
+
+Trust tiers are load-bearing: only the latest **human** confirmation makes a
+note eligible for the pre-edit gate; an orchestrator vouch makes it
+crew-visible within its own chat; everything else is reachable only by
+explicit recall, labelled. Memory is partitioned per repository
+(**workspace**, ADR-0026): the partition is derived from authenticated state,
+never from a caller's claim, and applies inside every candidate query.
+
+Push channels: every dispatch brief carries a memory slice (top-k vouched
+notes) and the workspace's **standing memory** — human-confirmed constraints
+and conventions that ride unconditionally under a character budget, because
+no query retrieves the facts nobody thinks to ask for.
+
+`preflight_edit` fuses the code graph's blast radius with governed memory at
+the edit boundary — impact, prior decisions, live sibling activity, and
+coverage telemetry in one read.
+
+## The MCP server (`muon-mcp`)
+
+See docs/mcp-server-card.md for the full card. Summary: a stdio MCP server
+whose tool inventory is tiered by session authority:
+
+- **Context** (19 tools): memory_search, memory_recall, memory_neighbors,
+  memory_explain, memory_delete, memory_clone, memory_add, memory_preedit,
+  preflight_edit, task_context, handoff_read, code_query, code_context,
+  code_impact, repo_map, review_diff, data_boundaries, flow_scope,
+  capability_preflight.
+- **Coordination** (5 tools, every worker): peer_message, peer_inbox,
+  claim_files, release_files, crew_roles. Mission-bounded; no authority — a
+  peer message cannot approve or dispatch, file claims are advisory.
+- **Control** (17 tools, coordinator only): assign_roles, fleet_status,
+  set_fleet, create_task, list_tasks, dispatch, read_stream, dispatch_status,
+  budget_status, raise_budget, steer, interrupt, propose_workflow,
+  apply_workflow, workflow_status, ship, check_approval.
+- **Delegate** (1 tool): delegate — governed sub-dispatch under the parent's
+  capped manifest.
+
+Session identity is declared, not inferred: `MUON_MCP_MODE` is
+`worker`/`orchestrator`/`delegate` for MUON-spawned sessions; an ABSENT mode
+means a human attached this session by hand (`muon mcp install` deliberately
+writes no mode, no token, and no API base).
+
+## Repository layout
+
+- `backend/` — Fastify API + Prisma/SQLite ledger + graph projection.
+- `packages/protocol` — shared types, vendor registry, capability schemas.
+- `packages/adapters` — per-vendor CLI adapters, profile compilers, guards.
+- `packages/core` — session manager, approval bridge, memory slice, capture.
+- `packages/runner` — the dispatch executor (worktrees, budgets, handoffs).
+- `packages/graph` — the memory graph store and retrieval.
+- `packages/mcp` — the muon-mcp server.
+- `apps/cli`, `apps/desktop`, `apps/tui` — the operator surfaces.
+- `docs/` — canon; precedence order in docs/README.md.
+
+## Reading order for agents
+
+1. docs/README.md (precedence), then docs/progress.md (what is real).
+2. docs/design/agents-as-a-company.md (what the product is for).
+3. The ADRs touching your task area (docs/adr/).
+4. TODO.md is a queue, never a record — trust progress.md over it.

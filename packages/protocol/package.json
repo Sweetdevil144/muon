@@ -1,0 +1,46 @@
+{
+  "name": "@muon/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./compatibility-digest": {
+      "types": "./dist/compatibility-digest.d.ts",
+      "import": "./dist/compatibility-digest.js",
+      "default": "./dist/compatibility-digest.js"
+    },
+    "./project-setup": {
+      "types": "./dist/project-setup.d.ts",
+      "import": "./dist/project-setup.js",
+      "default": "./dist/project-setup.js"
+    },
+    "./refusal": {
+      "types": "./dist/refusal.d.ts",
+      "import": "./dist/refusal.js",
+      "default": "./dist/refusal.js"
+    },
+    "./detection-manifest": {
+      "types": "./dist/detection-manifest.d.ts",
+      "import": "./dist/detection-manifest.js",
+      "default": "./dist/detection-manifest.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2"
+  }
+}

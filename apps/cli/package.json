@@ -1,0 +1,33 @@
+{
+  "name": "@muon/cli",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "muon": "dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@muon/adapters": "file:../../packages/adapters",
+    "@muon/client": "file:../../packages/client",
+    "@muon/core": "file:../../packages/core",
+    "@muon/orchestrator": "file:../../packages/orchestrator",
+    "@muon/protocol": "file:../../packages/protocol",
+    "@muon/runner": "file:../../packages/runner",
+    "commander": "^14.0.1",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

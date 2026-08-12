@@ -1,0 +1,49 @@
+-- D1 (docs/design/memory-index-decisions.md §D1, option B): an anchor records
+-- whether its COORDINATE named a real file.
+--
+-- An anchor value used to be whatever the caller typed, and nothing checked it.
+-- Measured on the founder's own brain: three of six live `Symbol` ids are a file's
+-- own basename used as a symbol name, four of nine module anchors are paths that
+-- resolve in no workspace that ledger knows about, and 63 active notes name a
+-- TRACKED repo file in their prose while carrying no module anchor at all. With no
+-- resolution column, a typo and a valid path in another repository are the same
+-- row, so D15's retro-anchoring backfill cannot even be specified.
+--
+-- Depends on `0041_memory_note_workspace` (ADR-0026): the workspace is what a
+-- coordinate resolves AGAINST. §6's sequencing is D3 → D1 → D15/D2.
+--
+-- FOUR states, three named and the fourth being NULL:
+--   'resolved'   — the coordinate is in the workspace's tracked-file set
+--   'unresolved' — we HAVE that set and the coordinate is not in it (an assertion)
+--   'planned'    — an EXPLICIT caller declaration for a file that does not exist yet
+--   NULL         — we could not obtain the tracked set (no workspace on the note,
+--                  not a git repository, `git` missing, timed out), or the anchor
+--                  is not a coordinate at all (task/lane/chat/workspace/topic), or
+--                  the row predates this migration.
+-- `unresolved` is never written when the set could not be read; that would assert
+-- a fact we do not have. The write NEVER fails for an unresolvable coordinate.
+
+-- ── ADDITIVE ONLY, and why each thing this migration does NOT do is deliberate ──
+--
+-- NO BACKFILL. There is nothing honest to backfill from. Resolving an existing
+-- anchor needs its note's workspace (which 0041 only just filled, and only where
+-- two witnesses agreed) AND a `git ls-files` per distinct repo root. `ensureSchema`
+-- runs a migration's statements INSIDE ONE TRANSACTION, so a subprocess-driven
+-- backfill is not expressible here at all, and a statement that can abort takes
+-- the additive column down with it — the exact trap 0041 documented after removing
+-- its own CHECK-constraint guard for bricking startup on an install that had ever
+-- imported a pack. Retro-resolution belongs to D15's dry-runnable one-shot, where
+-- an operator can see the counts before anything is written. NULL means
+-- legacy/unknown, which is the true statement about every pre-0042 row.
+--
+-- NO NOT NULL and no DEFAULT. NULL is a real, load-bearing state (above), not an
+-- absence to be filled. A DEFAULT would make every non-coordinate anchor claim a
+-- resolution it never had.
+--
+-- NO INDEX. The only query that reads this column is the `planned`-declaration
+-- inheritance lookup a clone and a text-edit successor perform
+-- (`WHERE noteId = ? AND resolution = 'planned'`), which the existing
+-- `MemoryAnchor_noteId_idx` already serves. Nothing filters on `resolution`
+-- across notes yet — that is D15 and D4+D6 — and an index justified by a query
+-- nobody has written is an index nobody can remove.
+ALTER TABLE "MemoryAnchor" ADD COLUMN "resolution" TEXT;

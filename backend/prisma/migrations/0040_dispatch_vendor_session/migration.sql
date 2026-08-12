@@ -1,0 +1,13 @@
+-- BACKLINK: the vendor's own session id for a dispatched job's latest
+-- execution (codex rollout id / Claude session uuid) — the handle
+-- `codex resume <id>` / `claude --resume <id>` take, so the human can reopen
+-- the EXACT session MUON dispatched in the vendor's real TUI.
+--
+-- PURELY ADDITIVE, no backfill, no index — the same shape and reasoning as
+-- 0039 (executionPath). NULL means "no resume handle is known", which is
+-- exactly the pre-0040 situation for every existing row, and the id of a
+-- finished pre-0040 job cannot be recovered after the fact (guessing one into
+-- a fact column would be indistinguishable from an observation). The column
+-- is only ever read off already-keyed job fetches, never searched, so an
+-- index would cost writes and buy nothing.
+ALTER TABLE "DispatchJob" ADD COLUMN "vendorSessionId" TEXT;

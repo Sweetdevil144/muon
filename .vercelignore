@@ -1,0 +1,14 @@
+# Vercel builds ONLY the root Next.js marketing site. Everything below is part of
+# the monorepo but is not needed for (and must not influence) the frontend build.
+backend/
+apps/
+packages/
+scripts/
+docs/
+packaging/
+.muon/
+.kiro/
+.github/
+backend.Dockerfile
+Dockerfile
+docker-compose.yml

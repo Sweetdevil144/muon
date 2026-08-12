@@ -1,0 +1,38 @@
+{
+  "name": "muon-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "e2e": "bash ../scripts/e2e-smoke.sh",
+    "prisma:generate": "prisma generate",
+    "prisma:push": "prisma db push",
+    "prisma:migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@fastify/sensible": "^6.0.3",
+    "@muon/adapters": "file:../packages/adapters",
+    "@muon/client": "file:../packages/client",
+    "@muon/codegraph": "file:../packages/codegraph",
+    "@muon/core": "file:../packages/core",
+    "@muon/graph": "file:../packages/graph",
+    "@muon/protocol": "file:../packages/protocol",
+    "@prisma/client": "^6.13.0",
+    "dotenv": "^17.2.1",
+    "fastify": "^5.6.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "prisma": "^6.13.0",
+    "supertest": "^7.1.4",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

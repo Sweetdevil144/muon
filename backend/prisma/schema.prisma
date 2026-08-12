@@ -1,0 +1,1287 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Local-first embedded brain runs on SQLite (per-user data dir, single writer
+// process, see docs/adr/0008-embedded-brain-sqlite.md). Every schema edit that
+// makes SQLite work (dropped `Json @default`s, re-applied in lib/db.ts, and
+// `StreamChunk.seq: Int`) is ALSO Postgres-compatible, so a future hosted
+// "Team/Cloud" build is a single build-time swap of the line below:
+//
+//   provider = "postgresql"
+//
+// and pointing DATABASE_URL at Postgres. No other change to this schema.
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Lane {
+  id          String        @id @default(cuid())
+  key         String        @unique
+  name        String
+  provider    String
+  role        String
+  status      String        @default("available")
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  assignments Assignment[]
+  handoffsOut Handoff[]     @relation("fromLane")
+  handoffsIn  Handoff[]     @relation("toLane")
+  profile     LaneProfile?
+  sessions    LaneSession[]
+}
+
+// Full vendor capability passthrough: validated lane configuration compiled
+// by adapters to native flags/config. See docs/research/vendor-capability-matrix.md
+model LaneProfile {
+  id        String   @id @default(cuid())
+  laneId    String   @unique
+  version   Int      @default(1)
+  config    Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  lane      Lane     @relation(fields: [laneId], references: [id], onDelete: Cascade)
+}
+
+// Interactive lane session (Phase 5): maps a MUON session to the vendor's
+// native session/thread id so work can be resumed or taken over natively.
+model LaneSession {
+  id              String    @id @default(cuid())
+  laneId          String
+  taskId          String
+  // Checkpoint edge (P0.1): the DispatchJob this session executes, written at
+  // session create so job→session is a first-class, indexed join. Plain
+  // column, no FK (matches the Task workflow-linkage precedent).
+  jobId           String?
+  vendorSessionId String?
+  status          String    @default("running")
+  // ADR-0030: one owner at a time. "muon" = automation may act on this
+  // session; "human" = a native take-over holds it (agent steer refuses,
+  // auto-continue skips) until an explicit operator return.
+  owner           String    @default("muon")
+  ownerChangedAt  DateTime?
+  startedAt       DateTime  @default(now())
+  endedAt         DateTime?
+  updatedAt       DateTime  @updatedAt
+  lane            Lane      @relation(fields: [laneId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, startedAt])
+  @@index([jobId])
+}
+
+model Task {
+  id            String            @id @default(cuid())
+  title         String
+  description   String
+  status        String            @default("backlog")
+  priority      String            @default("medium")
+  // Owning orchestrator chat for crew-created work. Null for operator/CLI
+  // tasks that are not part of a conversational mission. This is an authority
+  // partition, not a display hint: job-scoped bearers may only cross from
+  // their exact task to another task when they are the owning orchestrator and
+  // both tasks carry the same chatId.
+  chatId        String?
+  // Workflow linkage (VISION §4): a workflow step IS a task. Null means an
+  // ad-hoc task, which stays first-class forever. Plain columns (no FK) so a
+  // deleted run never cascades into the task ledger.
+  workflowRunId String?
+  stepKey       String?
+  // Target repo folder for dispatch (like opening a folder in an editor).
+  // Null = whatever directory the executing client runs from.
+  workspacePath String?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  assignments   Assignment[]
+  handoffs      Handoff[]
+  approvals     ApprovalRequest[]
+
+  @@index([chatId, createdAt])
+  @@index([workflowRunId])
+}
+
+model Assignment {
+  id          String    @id @default(cuid())
+  taskId      String
+  laneId      String
+  summary     String
+  state       String    @default("queued")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+  lane        Lane      @relation(fields: [laneId], references: [id], onDelete: Cascade)
+  task        Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+}
+
+model Handoff {
+  id          String   @id @default(cuid())
+  taskId      String
+  fromLaneId  String
+  toLaneId    String
+  packetTitle String
+  packetBody  String
+  // Typed v2 handoff packet (P0.3). NULL for every legacy row; validated
+  // against handoffPacketSchema at the route. AGENT-PRODUCED UNTRUSTED DATA:
+  // read only on data-only surfaces (handoff_read under the _muon envelope).
+  packetJson  Json?
+  status      String   @default("pending")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  fromLane    Lane     @relation("fromLane", fields: [fromLaneId], references: [id], onDelete: Cascade)
+  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  toLane      Lane     @relation("toLane", fields: [toLaneId], references: [id], onDelete: Cascade)
+}
+
+// Append-only lane event log. Rows are never updated or deleted, and stay
+// intact even if the referenced task or lane is removed, so no relations.
+model Event {
+  id        String   @id @default(cuid())
+  laneId    String
+  taskId    String
+  kind      String
+  message   String
+  metadata  Json
+  timestamp DateTime @default(now())
+  // TODO 5.15 — enterprise audit columns. Additive + nullable so legacy rows
+  // stay readable; new writers stamp them. Dual-keyed so "which AI acted" and
+  // "which human is accountable" are two columns, not a reconstruction.
+  // `payloadDiff` is a JSON object of before/after (or field patches); never
+  // secrets. `requestId` correlates a decision with the gate/approval/request
+  // that produced it. No FK: Principal rows can be re-derived; Event is
+  // append-only and must not block on a missing principal.
+  principalId             String?
+  principalKind           String? // human | agent
+  accountablePrincipalId  String?
+  requestId               String?
+  payloadDiff             Json?
+
+  @@index([taskId, timestamp])
+  @@index([principalId, timestamp])
+  @@index([requestId])
+}
+
+model ApprovalRequest {
+  id            String    @id @default(cuid())
+  taskId        String
+  requestedBy   String
+  kind          String
+  reason        String
+  status        String    @default("pending")
+  decisionNotes String?
+  // Structured gate binding (ADR-0010 Part B): the exact action+payload tag
+  // (e.g. `[gate:set_fleet claude-code=2,codex=0,cursor=0]`) a route redeems
+  // this gate against, set only for `kind=="gate"`, null for every other
+  // approval. A structured column (not the free-text `reason`) gives the
+  // route an EXACT, atomic `updateMany` match: `reason: { contains: tag }`
+  // compiles to SQL `LIKE %tag%` where `_` is a wildcard, so `set_fleet`
+  // would also match `setXfleet`. `reason` stays human-readable for the inbox.
+  gateTag       String?
+  // Checkpoint edge (P0.1): the DispatchJob whose execution filed this
+  // approval — an AGENT-SUPPLIED binding, corroborated by
+  // `evidence.details.sessionId` → `LaneSession.jobId`. Gives "the exact
+  // pending gate" a durable, indexed job join instead of the soft evidence
+  // lookup. Plain column, no FK.
+  jobId         String?
+  // Single-use gates: once a gated orchestrator action redeems an approved
+  // approval, it is consumed and can never be replayed (v2 safety fix).
+  // For `kind=="command"` session approvals, `consumedAt` is the DELIVERY
+  // stamp (consume-before-allow): non-null ⇔ the allow reached the vendor.
+  consumedAt    DateTime?
+  // Safe, bounded review evidence for non-route approvals. Raw vendor payloads
+  // and credentials are never stored; payloadDigest binds the paused request.
+  evidence            Json?
+  // Operator-derived merge review verdict, bound to the exact worktree
+  // artifact digest. Agent/vendor callers cannot write this field.
+  reviewCertification Json?
+  // Durable merge execution ledger. A merge approval remains `pending` while
+  // this state is `executing`; only a successful, token-bound finalization may
+  // publish `status == "approved"`. The attempt id + lease form the CAS claim
+  // used to reject concurrent execution and safely resume a crashed attempt.
+  mergeExecutionStatus         String?
+  mergeExecutionAttemptId      String?
+  mergeExecutionLeaseExpiresAt DateTime?
+  mergeExecution               Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  decidedAt     DateTime?
+  task          Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@index([status, mergeExecutionStatus, mergeExecutionLeaseExpiresAt])
+}
+
+// Repository-scoped merge exclusion. ApprovalRequest's attempt lease
+// serializes retries for one decision; this lease prevents two different task
+// approvals (even on different refs) from concurrently mutating the same
+// primary checkout index/MERGE_HEAD.
+model MergeRepositoryLease {
+  key            String   @id
+  repoRoot       String   @unique
+  ref            String
+  approvalId     String
+  attemptId      String
+  leaseExpiresAt DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([leaseExpiresAt])
+}
+
+// Harness (VISION §4): a named, reusable execution constraint bundle merged
+// over the lane profile at dispatch. `config` is validated by
+// `harnessConfigSchema` in @muon/protocol (overlay, checks, requires,
+// preauthorizedTools, budget, memorySlice).
+model Harness {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  name      String
+  config    Json
+  version   Int      @default(1)
+  createdBy String   @default("human")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Workflow template (VISION §4): a named, versioned declared plan. The
+// `definition` is validated by `workflowDefinitionSchema` in @muon/protocol.
+model WorkflowTemplate {
+  id         String   @id @default(cuid())
+  key        String   @unique
+  name       String
+  version    Int      @default(1)
+  definition Json
+  createdBy  String   @default("human")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// One proposal/execution of a workflow. The proposal stays inert until a
+// human applies it (appliedBy is always a human identity, never an agent).
+// Steps become Tasks (Task.workflowRunId/stepKey), the run is a grouping
+// record, not a parallel task store.
+model WorkflowRun {
+  id              String    @id @default(cuid())
+  templateKey     String?
+  templateVersion Int?
+  request         String
+  workspacePath   String?
+  chatId          String?
+  proposal        Json
+  status          String    @default("proposed")
+  proposedBy      String    @default("heuristic")
+  appliedBy       String?
+  appliedAt       DateTime?
+  startedAt       DateTime?
+  endedAt         DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([status, createdAt])
+  @@index([chatId, status, createdAt])
+}
+
+// Full agent output stream, chunk-level, what makes "watch an agent work"
+// possible from any surface. Separate from Event (milestones, coalesced) so
+// the ledger stays calm while the stream stays complete. The autoincrement
+// seq is the polling cursor.
+model StreamChunk {
+  seq       Int      @id @default(autoincrement())
+  taskId    String
+  laneId    String
+  agentId   String?
+  sessionId String?
+  runId     String?
+  dedupeKey String?
+  kind      String   @default("output")
+  content   String
+  // Bounded, REDACTED tool-call detail ({args,result} + truncation flags) so a
+  // surface can show WHAT a tool did, not just that it ran. Untrusted vendor
+  // text: bounded at the adapter, scrubbed by @muon/core's redactedTail before
+  // it gets here, rendered only behind a human expand. Nullable and additive —
+  // every row written before 0036 keeps working, and so does every old client.
+  detail    Json?
+  timestamp DateTime @default(now())
+
+  @@unique([taskId, dedupeKey])
+  @@index([taskId, seq])
+  @@index([runId, seq])
+  @@index([agentId, seq])
+}
+
+// Immutable context evidence (TODO 5.5). A frame is created before MUON hands
+// bytes to a vendor boundary; the terminal delivery receipt is a separate
+// append-only row so a crash leaves an honest queued frame, never a mutable
+// "delivered" claim. No foreign keys: task/job cleanup must not erase audit
+// evidence, matching Event and StreamChunk.
+model ContextFrame {
+  id              String   @id @default(cuid())
+  clientRequestId String
+  jobId           String
+  taskId          String
+  laneId          String
+  workspacePath   String?
+  chatId          String?
+  missionId       String
+  turnSeq         Int
+  source          String
+  completeness    String   @default("muon_supplied")
+  content         String
+  contentSha256   String
+  charCount       Int
+  tokenEstimate   Int
+  createdAt       DateTime @default(now())
+
+  @@unique([jobId, clientRequestId])
+  @@unique([jobId, turnSeq])
+  @@index([taskId, createdAt])
+  @@index([missionId, createdAt])
+}
+
+model ContextExposure {
+  id           String   @id @default(cuid())
+  frameId      String
+  artifactKind String
+  artifactId   String
+  eligible     Boolean
+  included     Boolean
+  reason       String
+  ordinal      Int?
+  charCount    Int?
+  trustTier    String?
+  createdAt    DateTime @default(now())
+
+  @@unique([frameId, artifactKind, artifactId, reason])
+  @@index([artifactKind, artifactId])
+}
+
+model ContextFrameDelivery {
+  id              String   @id @default(cuid())
+  frameId         String   @unique
+  status          String
+  sessionId       String?
+  vendorSessionId String?
+  failure         String?
+  createdAt       DateTime @default(now())
+}
+
+// A MUON-owned condensation carries the exact summary and forgotten members.
+// A vendor-reported marker deliberately carries neither when the vendor only
+// discloses that compaction happened (the installed Codex v2 contract today).
+model ContextCondensation {
+  id               String   @id @default(cuid())
+  jobId            String
+  taskId           String
+  inputFrameId     String?
+  outputFrameId    String?
+  origin           String
+  sourceResponseId String
+  summary          String?
+  summaryOffset    Int?
+  createdAt        DateTime @default(now())
+
+  @@unique([jobId, sourceResponseId])
+  @@index([taskId, createdAt])
+}
+
+model ContextCondensationMember {
+  id             String   @id @default(cuid())
+  condensationId String
+  artifactKind   String
+  artifactId     String
+  createdAt      DateTime @default(now())
+
+  @@unique([condensationId, artifactKind, artifactId])
+  @@index([artifactKind, artifactId])
+}
+
+// A conversation with the super-orchestrator (v2). The chat IS an agent
+// session (Claude SDK, resumable via vendorSessionId) bound to a workspace
+// folder; its turns are StreamChunks keyed by chatId so TUI and desktop
+// render and resume the same history.
+model OrchestratorChat {
+  id              String   @id @default(cuid())
+  title           String
+  workspacePath   String
+  // Shadow task: the chat's anchor in the task ledger so approvals filed by
+  // the super-agent (which FK to Task) have a real row to hang on.
+  taskId                  String?
+  vendorSessionId         String?
+  // Resume ownership is explicit. A session id without both coordinates is
+  // legacy/untrusted and is never resumed by the orchestrator.
+  vendorSessionVendor     String?
+  vendorSessionRootJobId  String?
+  status                  String   @default("active")
+  // ADR-0036 D7 — the mission's dollar cap, and the ONLY place one is enforced.
+  //
+  // On the CHAT, not the root dispatch job, even though the wall-clock pool
+  // lives there: a chat mints a new root every turn, so a job-scoped cost cap
+  // would reset each time the human pressed enter, and a limit that forgets is
+  // not a limit. NULL means no cap, which is not the same as a cap of zero.
+  //
+  // Written ONLY by an operator-tier route. There is deliberately no agent
+  // path that touches it — an agent that can raise its own spending limit does
+  // not have one — and an operator DEFAULT (OperatorSetting) is COPIED here at
+  // creation rather than read live, so editing the default can never move a
+  // cap a human already approved for a mission in flight.
+  costCapUsd              Float?
+  costCapSetBy            String?
+  costCapSetAt            DateTime?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+
+// Agent fleet (v2): running instances of a lane, 0–3 per vendor. Lanes stay
+// the vendor definitions (profile, capabilities); agents are the concurrent
+// workers the orchestrator claims and dispatches to.
+model Agent {
+  id            String   @id @default(cuid())
+  vendor        String
+  name          String   @unique
+  ordinal       Int
+  status        String   @default("idle")
+  currentTaskId String?
+  // Exact dispatch ownership. `currentTaskId` is operator-friendly context;
+  // this job id is the release/replay fence (two jobs may share one task).
+  currentJobId  String?  @unique
+  sessionId     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([vendor, ordinal])
+}
+
+// A unit of sub-agent work enqueued for the persistent runner (R1). The
+// orchestrator/TUI/desktop enqueue jobs and return immediately; a long-lived
+// runner process (outliving any chat turn) claims, executes, streams, and
+// releases, so dispatch is truly asynchronous and parallel, and cross-turn
+// steer/interrupt work via the control fields.
+model DispatchJob {
+  id                          String    @id @default(cuid())
+  kind                        String    @default("auto") // auto | oneshot | loop | session
+  vendor                      String // claude-code | codex | cursor
+  taskId                      String
+  brief                       String
+  harnessKey                  String?
+  // Optional task-scoped budget overrides. Harness defaults remain the
+  // fallback; these let governed workflow/CLI callers narrow one dispatch
+  // without mutating the reusable harness.
+  maxIterations               Int?
+  maxWallMs                   Int?
+  checks                      Json?
+  iterationTimeoutMs          Int?
+  resumeVendorSessionId       String?
+  approvalTimeoutMs           Int?
+  workspacePath               String?
+  chatId                      String?
+  parentJobId                 String?
+  rootJobId                   String?
+  delegationDepth             Int       @default(0)
+  maxDelegationDepth          Int?
+  maxChildren                 Int?
+  maxTotalDescendants         Int?
+  // Fleet-scaled descendant pool (S3): the aggregate wall-clock a root's whole
+  // delegation subtree may reserve, DECOUPLED from the root's own turn timeout
+  // (`maxWallMs`). A v2 chat root defaults it to DELEGATION_MAX_DESCENDANTS ×
+  // DEFAULT_CHILD_WALL_MS (80 min) so N read-only workers enqueue concurrently.
+  // NULL for pre-S3 (v1) roots and non-root jobs, which fall back to `maxWallMs`.
+  maxDescendantWallMs         Int?
+  maxDelegationIterations     Int?
+  delegationChildrenIssued    Int       @default(0)
+  delegationDescendantsIssued Int       @default(0)
+  delegationBudgetReservedMs  Int       @default(0)
+  // Released reservation accounting: a child's reserved wall-clock is returned
+  // to the root pool on its FIRST terminal transition and its actual spend is
+  // recorded here. `remaining = maxWallMs − reserved − consumed`, so a child
+  // that finishes early frees budget for siblings without ever raising the cap.
+  delegationBudgetConsumedMs  Int       @default(0)
+  delegationDeadline          DateTime?
+  capabilityMode              String?
+  // A2A/crew role (VISION §2): the crew role this job RUNS AS, stamped at
+  // dispatch from the chat's CrewRoleBinding. NULL for every pre-A2A job and
+  // for any dispatch made outside a role plan — a missing role is refused at
+  // the A2A routes rather than defaulted, so peer addressing can never be
+  // widened by a guess. It is an identity label, never an authority: the real
+  // narrowing is `narrowProfileForRole`/`assertProfileMatchesRole` at launch.
+  role                        String?
+  delegationManifest          Json?
+  status                      String    @default("queued") // queued|running|done|failed|interrupted
+  agentId                     String?
+  // The runner host that claimed this job, lets a restarting runner reclaim
+  // the jobs it orphaned when it crashed (requeue + release the agent).
+  host                        String?
+  // SHA-256 of the unexposed per-process launch token. This fences terminal
+  // writes and reclaim across runner incarnations without persisting the secret.
+  runnerLeaseHash             String?
+  dispatchedBy                String    @default("orchestrator")
+  // Cross-turn control: the runner drains steerMessages into a live session
+  // and honors interruptRequested. Both are set via control routes.
+  // Optional at create (a steer queue starts empty); lib/db.ts defaults it to
+  // [] via the Client $extends. `?` lets the create site omit it, the SQLite
+  // `Json @default("[]")` that used to do this can't be expressed.
+  interruptRequested          Boolean   @default(false)
+  steerMessages               Json?
+  // ADR-0013 #52 v2, a vendor-native action resolved + guard-enforced at the
+  // dispatch ROUTE rides on the job so the runner applies it at execution:
+  // `action` is the resolved action id (provenance); `actionProfilePatch` merges
+  // into the compiled LaneProfile (mergeProfilePatch); `actionArgvOverride`
+  // replaces the one-shot taskCommand (subcommand channel); `actionBriefPrefix`
+  // prepends to the brief. Additive + nullable: a plain dispatch leaves them NULL.
+  action                      String?
+  actionProfilePatch          Json?
+  actionArgvOverride          Json?
+  actionBriefPrefix           String?
+  // Resume lineage (P0.1): the terminal job this dispatch was re-created from
+  // by an explicit human resume act. A resumed job is deliberately a NEW ROOT
+  // (fresh budgets, unweakened delegation fences); lineage lives here only.
+  // Plain column, no FK.
+  resumedFromJobId            String?
+  // Append-once resume claim (P0.1 replay-safety): the redispatch route
+  // atomically stamps the ORIGINAL interrupted job the FIRST time it is resumed
+  // (guarded updateMany, `resumedAt IS NULL`). A second resume of the same
+  // original — sequential or concurrent — finds `resumedAt` set and is refused
+  // (409). This write-once stamp (`resumedByJobId` = the fresh child that
+  // claimed it) is the ONLY mutation ever applied to an otherwise-immutable
+  // terminal row, keeping the redispatch idempotent and side-effect-safe.
+  resumedAt                   DateTime?
+  resumedByJobId              String?
+  result                      String?
+  exitCode                    Int?
+  // Typed terminal handoff packet (P0.3): attached by the runner at the
+  // leased terminal commit; NULL for legacy rows and non-emitting kinds.
+  packetJson                  Json?
+  // LIVE TERMINAL: the read-only console session the lease-holding runner
+  // published for this job, `pty:job:<jobId>`. Written ONLY after the vendor
+  // actually produced a console byte, so a non-null value means "there is a
+  // real process console behind this job", never merely "a viewer could open a
+  // pane". NULL for every pre-0038 row, for every lane that runs through an
+  // in-process SDK or a protocol channel, and for any run whose pty could not
+  // be established — all of which fall back to the recorded stream.
+  ptySessionId                String?
+  // BACKLINK: the vendor's OWN session id for this job's latest execution —
+  // the codex rollout id from its exec banner, or the Claude session uuid the
+  // Agent SDK streams. Written ONLY by the exact lease-holding runner of the
+  // RUNNING job (same fence as ptySessionId/executionPath), never accepted on
+  // a dispatch body. It is what `codex resume <id>` / `claude --resume <id>`
+  // take, so the human can reopen the EXACT dispatched session in the
+  // vendor's real TUI with the brief visible as its first turn. NULL means
+  // "no resume handle is known" — a pre-backlink row, a lane that never
+  // reported one, or a run killed before the id was observed.
+  vendorSessionId             String?
+  // WHERE THIS JOB ACTUALLY RAN: the absolute directory the lease-holding
+  // runner handed the vendor as its cwd — the task's isolated
+  // `<repoRoot>/.muon/worktrees/<taskId>` checkout when the harness requires a
+  // worktree, otherwise the canonical workspace itself. Recorded for BOTH
+  // shapes on purpose: "it ran in the workspace root" is a FACT a review
+  // surface needs, and it must not arrive as an omission indistinguishable
+  // from "we do not know". NULL therefore means exactly UNKNOWN — a pre-0039
+  // row, a job that never reached launch, or a run whose stamp failed — and a
+  // reader falls back to deriving the tree rather than trusting a guess.
+  // Written ONLY by the exact runner lease that owns the RUNNING job, from the
+  // runner's own resolution; it is never accepted on any dispatch body, so no
+  // agent can point a reviewer at a directory of its choosing. It is a
+  // COORDINATE, not a capability: surfaces read evidence from it, and nothing
+  // is ever executed or written because of it.
+  executionPath               String?
+  createdAt                   DateTime  @default(now())
+  startedAt                   DateTime?
+  endedAt                     DateTime?
+  updatedAt                   DateTime  @updatedAt
+
+  @@index([status, createdAt])
+  @@index([host, status])
+  @@index([parentJobId])
+  @@index([rootJobId])
+  @@index([resumedFromJobId])
+  // ADR-0037's read-time check-history annotation filters by workspacePath and
+  // orders by createdAt; the TUI's task-detail poll repeats it. Filter-then-sort
+  // order, so the bounded `take` short-circuits on an ordered walk.
+  @@index([workspacePath, createdAt])
+}
+
+// Unforgeable, runner-issued capability for one exact parent job. The raw
+// token is returned once to the lease-holding runner and injected only into
+// that job's MUON MCP server; only its hash is persisted.
+model DelegationGrant {
+  jobId     String   @id
+  tokenHash String
+  expiresAt DateTime
+  issuedAt  DateTime @default(now())
+
+  @@index([tokenHash])
+}
+
+// P0.4: operator-authored workspace policy profile (LaneProfile govern
+// precedent — agents never author policy). `profile` is validated against the
+// strict `policyProfileSchema` at write time, so the always-ask fence
+// (network/merge/ship un-allowable) is a property of every stored row.
+model WorkspacePolicyProfile {
+  id            String   @id @default(cuid())
+  // Canonical governed workspace (validateWorkspacePath-normalized at write).
+  workspacePath String
+  // "" = workspace-scoped; a taskId = task-scoped override. Sentinel "" (not
+  // NULL) because SQLite/Postgres treat NULLs as distinct in unique indexes.
+  taskScope     String   @default("")
+  profile       Json
+  version       Int      @default(1)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([workspacePath, taskScope])
+}
+
+// P0.4: a content-bound, expiring receipt minted by an EXPLICIT operator
+// opt-in on one approval decision (DelegationGrant expiring-hash-bound
+// precedent). Bound to the exact action + payload digest + workspace + run +
+// manifest; ANY drift falls out of the atomic redeem guard back to the full
+// gate. Never mints for network/merge/ship — enforced at mint AND at redeem.
+model ApprovalReceipt {
+  id                  String    @id @default(cuid())
+  approvalId          String    @unique // the operator decision that minted it
+  taskId              String
+  jobId               String // single-run scope: the run that may redeem
+  sessionId           String? // corroboration record from mint time
+  workspacePath       String // canonical governed workspace
+  actionClass         String // read | test | edit — NEVER network/merge/ship
+  toolName            String // exact vendor tool
+  payloadDigest       String // sha256 over the exact tool input
+  // SEC-1: the OPERATOR-VISIBLE resolved target the human actually saw on the
+  // card — the edit/read file path or the test command line (redacted form).
+  // This is the ENFORCED human-visible binding; `payloadDigest` (agent-authored
+  // at file time) only narrows further. An approval whose visible evidence
+  // disagrees with its digest mints a receipt that can never redeem: the two
+  // bindings are mutually unsatisfiable. NULL for a target-less action (e.g. a
+  // path-less Glob/Grep) and for pre-SEC-1 rows.
+  resolvedTarget      String?
+  manifestFingerprint String? // canonical hash of job.delegationManifest at mint
+  expiresAt           DateTime // absolute expiry
+  revokedAt           DateTime? // one-way operator revocation
+  useCount            Int       @default(0)
+  lastUsedAt          DateTime?
+  createdAt           DateTime  @default(now())
+
+  @@index([jobId, payloadDigest])
+}
+
+// Runner heartbeat (R1): lets surfaces know a live runner exists before they
+// enqueue (and spawn one if not). One local runner is the norm.
+model Runner {
+  id         String   @id @default(cuid())
+  host       String   @unique
+  pid        Int?
+  // SHA-256 of a random launch token generated in runner memory. Nullable only
+  // for pre-migration rows; every live heartbeat supplies a non-null value.
+  leaseHash  String?  @unique
+  status     String   @default("online")
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+}
+
+// ── Shared-brain memory ledger (ADR-0009 Slice 1 / KG-1) ────────────────────
+// The relational ledger is the DURABLE SOURCE OF TRUTH for memory; the embedded
+// LadybugDB graph is a REBUILDABLE projection (an idempotent projector replays
+// these tables into the graph on boot). This is what makes a `STORE_VERSION`
+// bump / corrupt-store recovery safe: wiping the graph can never destroy a
+// human-confirmed memory, because the memory lives here first. See
+// docs/adr/0009-shared-brain-architecture.md §Substrate + Migration Slice 1.
+//
+// SQLite conventions (ADR-0008): `Json` fields carry NO `@default` (Prisma emits
+// invalid SQLite DDL), the defaults are re-applied centrally in lib/db.ts via
+// the Client `$extends` (MemoryNote.modules/topics → []). Everything here stays
+// Postgres-compatible for a future hosted build.
+
+// Provenance root (append-only): the raw source a note was derived from.
+model Episode {
+  id         String   @id @default(cuid())
+  sourceType String // human | stream | handoff | review | loop | deterministic | api
+  rawRef     String?
+  createdAt  DateTime @default(now())
+}
+
+// A memory note, bitemporal-shaped (distinct transaction time vs valid time),
+// history never destroyed (retire, never delete). `id` is authoritative here and
+// reused verbatim as the graph node id, so a wipe→reproject preserves ids.
+model MemoryNote {
+  id            String    @id
+  kind          String // decision | constraint | convention | attempt | question
+  text          String
+  textHash      String
+  scope         String    @default("project") // private:<p> | lane:<k> | project | global
+  trust         String    @default("medium") // low | medium | high
+  status        String    @default("active") // active | paused | rejected
+  // Transaction time (when the system recorded / retired the fact).
+  recordedAt    DateTime  @default(now())
+  retiredAt     DateTime?
+  // Valid time (when the fact holds in the world), distinct from recordedAt.
+  validFrom     DateTime  @default(now())
+  validTo       DateTime?
+  supersededBy  String?
+  staleSince    DateTime?
+  // R3 TTL (mem0 §6 `expiration_date`). DELIBERATELY NOT `validTo`: valid time
+  // states when the FACT stops holding in the world, and an as-of query reads it
+  // that way. A TTL says something different — "we stop vouching for this
+  // unreviewed guess" — and the note may still be perfectly true. Folding the two
+  // together would make every bitemporal "what did the brain believe at T" answer
+  // claim the fact became FALSE at the TTL boundary, and would make "confirming
+  // clears the expiry" silently erase a genuine, human-stated valid-time end.
+  // Two additive nullable columns instead, no backfill:
+  //   expiresAt — the POLICY deadline stamped at ingest on an unconfirmed,
+  //     at-or-below-ceiling-trust, AGENT-authored note. NULL = never expires
+  //     (every pre-migration row, every human/confirmed/high-trust note).
+  //     Reads DERIVE hidden-ness from `expiresAt <= now`, so recall is correct
+  //     even if the sweeper never runs.
+  //   expiredAt — the sweeper's materialized eviction marker (audit + graph
+  //     mirror + the bounded sweep's idempotent cursor). NEVER authority: no read
+  //     path keys on it.
+  // Expiry HIDES, it never deletes: the row, its text, its provenance, and its
+  // history all stay, and a human confirm clears the expiry outright.
+  expiresAt     DateTime?
+  expiredAt     DateTime?
+  // Substrate §3.4: structured result on `attempt` notes. Nullable, no backfill —
+  // NULL = legacy prose with no outcome (`worked` | `abandoned` | `superseded` |
+  // `unknown`). Only meaningful when `kind = "attempt"`; other kinds leave it NULL.
+  outcome       String?
+  // TODO 4.8 / D7: provenance tier on the NOTE itself, before any derived structure
+  // ships. Additive nullable, no backfill — NULL = authored (every pre-migration row
+  // and every explicit human/agent statement at ingest). `inferred` is reserved for
+  // rows whose content was derived rather than stated.
+  derivation    String?
+  // Operator review stamp, separate from confirm/reject. NULL = no stamp yet.
+  reviewStatus  String?
+  accessCount   Int       @default(0)
+  lastUsedAt    DateTime?
+  createdBy     String
+  // Anchors (kept on the note for projection + indexed recall). modules/topics/
+  // symbols are Json string[], defaulted to [] via lib/db.ts $extends (no SQLite
+  // Json default). `symbols` (ADR-0012) holds `<module>#<name>` ids; a symbol-
+  // anchored note is ALWAYS also module-anchored (module auto-derived from each
+  // id prefix at ingest), so this is a refinement of `modules`, never a new axis.
+  taskId        String?
+  laneId        String?
+  // Per-chat memory partition key (#126): the mission/chat id this note was
+  // written under. Nullable + no backfill — a NULL (legacy / non-chat / team-
+  // synced) note is chat-PRIVATE to nobody and reachable only via the explicit
+  // `scope:"global"` opt-in; a chat-scoped AGENT read matches `chatId = <chat>`
+  // exactly, so ordinary project memory never leaks across chats. Operator-tier
+  // reads (GET /library) stay global (no chatId filter). See ADR-0009 §Chat scope.
+  chatId        String?
+  // Per-WORKSPACE memory partition key (ADR-0026): the canonical absolute repo
+  // root this note's facts are about. It was the ONLY partition coordinate the
+  // brain lacked, and the one that matters most, because a note's anchors
+  // (`modules`, `symbols`) are workspace-RELATIVE paths — repo A's
+  // `src/index.ts` and repo B's are the same anchor string.
+  //
+  // DERIVED, never claimed: the agent write path reads it from the authenticated
+  // `AgentJobCapability.workspacePath` (itself read server-side from
+  // `DispatchJob.workspacePath`), reduced to the parent repo by `repoRootOf` and
+  // case-canonicalized — deliberately NOT from `MUON_WORKSPACE`, which the
+  // runner remaps to the governed worktree for every worker under an editing
+  // harness and would therefore mint one memory island per dispatch (§4).
+  //
+  // Nullable, with a doubly-witnessed backfill (`taskId → Task.workspacePath`
+  // corroborated by `chatId → OrchestratorChat.workspacePath`, written only on
+  // agreement). A note still NULL after the backfill is the RESIDUE, and §8
+  // fixes its visibility asymmetrically: operator-tier reads only, under an
+  // explicit unscoped request — never an agent read, never a pack export. NULL
+  // therefore fails CLOSED for every automated consumer and open-but-labelled
+  // for the one consumer who can adjudicate it.
+  workspacePath String?
+  modules       Json
+  topics        Json
+  symbols       Json
+  episodeId     String?
+  updatedAt     DateTime  @updatedAt
+
+  @@index([status, kind])
+  @@index([textHash])
+  @@index([taskId])
+  @@index([laneId])
+  @@index([chatId])
+  @@index([workspacePath])
+  // ADR-0026: every agent read ANDs the workspace fence with the chat fence in
+  // ONE candidate query, so the composite is the access path, not two probes.
+  @@index([workspacePath, chatId])
+  // The sweeper's bounded scan (`expiresAt <= now AND expiredAt IS NULL`).
+  @@index([expiresAt, expiredAt])
+}
+
+// TODO 4.12: evidence that a note entered working context, capped to the newest
+// 128 rows per note in the append transaction. Ranking still uses
+// MemoryNote.accessCount + LadybugDB's decayed buffer; this ledger is for
+// provenance and measurement, never an authority or a ranking input.
+model MemoryAccess {
+  id            String   @id
+  noteId        String
+  accessType    String // brief_injection | explicit_recall | preedit_gate | legacy_used
+  principal     String
+  taskId        String?
+  jobId         String?
+  missionId     String?
+  workspacePath String?
+  accessedAt    DateTime @default(now())
+
+  @@index([noteId, accessedAt])
+  @@index([accessType, accessedAt])
+  @@index([workspacePath, accessedAt])
+}
+
+// Anchor index for dedup/contradiction candidate lookup (KG-1 F1 fix). One row
+// per (note, anchor) so the ingest comparison set is fetched by SHARED ANCHOR
+// via an indexed query, NOT a global recency window (which silently missed
+// aged-anchor duplicates/contradictions once the brain exceeded the window).
+// `value` holds the taskId / laneId / module path / topic; `kind` disambiguates.
+// Indexed on (kind, value) and portable (no Json array-contains needed).
+model MemoryAnchor {
+  id     String @id @default(cuid())
+  noteId String
+  kind   String // task | lane | chat | workspace | module | topic | symbol
+  value  String
+  // D1 (docs/design/memory-index-decisions.md §D1, option B): did this COORDINATE
+  // name a real file when it was written? Resolved at ingest against the
+  // workspace's TRACKED-FILE SET (`git ls-files`, never the filesystem — APFS is
+  // case-insensitive and would accept the wrong spelling). Four states, and the
+  // difference between the last two is the whole point:
+  //   resolved   — the coordinate is in the tracked set
+  //   unresolved — we HAVE the tracked set and it is not in it (an assertion)
+  //   planned    — an EXPLICIT caller declaration for a file that does not exist yet
+  //   NULL       — we could not obtain the tracked set (no workspace on the note,
+  //                not a git repo, git missing, timed out), the anchor is not a
+  //                coordinate at all (task/lane/chat/workspace/topic), or the row
+  //                predates 0042. NEVER `unresolved`, which would assert a fact
+  //                we do not have.
+  // Additive and nullable with no backfill, and NOTHING READS IT YET: the
+  // consumers are D15 (retro-anchoring from note prose) and D4+D6 (the batched
+  // conjunctive candidate query). See lib/anchor-resolution.ts.
+  resolution String?
+
+  @@unique([noteId, kind, value])
+  @@index([kind, value])
+  @@index([noteId])
+}
+
+// A relation between two notes (source of truth for supersede/contradiction
+// links). Replayed into the graph by the projector; the unique triple makes
+// both dual-write and re-projection idempotent. `kind` is a free-form String, so
+// KG-3's `related` and KG-6's `proposes_supersede` were added with NO schema
+// migration, a governed, contested destructive write (KG-6) records a
+// `proposes_supersede` row (both notes stay active) that a human/peer confirm
+// later swaps for a real `supersedes`. TODO 4.9 adds `extends`: a conservative
+// lexical refinement that also keeps both notes active and preserves the added
+// detail as reviewable derived structure.
+model MemoryEdge {
+  id     String   @id @default(cuid())
+  fromId String
+  toId   String
+  kind   String // supersedes | extends | contradicts | related | proposes_supersede | cloned_from
+  weight Float?
+  at     DateTime @default(now())
+
+  @@unique([fromId, toId, kind])
+  @@index([fromId])
+  @@index([toId])
+}
+
+// Human decisions on a note (append-only). The note's confirmed state is
+// DERIVED from the latest confirmation, so it survives a graph rebuild.
+model Confirmation {
+  id        String   @id @default(cuid())
+  noteId    String
+  principal String
+  decision  String // confirm | reject
+  at        DateTime @default(now())
+  // Bulk removal provenance (TODO 4.16): groups expire/compact rows so an
+  // operator can revert a soft expiry sweep as a unit. NULL on single-note
+  // actions and boot-time sweeps.
+  batchId   String?
+  reason    String?
+
+  @@index([noteId])
+  @@index([batchId])
+}
+
+// ADR-0027 D12-C: one independent crew principal's support for one normalized
+// claim inside one mission/workspace. The unique key makes retries idempotent;
+// the count is evidence, never human confirmation.
+model MemoryCorroboration {
+  id            String   @id @default(cuid())
+  noteId        String
+  textHash      String
+  workspacePath String
+  missionId     String
+  principal     String
+  createdAt     DateTime @default(now())
+
+  @@unique([workspacePath, missionId, textHash, principal])
+  @@index([workspacePath, missionId, textHash])
+  @@index([noteId])
+}
+
+// ADR-0027 D11: a human rejection binds the normalized claim for this mission.
+// It prevents later corroboration from re-vouching the same claim, while the
+// workspace+mission key prevents a local rejection from tombstoning other crews.
+model MemoryRejectBind {
+  id            String   @id @default(cuid())
+  noteId        String
+  textHash      String
+  workspacePath String
+  missionId     String
+  principal     String
+  createdAt     DateTime @default(now())
+
+  @@unique([workspacePath, missionId, textHash])
+  @@index([noteId])
+}
+
+// Provenance principal (KG-5): the human or agent that AUTHORED / CONFIRMED a
+// memory note. UPSERTED from MemoryNote.createdBy on ingest, parsing either the
+// explicit `human:<id>` / `agent:<vendor>` convention or the bare legacy form
+// ("human" → human; anything else → an agent whose vendor is the string). A
+// note's `trust` DERIVES from its author principal's trust (a human outranks a
+// low-trust agent) unless explicitly overridden, the hook KG-6's governed,
+// multi-principal writes gate on. Durable here (source of truth); the graph
+// Principal node + AUTHORED_BY / CONFIRMED_BY edges are a rebuildable projection,
+// so a `.lbug` wipe → projectLedgerToGraph restores all provenance with no loss.
+model Principal {
+  id          String   @id
+  kind        String // human | agent
+  displayName String
+  vendor      String? // agent principals: the vendor (claude-code | codex | ...)
+  trust       String   @default("medium") // low | medium | high
+  createdAt   DateTime @default(now())
+
+  @@index([kind])
+}
+
+// Content-addressed embedding cache (sha256(text) → vector), keyed ALSO by the
+// embedding model (KG-3 F2): the same text under a different model is a distinct
+// space, so the PK is composite ([textHash, model]) and a model switch is a
+// natural cache MISS rather than a cross-space cosine. Vector stored as a
+// JSON-encoded number[] string so the shape is identical on SQLite and Postgres.
+// The durable home means vectors are never recomputed and survive a graph wipe.
+model EmbeddingCache {
+  textHash  String
+  model     String
+  vector    String
+  dims      Int
+  createdAt DateTime @default(now())
+
+  @@id([textHash, model])
+}
+
+// P1.4 memory packs: PROVENANCE of an imported record (origin workspace, origin
+// author/confirmation, content address, local disposition). Structurally
+// incapable of satisfying the confirmed gate: origin confirmations land ONLY
+// here, never as Confirmation rows, so an imported note stays an unconfirmed
+// proposal until a human in the RECEIVING workspace confirms it through the
+// existing PATCH flow. `(originWorkspace, receivingWorkspace, recordHash)` is
+// the anchor-independent idempotence key for re-import/sync. Origin principals
+// here are DATA, never authority (payload-is-data): an imported "human:carol"
+// can never authorize a destructive write locally.
+model MemoryImport {
+  id                 String   @id @default(cuid())
+  originWorkspace    String
+  // ADR-0026 §7: a pack is per-(ORIGIN workspace, RECEIVING workspace).
+  // Re-importing the same pack into a second local workspace must produce a
+  // second set of local proposals, so the idempotence key widens to include the
+  // receiving side; without it the second import is silently swallowed as
+  // `alreadyImported`. NOT NULL with a '' default rather than nullable, because
+  // SQLite treats every NULL in a UNIQUE index as distinct and a nullable column
+  // would DISABLE the very key `importMemoryPack` relies on (it claims the row
+  // first and reads P2002 as "already imported"). '' is byte-for-byte today's
+  // semantics; ADR-0026's step 5 stamps the real receiving workspace here.
+  //
+  // `originWorkspace` stays the salted opaque `ws-<16 hex>` provenance
+  // fingerprint and stays DATA. `MemoryNote.workspacePath` is the local
+  // PARTITION and is authority. They answer two different questions and must
+  // never be unified: no absolute path, hostname or username may ride a pack.
+  receivingWorkspace String   @default("")
+  originLabel        String
+  originNoteId       String
+  recordHash         String
+  textHash           String
+  noteId             String?
+  disposition        String // proposed | duplicate-confirmed | duplicate | conflict | related | proposed-supersede | revoked-at-origin
+  originAuthor       String
+  originConfirmedBy  String
+  originConfirmedAt  DateTime
+  importedAt         DateTime @default(now())
+
+  @@unique([originWorkspace, receivingWorkspace, recordHash])
+  @@index([noteId])
+  @@index([originWorkspace, originNoteId])
+}
+
+// Execution record of one budgeted loop (implement→check→repair etc.).
+// Iterations land in the append-only Event log as `loop.iteration`.
+model LoopRun {
+  id            String    @id @default(cuid())
+  // The exact loop dispatch that owns this execution. Nullable only for rows
+  // created before 0051; new runner-created rows always bind it.
+  dispatchJobId String?   @unique
+  taskId        String
+  workflowRunId String?
+  stepKey       String?
+  harnessKey    String?
+  kind          String    @default("check_repair")
+  budget        Json
+  progress      Json?
+  iterations    Int       @default(0)
+  status        String    @default("running")
+  stopReason    String?
+  startedAt     DateTime  @default(now())
+  endedAt       DateTime?
+  updatedAt     DateTime  @updatedAt
+
+  @@index([taskId, startedAt])
+}
+
+// T3: an operator-authored, bounded promise to open a fresh orchestrator turn
+// at (or after) nextRunAt. Creating the schedule authorizes WHEN the turn may
+// start; it never grants tool approval. The desktop executor additionally
+// requires the live standing-approver lease, and every run receives independent
+// root + descendant wall-clock caps.
+model GovernedSchedule {
+  id                      String    @id @default(cuid())
+  title                   String
+  objective               String
+  workspacePath           String
+  vendor                  String
+  model                    String?
+  effort                   String?
+  cadenceMinutes           Int?
+  nextRunAt                DateTime
+  maxRuns                  Int?
+  runCount                 Int       @default(0)
+  maxWallMs                Int
+  maxDescendantWallMs      Int
+  status                   String    @default("active") // active | paused | completed
+  lastStartedAt            DateTime?
+  lastEndedAt              DateTime?
+  lastStatus               String?
+  lastError                String?
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+  occurrences              ScheduleOccurrence[]
+
+  @@index([status, nextRunAt])
+  @@index([workspacePath, createdAt])
+}
+
+// One append-shaped execution attempt. A due claim creates this row and moves
+// the schedule's cursor in the SAME transaction, so overlapping desktop pollers
+// cannot start the same occurrence twice. Terminal fields may be filled once;
+// the row remains as the operator-visible audit trail.
+model ScheduleOccurrence {
+  id            String    @id @default(cuid())
+  scheduleId    String
+  scheduledFor  DateTime
+  status        String    @default("claimed") // claimed | running | done | failed
+  chatId        String?
+  rootJobId     String?
+  error         String?
+  claimedAt     DateTime  @default(now())
+  startedAt     DateTime?
+  endedAt       DateTime?
+  schedule      GovernedSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  @@unique([scheduleId, scheduledFor])
+  @@index([status, claimedAt])
+  @@index([chatId])
+}
+
+// Enterprise inbound leads from the marketing site (`/enterprise`).
+// Source of truth for the table shape. The Vercel marketing app writes via
+// WAITLIST_DATABASE_URL (same Railway Postgres as the standalone waitlist)
+// with an INSERT-only role; the embedded local brain leaves this table unused.
+// A future hosted Team/Cloud Postgres build keeps the same definition.
+model EnterpriseContact {
+  id                 String   @id @default(cuid())
+  fullName           String
+  role               String
+  company            String
+  companyEmail       String
+  phoneNumber        String?
+  problemDescription String
+  source             String   @default("marketing_site")
+  status             String   @default("new") // new | contacted | closed
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([companyEmail])
+  @@index([createdAt])
+  @@index([status, createdAt])
+}
+
+// #133 operator-tier server-side settings (key/value). HUMAN-owned posture flags
+// read at request time by privileged handlers. Written ONLY through the
+// operator-tier route (requireOperator) — never a free-form request body, never an
+// agent-controlled env var — so a dispatched sub-agent can never flip one. There is
+// deliberately NO per-agent/per-chat row: the ONE value today
+// (`autoConfirmAgentMemory`) is a global operator toggle whose blast radius is
+// still HARD-WIRED per-chat in code (preEditContext), so it can never auto-confirm
+// a note or cross a chat boundary. Absent row = the handler's documented default.
+model OperatorSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// ── A2A + role assignment (VISION §2, packages/protocol/src/a2a.ts) ───────────
+
+// The chat's answer to "who does what". Written ONLY by the operator-tier crew
+// planner (POST /api/crew/roles), which recomputes the whole chat's bindings in
+// one transaction from `assignRoles()`, so a binding set is always a coherent
+// plan and never a half-applied merge. `assignedBy` records provenance ("human"
+// for a pin, "muon" for an engine pick) and `blocked` keeps a pinned-but-unable
+// lane visible instead of silently dropping it.
+model CrewRoleBinding {
+  id            String   @id @default(cuid())
+  chatId        String
+  vendor        String
+  role          String
+  fit           Float
+  reason        String
+  assignedBy    String   @default("muon")
+  blocked       Boolean  @default(false)
+  blockedReason String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([chatId, role])
+  @@index([chatId])
+}
+
+// One horizontal peer message. Every identity/scope column (chatId, missionId,
+// fromJobId, fromRole, fromVendor) is derived SERVER-SIDE from the exact-job
+// bearer, never from the body; `subject`/`body` are UNTRUSTED agent text that is
+// stored and rendered but never treated as instruction, authority, or memory.
+// Delivery is bounded to one chat AND one mission, so the per-chat partition
+// survives. `readAt` is DISPLAY METADATA ONLY (when a directly-addressed job
+// first pulled it); delivery correctness lives in PeerInboxCursor below,
+// because a role/crew message has MANY recipients and one shared column could
+// only ever record the first of them.
+model PeerMessage {
+  id         String    @id @default(cuid())
+  chatId     String
+  missionId  String
+  fromJobId  String
+  fromRole   String
+  fromVendor String
+  fromName   String?
+  toKind     String // job | role | crew
+  toJobId    String?
+  toRole     String?
+  kind       String
+  subject    String
+  body       String
+  refs       Json
+  /// ADR-0038-adjacent (coordination design §5.2): the ONE finding this message
+  /// announces. Server-validated against the sender's own visibility, so a
+  /// message can never point a peer at a note it may not read. Nullable because
+  /// most messages are talk, not findings.
+  memoryNoteId String?
+  replyTo    String?
+  createdAt  DateTime  @default(now())
+  readAt     DateTime?
+
+  @@index([chatId, missionId, createdAt])
+  @@index([toJobId, readAt])
+  @@index([memoryNoteId])
+}
+
+// Per-job delivery cursor: the ONLY thing inbox correctness depends on. Each
+// job reads forward through its mission's traffic independently, so one crew
+// broadcast reaches every peer exactly once each. The cursor is the TUPLE
+// (lastReadAt, lastReadMessageId): two messages can share a millisecond, and a
+// timestamp-only cursor would silently skip one of them.
+model PeerInboxCursor {
+  id                String   @id @default(cuid())
+  jobId             String   @unique
+  chatId            String
+  missionId         String
+  lastReadAt        DateTime
+  lastReadMessageId String?
+  updatedAt         DateTime @updatedAt
+
+  @@index([chatId, missionId])
+}
+
+// An ADVISORY, expiring file lease (a2a.ts): first-writer-wins, surfaced to the
+// conflicting agent and the human, never a filesystem lock and never a grant.
+// A released or expired row is inert — conflict detection skips it — so a worker
+// that dies holding a claim cannot freeze the crew.
+/// A WORK CLAIM (design §5.2). Named `FileClaim` for its migration history; it
+/// is no longer file-shaped. `coordinateKind` + `coordinate` express the exact
+/// symbol a job is working on, which a path could not, and `workspacePath` is
+/// the fence that keeps two repositories with matching relative paths from
+/// reporting a false collision.
+model FileClaim {
+  id             String    @id @default(cuid())
+  workspacePath  String
+  chatId         String
+  missionId      String
+  jobId          String
+  coordinateKind String    @default("path") // path | symbol | module
+  coordinate     String
+  intent         String // edit | review | investigate
+  role           String
+  vendor         String
+  createdAt      DateTime  @default(now())
+  expiresAt      DateTime
+  releasedAt     DateTime?
+
+  /// The collision read: fenced by workspace first, then narrowed by chat.
+  @@index([workspacePath, chatId, coordinate])
+  @@index([jobId, releasedAt])
+}
+
+// ADR-0038 slice 2 (D7/D8) — one human's decision to let ONE imported MCP
+// server reach ONE lane.
+//
+// A row here is an authority record, not a cache: the item's shape is stored
+// because that is what the human approved, and `enabledDigest` is the
+// fingerprint their approval is bound to. Before every governed run the
+// backend re-reads the vendor's configuration and recomputes the digest; a
+// mismatch flips `state` to `disabled-drift` and records what was observed
+// (D3 — disabled, not warned). Nothing here is ever written by an agent.
+//
+// The unique key is (laneId, vendor, itemKind, itemName): a second lane that
+// wants the same server needs its OWN enable, with its own diff (D6/D8) —
+// there is deliberately no workspace-wide row this could be widened into.
+model ImportedCapability {
+  id       String @id @default(cuid())
+  laneId   String
+  vendor   String
+  itemKind String
+  itemName String
+
+  // sha256 of importItemEvidence at the moment a human enabled it.
+  enabledDigest String
+  // The item's shape, secrets excluded by construction (ADR-0038 D5).
+  shape Json
+  // Credential NAMES MUON refused to carry, restated for every surface.
+  secretsRefused Json
+
+  // enabled | disabled-drift
+  state String @default("enabled")
+  // What re-attestation observed when it disabled this row; "absent" when the
+  // item is no longer in the vendor's configuration. Null while enabled.
+  driftDigest String?
+  driftReason String?
+  disabledAt  DateTime?
+
+  enabledBy String
+  enabledAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // THE KEY IS (lane, kind, NAME) — vendor is a column, not part of it.
+  //
+  // It was (lane, vendor, kind, name), which correctly modelled the STORE (two
+  // vendors may each define a `linear`) and wrongly modelled the RUNTIME: an
+  // MCP server map is keyed by name, so a lane can hold exactly one server
+  // called `linear` however many vendors offer one. Enable checks for the
+  // collision and explains it, but a check plus an upsert is not atomic —
+  // two concurrent enables from different vendors both passed. This is the
+  // fence; the check is what makes the refusal readable.
+  @@unique([laneId, itemKind, itemName])
+  @@index([laneId, state])
+}

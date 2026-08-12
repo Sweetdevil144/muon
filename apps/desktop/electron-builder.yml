@@ -1,0 +1,126 @@
+# electron-builder configuration for MUON (macOS distribution).
+#
+# Ships a FREE, web-downloadable, UNSIGNED .dmg plus the feed metadata used by
+# the opt-in update checker. In-app download/install remains disabled until a
+# signed, notarized two-version upgrade is verified. Developer-ID activation is
+# a cert-gated release change, not a secret-only switch.
+#
+# NOTE: this file REPLACES the old `build` key in package.json. electron-builder
+# reads electron-builder.yml automatically; keeping both would conflict.
+
+appId: dev.muonlabs.muon
+productName: MUON
+copyright: © 2026 MUON Labs
+
+directories:
+  # Build resources (icon.icns, entitlements.mac.plist) live in build/.
+  buildResources: build
+  output: release
+
+# ---------------------------------------------------------------------------
+# What goes INTO the app.asar (the Electron main + renderer + their prod deps).
+# electron-builder always adds production `dependencies` node_modules on top of
+# these globs, so @muon/client, @muon/orchestrator and @muon/runner are included
+# automatically. The embedded BACKEND is NOT a dependency of @muon/desktop, it
+# is shipped separately as an extraResource (see below).
+# ---------------------------------------------------------------------------
+files:
+  - dist/**/*
+  - package.json
+  - "!**/*.map"
+  - "!**/*.ts"
+
+# The Claude Agent SDK (used by the orchestrator/runner running inside the
+# Electron main process) ships a platform CLI it spawns as a subprocess; it
+# must live on disk as a real file, not inside the asar.
+#
+# node-pty is a NATIVE module — its .node binary must be a real file on disk,
+# because dlopen cannot load from inside the asar. It does NOT need an
+# Electron-ABI rebuild: node-pty 1.x is N-API based, so the prebuilt binary
+# loads unchanged under both plain node and Electron (verified live on Electron
+# 39, in the main process and in the Electron-as-node runner child).
+#
+# It is loaded BY DEFAULT now — the real vendor terminal is the normal path, in
+# Electron main (the human's interactive/resumed sessions) and in the runner
+# child (a dispatched codex job's real console). `MUON_REAL_PTY=0` opts out and
+# the dependency-free echo driver stands in as a stated diagnostic; a genuine
+# load failure degrades the same way rather than crashing. hardenedRuntime + the
+# mac entitlements below already cover loading an unsigned native module.
+asarUnpack:
+  - "**/node_modules/@anthropic-ai/claude-agent-sdk/**"
+  - "**/node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/**"
+  - "**/node_modules/node-pty/**"
+
+# ---------------------------------------------------------------------------
+# The embedded brain. BrainSupervisor spawns `<Electron bin> backend/dist/index.js`
+# (ELECTRON_RUN_AS_NODE=1) as a real child process and resolves the entry at
+# `process.resourcesPath/backend/dist/index.js`. So the ENTIRE backend, its
+# compiled dist, prisma schema/migrations, AND a self-contained node_modules
+# (Prisma library engine + the LadybugDB N-API native module + the @muon/*
+# file: deps, all materialized), must ship as unpacked files under Resources.
+#
+# `scripts/stage-backend.mjs` assembles that self-contained tree at
+# apps/desktop/staged/backend (run by the `package`/`dist` npm scripts BEFORE
+# electron-builder). Because these are plain files (not asar), the child's
+# require() + dlopen() resolve exactly as they do in `node backend/dist/index.js`.
+# ---------------------------------------------------------------------------
+extraResources:
+  # `from: staged` (the PARENT of staged/backend), NOT `from: staged/backend`.
+  # electron-builder's copy filter hardcodes `if (relative === "node_modules")
+  # return false`, it always drops the *root* node_modules directly under `from`
+  # (a NESTED node_modules is kept). Pointing `from` at the parent makes the
+  # backend's deps live at `backend/node_modules` (nested → kept), so the Prisma
+  # engine + LadybugDB addon + @muon/* all ship. staged/ contains only backend/,
+  # so this lands exactly one dir: <Resources>/backend/.
+  # (No `filter:`, that path runs globs through globby, which also drops
+  # node_modules; the stage already excludes *.ts/*.map.)
+  - from: staged
+    to: "."
+
+mac:
+  category: public.app-category.developer-tools
+  icon: build/icon.icns
+  # UNSIGNED: do not look for / use a Developer-ID identity. electron-builder
+  # still applies an ad-hoc signature on arm64 so the app can launch at all.
+  # (CSC_IDENTITY_AUTO_DISCOVERY=false is also exported by the npm scripts + CI.)
+  identity: null
+  # Correct-when-notarized settings; inert while unsigned. Hardened runtime +
+  # these entitlements are what a future notarized build needs to load the
+  # unsigned native modules the brain uses.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Notarization is env-gated in scripts/notarize.mjs (afterSign), so leaving
+  # `notarize` unset here keeps electron-builder's own notarize path off.
+  target:
+    - target: dmg
+      arch:
+        - arm64
+    # The zip + latest-mac.yml provide a real release feed for update checks and
+    # the future signed installer path.
+    - target: zip
+      arch:
+        - arm64
+
+dmg:
+  title: "${productName} ${version}"
+  # Deterministic name so the Homebrew cask URL is stable: MUON-<version>-arm64.dmg
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+  # writeUpdateInfo (blockmap for delta updates) stays on by default.
+
+# The hook is a no-op in the unsigned workflow. A future signed lane must remove
+# identity:null, inject the Developer-ID certificate, and pass two-version
+# install verification before updater installation is enabled.
+afterSign: scripts/notarize.mjs
+
+# ---------------------------------------------------------------------------
+# Update-check feed = the MUON download host (latest-mac.yml + the zip live
+# there). This is the ONE allowed outbound call (documented in
+# docs/install.md); it is opt-in + surfaced in the UI, never silent telemetry.
+# The generic provider only READS: artifacts are uploaded to the host by the
+# founder-run release process, never by electron-builder.
+# ---------------------------------------------------------------------------
+publish:
+  - provider: generic
+    url: https://download.getmuon.com

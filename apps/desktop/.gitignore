@@ -1,0 +1,8 @@
+# Build / packaging artifacts, NEVER commit (each is hundreds of MB).
+release/
+staged/
+out/
+*.dmg
+*.zip
+*.app
+*.blockmap

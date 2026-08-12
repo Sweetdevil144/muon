@@ -1,0 +1,16 @@
+-- Bounded, redacted tool-call detail on a stream chunk. ONE additive, nullable
+-- column; nothing existing is rewritten. Every pre-0036 row keeps working (a
+-- NULL detail simply renders as today's coordinates-only tool card), and every
+-- old client keeps working (the field is optional on the wire and ignored by
+-- readers that do not know it).
+--
+-- Shape (JSON object, all fields optional):
+--   { "args": string, "argsTruncated": bool,
+--     "result": string, "resultTruncated": bool }
+--
+-- The content is UNTRUSTED agent/vendor text. It is bounded at the adapter
+-- (args <= 2 KB head-kept, result <= 8 KB TAIL-kept — errors live at the end),
+-- scrubbed by @muon/core's single `redactedTail` control on the way in, and
+-- bounded again by the write route. It is never treated as instructions and
+-- never rendered as MUON's own copy.
+ALTER TABLE "StreamChunk" ADD COLUMN "detail" JSONB;

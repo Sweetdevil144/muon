@@ -1,0 +1,19 @@
+-- Live terminal: the read-only console session a dispatched job published.
+--
+-- PURELY ADDITIVE, no backfill, no index. One nullable column; every pre-0038
+-- row keeps working unchanged because NULL means "this job has no live console",
+-- which is exactly the pre-0038 behaviour (the viewer falls back to the recorded
+-- stream, as it does today). Every older client keeps working too: the field is
+-- optional on the wire and ignored by readers that do not know it.
+--
+-- No index on purpose. The column is only ever read as part of an already-keyed
+-- single-job fetch (`GET /api/dispatch/:jobId`) or the job list, never as a
+-- search predicate, so an index would cost writes and buy nothing.
+--
+-- Deliberately NOT a frame store. The console BYTES live in a bounded in-memory
+-- ring in the backend process, never in the brain: they are a live view, they
+-- are large, and they are untrusted vendor output. Persisting them would grow
+-- the operator's local database without bound for something whose whole value
+-- expires with the run. Losing the ring on restart degrades honestly — the
+-- attach route reports the session as unavailable and the viewer falls back.
+ALTER TABLE "DispatchJob" ADD COLUMN "ptySessionId" TEXT;

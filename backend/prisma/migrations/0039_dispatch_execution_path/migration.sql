@@ -1,0 +1,18 @@
+-- Where a dispatched job ACTUALLY ran: the cwd the runner handed the vendor.
+--
+-- PURELY ADDITIVE, no backfill, no index. One nullable column; every pre-0039
+-- row keeps working unchanged because NULL means "MUON does not know where this
+-- job ran", which is exactly the pre-0039 situation — a reader derives the tree
+-- from the harness + task id, as it does today. Every older client keeps working
+-- too: the field is optional on the wire and ignored by readers that do not
+-- know it.
+--
+-- Deliberately NOT backfilled. The path a finished job used cannot be recovered
+-- after the fact, only GUESSED from the harness that was configured at the time,
+-- and a guess written into a fact column is worse than an honest NULL: it would
+-- be indistinguishable from a recorded observation.
+--
+-- No index on purpose. The column is only ever read as part of an already-keyed
+-- single-job fetch (`GET /api/dispatch/:jobId`) or the job list, never as a
+-- search predicate, so an index would cost writes and buy nothing.
+ALTER TABLE "DispatchJob" ADD COLUMN "executionPath" TEXT;

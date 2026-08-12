@@ -1,0 +1,45 @@
+name: Restore MUON workspace
+description: >
+  Set up Node, restore the ordered node_modules from cache (populated by the
+  `setup` job), and optionally restore the built dist/ artifact. Lets every
+  downstream job reuse one install + build instead of repeating it 15x.
+
+inputs:
+  need-dist:
+    description: Download + extract the built dist artifact (needed by any job that consumes @muon/* dist).
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "24"
+        cache: npm
+        cache-dependency-path: |
+          package-lock.json
+          packages/*/package-lock.json
+          backend/package-lock.json
+          apps/*/package-lock.json
+
+    - name: Restore node_modules (all packages)
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          node_modules
+          packages/*/node_modules
+          backend/node_modules
+          apps/*/node_modules
+        key: nm-${{ runner.os }}-node24-${{ hashFiles('package-lock.json', 'packages/*/package-lock.json', 'backend/package-lock.json', 'apps/*/package-lock.json', 'scripts/ci-install.sh') }}
+        fail-on-cache-miss: true
+
+    - name: Download built dist
+      if: inputs.need-dist == 'true'
+      uses: actions/download-artifact@v4
+      with:
+        name: muon-dist
+
+    - name: Extract built dist
+      if: inputs.need-dist == 'true'
+      shell: bash
+      run: tar -xzf muon-dist.tgz && rm -f muon-dist.tgz

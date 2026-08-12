@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true
+  },
+  "include": [
+    "src/renderer/**/*",
+    "src/shared/**/*",
+    "src/lib/chat-history.ts",
+    "src/lib/live-chat.ts",
+    "src/lib/fleet.ts",
+    "src/lib/state-store.ts"
+  ]
+}

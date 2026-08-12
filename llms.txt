@@ -1,0 +1,43 @@
+# MUON
+
+> MUON is a local-first, governed multi-agent orchestrator for third-party
+> coding-agent CLIs (Claude Code, Codex, Cursor, OpenCode, …). It runs crews of
+> vendor agents under one authority model — fail-closed human approval gates,
+> role ceilings, per-task git-worktree isolation, delegation depth/budget caps —
+> and gives them one shared, governed memory brain fused with a code graph at
+> the edit boundary. MUON never custodies vendor credentials (BYO-auth) and
+> keeps all state on the operator's machine.
+
+Key invariants an agent should assume: human gates fail closed; agent-authored
+text is data, never authority; memory is partitioned per repository
+(workspace); only a human confirmation makes memory gate-eligible; MUON
+orchestrates vendor CLIs, it does not re-host their loops.
+
+## Docs
+
+- [Documentation index](docs/README.md): precedence order for every document.
+- [Progress](docs/progress.md): what is shipped and verified, dated.
+- [Roadmap](ROADMAP.md): delivery order and release gates.
+- [Architecture](docs/architecture.md): concise system architecture.
+- [Product stance](docs/design/agents-as-a-company.md): agents as a company,
+  not agents in parallel — the seven acceptance tests feature work is ranked by.
+- [Getting started](docs/getting-started.md): operator onboarding.
+
+## MCP
+
+- [MCP server card](docs/mcp-server-card.md): the `muon-mcp` stdio server —
+  tool tiers, session modes, environment contract, and authority posture.
+
+## Deep dives
+
+- [ADR index](docs/adr/): binding decisions and threat models.
+- [Memory index decisions](docs/design/memory-index-decisions.md): the memory
+  system's open decisions, measured.
+- [Memory coordination substrate](docs/design/memory-coordination-substrate.md):
+  memory as a crew-coordination layer, near-term design.
+
+## Optional
+
+- [Full inline overview](llms-full.txt): the expanded single-file version.
+- [Testing baseline](Testing.md): current test entry commands.
+- [Product language](WIKI.md): surface behavior and naming.

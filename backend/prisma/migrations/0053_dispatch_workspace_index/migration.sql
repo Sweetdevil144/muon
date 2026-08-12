@@ -1,0 +1,33 @@
+-- Index the (workspacePath, createdAt) pair DispatchJob is actually queried by.
+--
+-- `readCheckHistory` (backend/src/lib/check-history-read.ts) filters
+-- `workspacePath` + `status IN (...)`, orders by `createdAt DESC`, and takes a
+-- bounded page. DispatchJob had indexes on [status, createdAt], [host, status],
+-- [parentJobId], [rootJobId] and [resumedFromJobId] — none starting at
+-- `workspacePath`.
+--
+-- MEASURED, because the review that flagged this called it a table scan and
+-- that is not what the planner did. `EXPLAIN QUERY PLAN` before:
+--
+--   SEARCH DispatchJob USING INDEX DispatchJob_status_createdAt_idx (status=?)
+--   USE TEMP B-TREE FOR ORDER BY
+--
+-- So it seeked on `status`, read every matching row across EVERY workspace, and
+-- then materialised a sort — `status` being an IN over three of five lifecycle
+-- values makes that index's `createdAt` unusable for the ordering. After:
+--
+--   SEARCH DispatchJob USING INDEX DispatchJob_workspacePath_createdAt_idx (workspacePath=?)
+--
+-- One workspace's rows, walked in `createdAt` order, no temp B-tree.
+--
+-- It is not a rare call: the task-detail route annotates handoffs on READ
+-- (ADR-0037), and the TUI polls task detail, so the scan is repeated per poll
+-- per open task. A cycle-1 review flagged it and it was parked for a migration.
+--
+-- Column order is filter-then-sort: equality on `workspacePath` seeks, then
+-- `createdAt DESC` walks in index order so the `take` short-circuits. `status`
+-- is deliberately NOT in the index — it is an IN over three of the five
+-- lifecycle values, which is not selective enough to earn a column ahead of the
+-- ordering key, and putting it second would break the ordered walk.
+CREATE INDEX "DispatchJob_workspacePath_createdAt_idx"
+  ON "DispatchJob"("workspacePath", "createdAt");

@@ -1,0 +1,258 @@
+name: CI
+
+# Gates every merge to main. MUON is a monorepo with NO npm workspaces: each
+# package is file:-linked with its own package-lock.json and must be installed +
+# built in dependency order (protocol -> adapters -> client -> core -> graph ->
+# codegraph -> mcp -> orchestrator -> runner -> backend ->
+# apps/{cli,tui,desktop}). That
+# ordered install+build lives in scripts/ci-install.sh, the SAME script local
+# dev runs, and happens once in the `setup` job; every other job reuses it via
+# a cached node_modules + a dist artifact.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (a new push to a PR/branch).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. Install + build every package in dependency order, ONCE. Populates the
+  #    node_modules cache (shared by key) and uploads the built dist so the
+  #    fan-out jobs below don't each pay the install/build cost again.
+  setup:
+    name: Install + build (dependency order)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            packages/*/package-lock.json
+            backend/package-lock.json
+            apps/*/package-lock.json
+
+      - name: Cache node_modules (all packages)
+        id: nm
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            packages/*/node_modules
+            backend/node_modules
+            apps/*/node_modules
+          key: nm-${{ runner.os }}-node24-${{ hashFiles('package-lock.json', 'packages/*/package-lock.json', 'backend/package-lock.json', 'apps/*/package-lock.json', 'scripts/ci-install.sh') }}
+
+      # Fail closed if a second lockfile reappears. Vercel (and some detectors)
+      # prefer pnpm-lock.yaml over package-lock.json; Dependabot only refreshes
+      # npm. Dual lockfiles have already broken production installs.
+      - name: Lockfile contract (npm only)
+        run: node scripts/check-lockfile-contract.mjs
+
+      - name: Ordered install + build
+        run: |
+          if [ "${{ steps.nm.outputs.cache-hit }}" = "true" ]; then
+            echo "node_modules restored from cache, rebuilding dist only"
+            SKIP_INSTALL=1 bash scripts/ci-install.sh
+          else
+            bash scripts/ci-install.sh
+          fi
+
+      - name: Package built dist
+        run: |
+          tar -czf muon-dist.tgz \
+            packages/protocol/dist \
+            packages/adapters/dist \
+            packages/core/dist \
+            packages/client/dist \
+            packages/graph/dist \
+            packages/codegraph/dist \
+            packages/mcp/dist \
+            packages/runner/dist \
+            packages/orchestrator/dist \
+            backend/dist \
+            apps/cli/dist \
+            apps/tui/dist \
+            apps/desktop/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muon-dist
+          path: muon-dist.tgz
+          retention-days: 1
+          if-no-files-found: error
+
+  # 2. Typecheck (tsc --noEmit) + the vitest suite for every package, in
+  #    parallel. 14 legs = the 13 vitest suites + protocol (typecheck-only).
+  test:
+    name: ${{ matrix.name }}
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "test: root (web)",    dir: ".",                     cmd: "npm test" }
+          - { name: "test: protocol",      dir: "packages/protocol",     cmd: "npm run typecheck" }
+          - { name: "test: adapters",      dir: "packages/adapters",     cmd: "npm run typecheck && npm test" }
+          - { name: "test: core",          dir: "packages/core",         cmd: "npm run typecheck && npm test" }
+          - { name: "test: client",        dir: "packages/client",       cmd: "npm run typecheck && npm test" }
+          - { name: "test: graph",         dir: "packages/graph",        cmd: "npm run typecheck && npm test" }
+          - { name: "test: codegraph",     dir: "packages/codegraph",    cmd: "npm run typecheck && npm test" }
+          - { name: "test: mcp",           dir: "packages/mcp",          cmd: "npm run typecheck && npm test" }
+          - { name: "test: runner",        dir: "packages/runner",       cmd: "npm run typecheck && npm test" }
+          - { name: "test: orchestrator",  dir: "packages/orchestrator", cmd: "npm run typecheck && npm test" }
+          - { name: "test: backend",       dir: "backend",               cmd: "npm test" }
+          - { name: "test: cli",           dir: "apps/cli",              cmd: "npm run typecheck && npm test" }
+          - { name: "test: tui",           dir: "apps/tui",              cmd: "npm run typecheck && npm test" }
+          - { name: "test: desktop",       dir: "apps/desktop",          cmd: "npm run typecheck && npm test" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/restore-workspace
+      - name: ${{ matrix.name }}
+        working-directory: ${{ matrix.dir }}
+        run: ${{ matrix.cmd }}
+
+  # 3. Lint the whole tree (root flat config; dist/ ignored).
+  lint:
+    name: Lint
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/restore-workspace
+        with:
+          need-dist: "false"
+      - run: npm run lint
+      # TODO 7.1: error paths must go through redactForLog (or an approved scrubber).
+      - run: npm run scan:secrets
+
+  # 4. THE key MUON check: boot the REAL backend on the embedded SQLite path
+  #    (no external Postgres, DATABASE_URL unset, per ADR-0008), open the native
+  #    graph store, and curl /health for {"status":"ok"}. Catches the
+  #    graph-segfault-on-boot / schema / bootstrap regressions that Prisma-mocking
+  #    unit tests cannot.
+  backend-smoke:
+    name: Backend boot smoke (embedded SQLite /health)
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/restore-workspace
+      - run: bash scripts/ci-boot-smoke.sh
+
+  # 4b. THE capstone check: boot the REAL embedded backend and drive the FULL
+  #     moat + governance + auth loop over LIVE loopback HTTP (not app.inject).
+  #     Where backend-smoke proves the backend BOOTS, this proves the pieces are
+  #     WIRED, the two-token lockfile, onboarding readiness, the confirmed-only
+  #     memory gate, the pre-edit hero, the operator/agent capability boundary,
+  #     and durability across a real restart. Hermetic: temp data dir, embedded
+  #     SQLite, lexical brain (MUON_EMBED_DISABLE), empty PATH so no vendor CLI
+  #     can spawn, no network. A wiring regression can't merge past this.
+  e2e-smoke:
+    name: E2E integration harness (live HTTP moat + governance + auth)
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/restore-workspace
+      - run: bash scripts/e2e-smoke.sh
+
+  # 4c. THE SPINE capstone: boot the REAL embedded backend AND drive the REAL
+  #     persistent runner in-process, dispatching to a deterministic FAKE vendor
+  #     (MUON_FAKE_VENDOR=1) over live loopback HTTP. Where e2e-smoke proves the
+  #     MOAT loop is wired, this proves the ORCHESTRATION spine is wired:
+  #     dispatch (queued) → claim agent (0–3 semaphore) → claim job → execute →
+  #     stream → capture → release, plus the invariants (two-token boundary, P3-B
+  #     workspace sandbox, real-vendor isolation, steer/interrupt). The same job
+  #     then runs the SWE-bench harness synthetic fixture GREEN, proving the bench
+  #     plumbing end-to-end. Hermetic: temp data dir, embedded SQLite, lexical
+  #     brain, EMPTY PATH (no real vendor CLI), no network. A spine regression
+  #     can't merge past this.
+  e2e-loop:
+    name: E2E full-loop (fake vendor spine) + SWE-bench harness
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/restore-workspace
+      - name: Full-loop spine E2E (real backend + real runner + fake vendor)
+        run: bash scripts/e2e-loop.sh
+      - name: SWE-bench harness (synthetic fixture, fake vendor)
+        run: node scripts/swe-bench/run.mjs
+
+  # 4d. THE checkpoint+resume capstone (P0.1): boot the REAL embedded backend,
+  #     REALLY SIGKILL it at each lifecycle phase (queued, running, terminal,
+  #     waiting-gate), reopen the SAME temp data dir, and prove the lineage
+  #     digest is stable, the ledger state survives exactly, artifact hashes
+  #     re-verify from disk, and zero duplicate side effects occur. Hermetic:
+  #     temp data dir, embedded SQLite, lexical brain, EMPTY PATH (no real
+  #     vendor CLI), MUON_FAKE_VENDOR=1, no network beyond loopback. Cheap
+  #     (~6s locally) and proven deterministic — the same construction as
+  #     e2e-smoke/e2e-loop, just with a real SIGKILL+reopen in the middle.
+  e2e-resume:
+    name: E2E checkpoint + resume (SIGKILL at each phase)
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/restore-workspace
+      - run: bash scripts/e2e-resume.sh
+
+  # 5. Desktop smoke: build:main (tsc) + build:renderer (esbuild). No electron
+  #    binary / electron-builder packaging in CI.
+  desktop-smoke:
+    name: Desktop smoke (build:main + build:renderer)
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/restore-workspace
+      - name: build:main (tsc)
+        working-directory: apps/desktop
+        run: npm run build:main
+      - name: build:renderer (esbuild)
+        working-directory: apps/desktop
+        run: npm run build:renderer
+
+  # 6. Frontend production build (Next.js). Independent of the @muon/* graph.
+  frontend-build:
+    name: Frontend build (next build)
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/restore-workspace
+        with:
+          need-dist: "false"
+      - run: npm run build
+
+  # Single required status check for branch protection: green only if every
+  # gate above passed.
+  ci-success:
+    name: CI success
+    needs: [setup, test, lint, backend-smoke, e2e-smoke, e2e-loop, e2e-resume, desktop-smoke, frontend-build]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Verify all gates passed
+        run: |
+          results='${{ join(needs.*.result, ',') }}'
+          echo "Upstream job results: $results"
+          case "$results" in
+            *failure*|*cancelled*|*skipped*)
+              echo "::error::Every CI gate must complete successfully; at least one failed, was cancelled, or was skipped."
+              exit 1
+              ;;
+          esac
+          echo "All CI gates passed."

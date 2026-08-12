@@ -1,0 +1,251 @@
+name: Release (macOS)
+
+# A tag is publish authority. Manual runs build and verify the exact release
+# path, but never create a public release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify_macos:
+    name: Build + verify MUON (arm64, unsigned)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.authority.outputs.version }}
+      tag_commit: ${{ steps.authority.outputs.tag_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify version + immutable tag authority
+        id: authority
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./apps/desktop/package.json').version")"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag_commit=" >> "${GITHUB_OUTPUT}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            expected_tag="v${version}"
+            test "${GITHUB_REF_NAME}" = "${expected_tag}"
+            git fetch --no-tags origin main
+            tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+            echo "tag_commit=${tag_commit}" >> "${GITHUB_OUTPUT}"
+            git merge-base --is-ancestor "${tag_commit}" origin/main
+
+            marker="<!-- muon-release-workflow:${tag_commit} -->"
+            if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" 2>/dev/null)"; then
+              draft="$(jq -r '.draft' <<<"${release_json}")"
+              body="$(jq -r '.body // ""' <<<"${release_json}")"
+              if [[ "${draft}" == "true" && "${body}" == *"${marker}"* ]]; then
+                echo "Found a stale workflow-owned draft; publish job will replace it safely."
+              else
+                echo "::error::Release ${GITHUB_REF_NAME} already exists and is not a retryable workflow-owned draft."
+                exit 1
+              fi
+            fi
+          fi
+
+      # Same ordered monorepo install/build path as CI. This produces the
+      # backend and every @muon/* package staged into the desktop bundle.
+      - name: Ordered install + build
+        run: bash scripts/ci-install.sh
+
+      - name: Full release CI gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test
+          npm run typecheck --prefix packages/protocol
+          for dir in \
+            packages/adapters \
+            packages/core \
+            packages/client \
+            packages/graph \
+            packages/codegraph \
+            packages/mcp \
+            packages/runner \
+            packages/orchestrator \
+            apps/cli \
+            apps/tui \
+            apps/desktop
+          do
+            npm run typecheck --prefix "${dir}"
+            npm test --prefix "${dir}"
+          done
+          npm test --prefix backend
+          npm run lint
+          npm run build
+          bash scripts/ci-boot-smoke.sh
+          bash scripts/e2e-smoke.sh
+          bash scripts/e2e-loop.sh
+          node scripts/swe-bench/run.mjs
+
+      # ci-install intentionally skips Electron's postinstall. Packaging needs
+      # the real Electron binary and native dependency rebuild.
+      - name: Install desktop packaging dependencies
+        working-directory: apps/desktop
+        run: npm ci --no-audit --no-fund
+
+      # Build only. Publishing before the package smokes would expose an
+      # unverified artifact, so electron-builder is forced to --publish never.
+      #
+      # MUON_GITHUB_CLIENT_ID is a repo VARIABLE (not a secret — the device
+      # flow's client id is public configuration): write-build-config.mjs bakes
+      # it into Resources/build-config.json so a Finder-launched install can
+      # arm the identity gate. Absent, packaging still succeeds and the script
+      # warns loudly that the gate will be disabled in this artifact.
+      - name: Build release artifacts (unsigned)
+        working-directory: apps/desktop
+        env:
+          MUON_GITHUB_CLIENT_ID: ${{ vars.MUON_GITHUB_CLIENT_ID }}
+        run: npm run package
+
+      - name: Verify update-feed artifact hashes
+        working-directory: apps/desktop
+        run: npm run verify:release-artifacts
+
+      - name: Mount and verify the published DMG
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=( release/*.dmg )
+          test "${#dmgs[@]}" -eq 1
+          mount_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "${mount_dir}" -force >/dev/null 2>&1 || true
+            rm -rf "${mount_dir}"
+          }
+          trap cleanup EXIT
+          hdiutil attach "${dmgs[0]}" -nobrowse -readonly -mountpoint "${mount_dir}"
+          MUON_APP_PATH="${mount_dir}/MUON.app" npm run smoke:packaged-runner
+          MUON_APP_PATH="${mount_dir}/MUON.app" npm run smoke:packaged-desktop
+          cleanup
+          trap - EXIT
+
+      - name: Extract and verify the published update ZIP
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=( release/*.zip )
+          test "${#zips[@]}" -eq 1
+          extract_dir="$(mktemp -d)"
+          trap 'rm -rf "${extract_dir}"' EXIT
+          ditto -x -k "${zips[0]}" "${extract_dir}"
+          test -d "${extract_dir}/MUON.app"
+          MUON_APP_PATH="${extract_dir}/MUON.app" npm run smoke:packaged-runner
+
+      - name: Produce checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd apps/desktop/release
+          dmgs=( *.dmg )
+          zips=( *.zip )
+          blockmaps=( *.blockmap )
+          test "${#dmgs[@]}" -eq 1
+          test "${#zips[@]}" -eq 1
+          test -f latest-mac.yml
+          shasum -a 256 "${dmgs[@]}" "${zips[@]}" latest-mac.yml "${blockmaps[@]}" > SHA256SUMS
+
+      - name: Upload verified workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: muon-macos-arm64
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.zip
+            apps/desktop/release/latest-mac.yml
+            apps/desktop/release/*.blockmap
+            apps/desktop/release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish verified MUON release
+    needs: verify_macos
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: muon-macos-arm64
+          path: release
+
+      # This job executes no checked-out repository code and receives write
+      # authority only after the read-only verification job succeeds.
+      - name: Publish verified tag release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify_macos.outputs.version }}
+          TAG_COMMIT: ${{ needs.verify_macos.outputs.tag_commit }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          expected_tag="v${VERSION}"
+          test "${GITHUB_REF_NAME}" = "${expected_tag}"
+          marker="<!-- muon-release-workflow:${TAG_COMMIT} -->"
+
+          cleanup_workflow_draft() {
+            local release_json draft body
+            if ! release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" 2>/dev/null)"; then
+              return 0
+            fi
+            draft="$(jq -r '.draft' <<<"${release_json}")"
+            body="$(jq -r '.body // ""' <<<"${release_json}")"
+            if [[ "${draft}" == "true" && "${body}" == *"${marker}"* ]]; then
+              gh release delete "${GITHUB_REF_NAME}" --yes
+              return 0
+            fi
+            echo "::error::Refusing to alter an existing non-workflow release ${GITHUB_REF_NAME}."
+            return 1
+          }
+
+          # Retry-safe: remove only a draft carrying this exact tag-commit
+          # marker. If create/upload fails, ERR cleanup removes the partial
+          # draft so the same immutable tag can be retried.
+          cleanup_workflow_draft
+          trap cleanup_workflow_draft ERR
+          assets=(
+            release/*.dmg
+            release/*.zip
+            release/latest-mac.yml
+            release/*.blockmap
+            release/SHA256SUMS
+          )
+          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+            --verify-tag \
+            --generate-notes \
+            --notes "${marker}" \
+            --title "MUON ${VERSION}" \
+            --draft
+          gh release edit "${GITHUB_REF_NAME}" --draft=false
+          trap - ERR

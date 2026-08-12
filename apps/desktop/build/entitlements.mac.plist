@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS entitlements for MUON.
+
+  Today MUON ships UNSIGNED (identity: null → electron-builder ad-hoc signs the
+  arm64 bundle so it launches; Gatekeeper still quarantines it → the user does
+  "Open Anyway" once). These entitlements are inert without a real Developer-ID
+  signature, but they are written to be correct the day notarization is flipped
+  on (set APPLE_ID / APPLE_TEAM_ID / APPLE_APP_SPECIFIC_PASSWORD + a signing
+  identity, see scripts/notarize.mjs and docs/install.md).
+
+  Why each key matters for MUON specifically:
+    * allow-jit / unsigned-executable-memory , V8 (Electron + the embedded
+      Node runtime) JITs; required under the hardened runtime.
+    * disable-library-validation , MUON spawns the embedded backend as a child
+      of the *bundled Electron binary running as Node* (ELECTRON_RUN_AS_NODE),
+      which dlopen()s native modules NOT signed by our team: the LadybugDB
+      N-API addon (lbugjs.node) and the Prisma query engine
+      (libquery_engine-*.dylib.node). Without this, the hardened runtime would
+      refuse to load them and the brain would fail to boot.
+    * allow-dyld-environment-variables , the supervisor passes environment to
+      the spawned Node child; the hardened runtime otherwise scrubs inherited
+      dyld/loader environment.
+-->
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+  </dict>
+</plist>
