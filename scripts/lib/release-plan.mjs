@@ -17,6 +17,9 @@ export function releaseArtifacts(version) {
   return [
     { name: "latest-mac.yml", from: "desktop" },
     { name: "SHA256SUMS", from: "generated" },
+    // Read by `muon update` to learn what is published without downloading a
+    // 400KB tarball just to inspect its package.json.
+    { name: "latest-cli.json", from: "generated" },
     { name: `MUON-${version}-arm64.dmg.blockmap`, from: "desktop" },
     { name: `MUON-${version}-arm64-mac.zip.blockmap`, from: "desktop" },
     { name: `muon-cli-${version}.tgz`, from: "cli", alias: "muon-cli-latest.tgz" },

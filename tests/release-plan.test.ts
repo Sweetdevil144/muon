@@ -19,6 +19,7 @@ describe("releaseArtifacts", () => {
     expect(names).toEqual([
       "latest-mac.yml",
       "SHA256SUMS",
+      "latest-cli.json",
       "MUON-0.1.0-arm64.dmg.blockmap",
       "MUON-0.1.0-arm64-mac.zip.blockmap",
       "muon-cli-0.1.0.tgz",

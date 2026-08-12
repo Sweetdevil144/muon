@@ -41,6 +41,8 @@ import { registerShipCommand } from "./commands/ship.js";
 import { registerStreamCommands } from "./commands/stream.js";
 import { registerTaskCommands } from "./commands/task.js";
 import { registerTrajectoryCommands } from "./commands/trajectory.js";
+import { registerUninstallCommand } from "./commands/uninstall.js";
+import { registerUpdateCommand } from "./commands/update.js";
 import { registerVersionCommand } from "./commands/version.js";
 import { registerWorkflowCommands } from "./commands/workflow.js";
 import { MuonApiClient } from "./lib/api-client.js";
@@ -149,6 +151,8 @@ const createClient = () => {
 
 registerDoctorCommand(program, createClient);
 registerVersionCommand(program);
+registerUpdateCommand(program);
+registerUninstallCommand(program);
 registerAgentsCommand(program, createClient);
 registerOnboardCommand(program, createClient);
 registerQuickstartCommand(program, createClient);

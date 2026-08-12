@@ -1,6 +1,6 @@
 {
   "name": "@muon/desktop",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "private": true,
   "description": "MUON desktop, crew HQ: chat with the super-orchestrator, size the fleet, watch agents, decide gates",
   "author": "MUON Labs",

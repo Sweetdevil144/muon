@@ -65,6 +65,21 @@ log(`releasing version ${version}`);
 
 const artifacts = releaseArtifacts(version); // also validates semver
 
+// THE SAME GUARD THE WORKFLOW ENFORCES, so a MANUAL release cannot skip it.
+// The desktop and CLI ship as one release; a mismatch publishes two numbers
+// for one build. Caught for real on 0.3.1, where the CLI was bumped and the
+// desktop's bump was left unstaged — the workflow would have refused it, but
+// the workflow cannot run while Actions are billing-blocked, so the manual
+// path needs its own copy of the rule.
+const cliVersion = JSON.parse(
+  readFileSync(join(CLI, "package.json"), "utf8"),
+).version;
+if (cliVersion !== version) {
+  fail(
+    `version mismatch: desktop ${version}, CLI ${cliVersion}. Bump both before releasing.`,
+  );
+}
+
 const dirty = execFileSync("git", ["status", "--porcelain"], {
   cwd: ROOT,
   encoding: "utf8",
@@ -129,6 +144,13 @@ for (const a of artifacts) {
     copyFileSync(src, join(STAGE, a.name));
   }
 }
+// The marker `muon update` reads. Written before the checksums so it is
+// covered by them like every other artifact a user can verify.
+writeFileSync(
+  join(STAGE, "latest-cli.json"),
+  `${JSON.stringify({ version })}\n`,
+);
+
 const sums = checksummedArtifacts(version)
   .map((name) => {
     const digest = createHash("sha256")
