@@ -43,8 +43,17 @@ brain — there is no server to run) and `muon-tui` (the full-screen terminal
 cockpit). It needs Node.js 20+ and installs nothing else.
 
 The **desktop app is macOS-only today** and is a separate download from
-<https://getmuon.com/download>. The CLI and TUI are the whole product on Linux,
-and they are not a lesser one — the terminal is the hero surface.
+<https://getmuon.com/download>. It also ships the local brain the CLI and TUI
+talk to — so **on Linux the curl install gives you the binaries but not yet a
+running brain.** Until `muon-backend` is published, build it from source:
+
+```bash
+git clone https://github.com/Sweetdevil144/muon && cd muon
+npm install && ./build.sh
+muon doctor
+```
+
+That is a real gap, not a preference, and it is the next thing being fixed.
 
 There is deliberately no Homebrew tap, apt repo, or other package-manager
 recipe. One installer, one code path, nothing to drift out of step with a

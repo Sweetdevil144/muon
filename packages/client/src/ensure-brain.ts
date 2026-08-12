@@ -31,6 +31,24 @@ export type EnsureBrainResult = {
 };
 
 /**
+ * What to tell someone whose machine has no brain — WHICH DEPENDS ON THE
+ * MACHINE.
+ *
+ * This used to send every caller to the desktop download. The desktop app is
+ * macOS-only, so on Linux that is a dead end dressed as an instruction:
+ * measured on clean Debian through the published tarball, the CLI installs
+ * fine and then advises an app that platform cannot run.
+ */
+export function brainNotFoundNote(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "darwin") {
+    return "could not locate the MUON brain. Install the MUON desktop app from https://getmuon.com/download (it hosts the local brain), or set MUON_BRAIN_ENTRY.";
+  }
+  return "could not locate the MUON brain. The desktop app that hosts it is macOS-only today, so on this platform build it from source (https://github.com/Sweetdevil144/muon — `npm install && ./build.sh`) and re-run, or point MUON_BRAIN_ENTRY at an existing backend/dist/index.js.";
+}
+
+/**
  * Locate the embedded brain's entrypoint (`backend/dist/index.js`):
  *   1. `MUON_BRAIN_ENTRY`, an explicit override (packaged app / tests).
  *   2. a resolvable `muon-backend` dependency (installed/Homebrew layout).
@@ -47,6 +65,7 @@ export type EnsureBrainResult = {
  * lived in `apps/cli`. Exported so a test can assert the search still resolves
  * the backend from this new location (the move-verification requirement).
  */
+
 export function resolveBrainEntry(): string | undefined {
   const override = process.env.MUON_BRAIN_ENTRY?.trim();
   if (override && existsSync(override)) {
@@ -141,7 +160,7 @@ export async function ensureBrain(
       live: false,
       started: false,
       dataDir,
-      note: "could not locate the MUON brain. Install the MUON desktop app from https://getmuon.com/download (it hosts the local brain), or set MUON_BRAIN_ENTRY.",
+      note: brainNotFoundNote(),
     };
   }
 

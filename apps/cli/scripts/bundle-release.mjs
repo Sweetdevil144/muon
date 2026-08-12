@@ -12,7 +12,7 @@
 // Usage:  node scripts/bundle-release.mjs [--name muon-cli] [--version X.Y.Z]
 // Output: apps/cli/release/  →  `cd release && npm publish --access public`
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -43,16 +43,25 @@ const releaseDir = join(cliRoot, "release");
 rmSync(releaseDir, { recursive: true, force: true });
 mkdirSync(releaseDir, { recursive: true });
 
-// esbuild lives in apps/desktop's devDependencies (the renderer bundler);
-// resolve its binary from there rather than adding a second install.
-const esbuild = join(
-  cliRoot,
-  "..",
-  "desktop",
-  "node_modules",
-  ".bin",
-  "esbuild"
-);
+// esbuild, resolved from THIS package first.
+//
+// It used to be taken only from apps/desktop's devDependencies — "rather than
+// adding a second install" — which quietly made building the CLI release
+// require the desktop's entire Electron dependency tree. That is fine in a
+// full checkout and wrong for anyone who only wants the CLI, so it now
+// declares its own and falls back to the desktop copy for older checkouts.
+const esbuildCandidates = [
+  join(cliRoot, "node_modules", ".bin", "esbuild"),
+  join(cliRoot, "..", "..", "node_modules", ".bin", "esbuild"),
+  join(cliRoot, "..", "desktop", "node_modules", ".bin", "esbuild"),
+];
+const esbuild = esbuildCandidates.find((candidate) => existsSync(candidate));
+if (!esbuild) {
+  throw new Error(
+    `esbuild not found. Looked in:\n  ${esbuildCandidates.join("\n  ")}\n` +
+      "Run `npm install` in apps/cli."
+  );
+}
 
 // ESM output, `.mjs` entry: the @muon/* closure is ESM and reads
 // `import.meta.url` (a CJS bundle leaves that undefined and dies at boot).

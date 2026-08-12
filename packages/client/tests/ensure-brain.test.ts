@@ -2,7 +2,11 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ensureBrain, resolveBrainEntry } from "../src/ensure-brain.js";
+import {
+  brainNotFoundNote,
+  ensureBrain,
+  resolveBrainEntry,
+} from "../src/ensure-brain.js";
 import { lockfilePath, writeLockfile, type BrainLock } from "../src/paths.js";
 
 let dir: string;
@@ -82,6 +86,31 @@ describe("ensureBrain (moved into @muon/client)", () => {
       expect(entry.endsWith(path.join("backend", "dist", "index.js"))).toBe(
         true
       );
+    }
+  });
+});
+
+describe("a platform without the desktop app is not sent to download it", () => {
+  // Measured on clean Debian through the published tarball: the CLI installs,
+  // `muon doctor` runs, and the only guidance it gave was to install a
+  // macOS-only app. That is a dead end dressed as an instruction.
+  it("points a NON-macOS host at building from source, never at the .app", () => {
+    for (const platform of ["linux", "win32", "freebsd"] as NodeJS.Platform[]) {
+      const note = brainNotFoundNote(platform);
+      expect(note, platform).toMatch(/macOS-only/);
+      expect(note, platform).toMatch(/build it from source/);
+      expect(note, platform).not.toMatch(/getmuon\.com\/download/);
+    }
+  });
+
+  it("still points macOS at the app, which does exist there", () => {
+    expect(brainNotFoundNote("darwin")).toMatch(/getmuon\.com\/download/);
+    expect(brainNotFoundNote("darwin")).not.toMatch(/macOS-only/);
+  });
+
+  it("always names the MUON_BRAIN_ENTRY escape hatch, on every platform", () => {
+    for (const platform of ["darwin", "linux", "win32"] as NodeJS.Platform[]) {
+      expect(brainNotFoundNote(platform), platform).toMatch(/MUON_BRAIN_ENTRY/);
     }
   });
 });
