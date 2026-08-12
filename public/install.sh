@@ -40,8 +40,17 @@ say "Done. Two commands are now available:"
 say "  muon       — the CLI (auto-starts the local brain; try: muon doctor)"
 say "  muon-tui   — the full-screen terminal cockpit"
 say ""
-say "The MUON desktop app hosts the local brain the CLI/TUI talk to —"
-say "install it from https://getmuon.com/download if you haven't yet."
+# PLATFORM-AWARE. The desktop app that carries the brain is macOS-only, so
+# telling a Linux user to install it is a dead end dressed as an instruction.
+if [ "$(uname -s)" = "Darwin" ]; then
+  say "The MUON desktop app hosts the local brain the CLI/TUI talk to —"
+  say "install it from https://getmuon.com/download if you haven't yet."
+else
+  say "The local brain is not packaged for this platform yet — the desktop app"
+  say "that carries it is macOS-only today. Build it from source to finish setup:"
+  say "  git clone https://github.com/Sweetdevil144/muon && cd muon"
+  say "  npm install && ./build.sh && muon doctor"
+fi
 say ""
 say "Register MUON with your own coding agent (MCP):  muon mcp install"
 say "Docs: https://docs.getmuon.com"
