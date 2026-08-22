@@ -28,7 +28,9 @@ describe("muon:resolveApproval soft-skip surfacing", () => {
 
   it("never treats the skip as a mint failure that drops the decision", () => {
     // No branch rejects/re-throws on a skip; the decision poll always runs.
-    expect(handler).toContain("void monitor.poll()");
+    // `?.` because the monitor is wired late in `whenReady()` and the type now
+    // says so (H1) — the wake is still unconditional in the handler's flow.
+    expect(handler).toContain("void monitor?.poll()");
     expect(handler).not.toMatch(/throw .*receipt/i);
   });
 });

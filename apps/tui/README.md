@@ -2,21 +2,19 @@
 
 ## At a glance
 
-- Ink + React terminal cockpit that renders MUON's fleet over the shared brain through `@muon/client` — Mission / Crew / Control / Memory panels (`CockpitPanels.tsx`), header/footer, and full-screen overlays, laid out as side-by-side lane columns on wide terminals.
-- Prompt-first command bar (`parseCommandBarInput` in `src/lib/command-bar.ts`): plain text becomes a proposal for the super-orchestrator, slash-commands (`/run`, `/session`, `/ship`, `/memory`, `/task`, `/plan`, `/crew`, …) jump straight to cockpit actions, and `/<action> [vendor]` (e.g. `/plan codex`, `/ultrareview claude`) invokes a vendor's own feature, badged and gated.
-- Live supervision overlays: `AgentStreamOverlay` streams one sub-agent's output ("watch it think") and `ApprovalReviewOverlay` shows complete approval evidence behind a desktop-parity gate (`a` approve · `A` approve, don't ask again · `r` reject), requiring a REVIEW BLIND attestation (`m`) before a merge approval is legal.
-- Governed and local-first: the memory panel (`MemoryPanel.tsx`) marks settled vs unsettled notes, gates fail closed, and all four vendors run as managed dispatch lanes — Claude Code and Codex across every crew role, Cursor limited to reviewer/qa/architect/scout and OpenCode to scout, with the dispatch route refusing any role a lane cannot hold.
-
-Terminal coordination cockpit over the shared brain — the same **Mission** /
-**Crew** / **Control** / **Memory** model as the desktop app, tuned for fast
-keyboard review. Ink + React; data via `@muon/client`. Local-first, BYO-auth,
-gates fail closed.
-
-New here? See the [root README](../../README.md) for the product overview and the
-proven [first-run demo](../../docs/demo/first-run.md). Claude Code and Codex are
-managed dispatch lanes; Cursor is readiness + audited native takeover only.
-Evidence is hermetic (unit/integration + fake-vendor full-loop) — no real-vendor
-end-to-end run has been performed yet.
+- Terminal-hosting desk (`src/shell/`, ADR-0046): real vendor CLIs run inside
+  its panes over node-pty + a headless xterm, with MUON's governance beside
+  them — approvals, memory, tasks, workflows, crew, and pre-edit evidence are
+  chorded surfaces (`ctrl+b …`), not a separate app.
+- One keymap, drift-locked: `?` renders the exact table the dispatcher
+  resolves against (`src/shell/keymap.ts`); a key the desk advertises but
+  cannot run fails the suite.
+- Evidence-first gates: the review pane opens the complete approval evidence
+  on the first press and decides on the second (`a` / `A` approve+remember /
+  `m` REVIEW BLIND attestation for merges / `r` reject). Gates fail closed.
+- Governed and local-first over the shared brain via `@muon/client`: memory
+  writes are UNCONFIRMED proposals until a human vouches; dispatch lanes keep
+  their role fences; take-over is a consent form that flips ownership FIRST.
 
 ## Run
 
@@ -31,90 +29,51 @@ the compiled TUI versus the source-development command.
 
 ## Keys
 
-<!-- Generated from src/lib/keymap.ts (ADR-0032 D6). Do not edit by hand:
-     keymap-readme.test.ts fails when this drifts from the table. -->
+The authoritative list is IN the product: `?` renders the one keymap table
+the dispatcher resolves against (`src/shell/keymap.ts`), and the drift-lock
+test fails when an advertised key has no live handler. The shape:
 
-### Desk
-
-| Key | Action |
+| Chord | Action |
 | --- | --- |
-| `/ i` | focus the command bar — tell the crew what to do |
-| `ctrl+k` | command palette |
-| `?` | this keymap |
-| `tab shift+tab` | cycle focus between rail zones |
-| `j ↓` | move down in the focused zone |
-| `k ↑` | move up in the focused zone |
-| `o` | jump to the newest item that needs you |
+| `ctrl+b t` | new terminal (spawn picker: vendor CLIs, shell) |
+| `ctrl+b a` | command picker — every registry action |
+| `ctrl+b c` | crew drawer (`d` inside it opens roles + coordination) |
+| `ctrl+b i` | inbox — approvals, evidence-first |
+| `ctrl+b k` | tasks — the ledger and each task's packets |
+| `ctrl+b r` | workflow runs — review, apply or dismiss a plan |
+| `ctrl+b e` | evidence — pre-edit blast radius + governed memory |
+| `ctrl+b m` | memory — the brain's notes |
+| `ctrl+b g` | destinations |
+| `ctrl+b \|` | split the active pane |
+| `ctrl+b ⏎` | answer the waiting gate |
+| `esc` | pop one layer, innermost first |
 
-### Tabs
+On the review gate: `a` approve, `A` approve+remember (where a receipt can
+exist), `m` attest a review-blind merge, `r` reject — the first press
+always opens the evidence, the second decides.
 
-| Key | Action |
-| --- | --- |
-| `1 … 9` | switch to tab N |
-| `]` | next tab |
-| `[` | previous tab |
-| `x` | close the active tab |
+## Commands
 
-### Crew
+**The desk lists only what it runs** (ROADMAP H13). A command cannot be
+offered without a runner: the picker (`ctrl+b a`) derives from
+`ACTION_REGISTRY` (`src/lib/actions.ts`) — run, tasks, assignment, status,
+`ship`, `memory-add`, `specialist`, `fork`, `plan`, `budget`,
+`return-session`, and `take-over` (via its own consent form). `ship` runs
+the check in the task's own workspace and FILES a `kind:"merge"` approval
+— the decision stays a separate, evidence-first press in the inbox — and
+`memory-add` writes an UNCONFIRMED proposal a human still has to vouch
+for.
 
-| Key | Action |
-| --- | --- |
-| `enter` | open the selected lane's live stream in a tab _(lanes)_ |
-| `s` | stop the selected lane _(lanes)_ |
-| `b` | mission budget breakdown _(lanes)_ |
-| `!` | stop every dispatch |
-| `enter` | open the selected task's detail in a tab _(tasks)_ |
-
-### Decide
-
-| Key | Action |
-| --- | --- |
-| `a` | approve (first press opens the evidence) _(approvals)_ |
-| `A` | approve + don't ask again for 15 minutes _(approvals)_ |
-| `r` | reject (first press opens the evidence) _(approvals)_ |
-| `m` | merge gates only: attest REVIEW BLIND, then approve _(approval-review)_ |
-
-### Memory
-
-| Key | Action |
-| --- | --- |
-| `c` | confirm the selected note _(memory)_ |
-| `x` | reject the selected note (governed) _(memory)_ |
-| `p` | pause the selected note _(memory)_ |
-| `e` | toggle expired notes (re-runs the governed search) _(memory)_ |
-| `v` | view the selected proposal's text _(brain)_ |
-
-### Panels
-
-| Key | Action |
-| --- | --- |
-| `r` | refresh the open panel _(crew · mcp · brain)_ |
-| `a` | apply the selected workflow run _(workflow)_ |
-| `x` | apply if needed, then execute _(workflow)_ |
-
-### App
-
-| Key | Action |
-| --- | --- |
-| `esc` | back — never remounts the desk |
-| `q` | quit |
-
-## Palette commands
-
-- Create task, assign task (with a suggested lane + reason), update status
-- Run task/session/loop/workflow through the persistent runner and stream it
-  into the selected crew member
-- Open complete approval evidence, then approve or reject
-- Search, add, review, confirm, and reject memory
-- Inspect pre-edit evidence, diagnostics, activity, and Stop all
-- Focus panels, refresh, quit
+The two earlier Ink desks were retired by disposition list and deleted
+(ADR-0087 D4) after every gating command was ported here.
 
 ## Layout
 
-- **≥150 columns**: five live crew seats side-by-side, each with task, activity,
-  liveness, `Enter` stream focus, and `s` exact-lane Stop.
-- **110–149 columns**: fleet + orchestrator + decision columns.
-- **Narrower**: stacked fleet, orchestrator, and decision surfaces.
+Panes are terminal sessions: `ctrl+b t` spawns one (vendor CLI or shell),
+`ctrl+b |` splits the active pane, and governance surfaces (inbox, tasks,
+memory, workflows, crew, evidence) stack as layers over them — `esc` pops
+one layer at a time, innermost first. A sidebar rail carries crew/attention
+state when the terminal is wide enough.
 
 The TUI and Desktop share product semantics through `@muon/client`, but keep
 native interaction models. The TUI optimizes for fast keyboard review; the

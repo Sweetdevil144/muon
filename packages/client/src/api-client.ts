@@ -34,6 +34,7 @@ import {
   workflowDefinitionSchema,
   workflowProposalSchema,
   type AgentRole,
+  type ApprovalGrantDuration,
   type HandoffPacket,
   type HarnessConfig,
   type HarnessCheck,
@@ -56,13 +57,21 @@ import {
   type ContextFrameDeliveryInput,
   type ContextFrameSource,
   type Refusal,
+  type WorkflowAmendment,
+  type WorkflowAmendmentRecord,
+  type MemoryDecisionHistory,
+  type MemoryImpactClaim,
   blockingQuestionSchema,
+  memoryPackRecordProvenanceSchema,
+  memoryDecisionHistorySchema,
+  workflowAmendmentRecordSchema,
 } from "@muon/protocol";
 import { MEMORY_TRAVERSAL_TEXT_POLICY } from "./types.js";
 import type {
   AgentRecord,
   ApprovalKind,
   ApprovalReceipt,
+  ApprovalGrant,
   DispatchBudget,
   DispatchJobRecord,
   DispatchKind,
@@ -624,6 +633,11 @@ const taskDetailSchema = taskSchema.extend({
       createdAt: z.string(),
       fromLane: laneSchema.optional(),
       toLane: laneSchema.optional(),
+      // ADR-0080 D3: delivery renderings, present on OPERATOR reads only
+      // (evidence, never authority — "filed, unread" vs "read by J").
+      deliveries: z
+        .array(z.object({ jobId: z.string(), firstAt: z.string() }))
+        .optional(),
     })
   ),
   approvals: z.array(
@@ -643,6 +657,62 @@ const taskDetailSchema = taskSchema.extend({
 const tasksResponseSchema = z.object({
   tasks: z.array(taskSchema),
 });
+
+/** Item contracts are NAMED here (review finding: `Record<string,unknown>`
+ *  erased the coordinates), but every field is optional and unknown keys
+ *  ride: a malformed row renders as an honest blank, never a refused
+ *  frame. */
+const digestWhen = z.union([z.string(), z.number()]).optional();
+const digestItemSchema = z
+  .object({
+    id: z.string().optional(),
+    taskId: z.string().optional(),
+    kind: z.string().optional(),
+    status: z.string().optional(),
+    classification: z.string().optional(),
+    subject: z.string().optional(),
+    title: z.string().optional(),
+    missionId: z.string().optional(),
+    memoryNoteId: z.string().nullable().optional(),
+    forkSourceTaskId: z.string().nullable().optional(),
+    fromId: z.string().optional(),
+    toId: z.string().optional(),
+    createdAt: digestWhen,
+    decidedAt: digestWhen,
+    timestamp: digestWhen,
+    at: digestWhen,
+  })
+  .passthrough();
+
+const digestSectionSchema = z.object({
+  count: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+  /** Absent ⇔ true: only sections whose count can be a floor set it. */
+  countExact: z.boolean().optional(),
+  items: z.array(digestItemSchema),
+});
+
+/** ADR-0085: the digest wire shape. Sections null ⇔ no boundary yet. */
+const deskDigestSchema = z.object({
+  since: z.number().nullable(),
+  lastSeenAt: z.number().nullable(),
+  note: z.string().optional(),
+  sections: z
+    .object({
+      gatesOpened: digestSectionSchema,
+      gatesDecided: digestSectionSchema,
+      packets: digestSectionSchema.extend({
+        receiptsMinted: z.number().int().nonnegative(),
+      }),
+      questions: digestSectionSchema,
+      forks: digestSectionSchema,
+      findings: digestSectionSchema,
+      contradictions: digestSectionSchema,
+    })
+    .nullable(),
+});
+export type DeskDigest = z.infer<typeof deskDigestSchema>;
+export type DeskDigestSection = z.infer<typeof digestSectionSchema>;
 
 const approvalsResponseSchema = z.object({
   approvals: z.array(approvalSchema),
@@ -703,6 +773,9 @@ const memoryNoteSchema = z.object({
     .enum(["worked", "abandoned", "superseded", "unknown"])
     .nullable()
     .default(null),
+  // ADR-0091: structured owners on the ownership kind; null/absent
+  // everywhere else and on older backends.
+  owners: z.array(z.string()).nullable().default(null),
 });
 
 /**
@@ -718,10 +791,87 @@ const memoryGraphDegradedSchema = z.object({
 
 export type MemoryGraphDegraded = z.infer<typeof memoryGraphDegradedSchema>;
 
+/** ADR-0061 D2 — an identifier-only stub for a policy-withheld note. */
+const memoryWithheldStubSchema = z
+  .object({
+    id: z.string(),
+    kind: z.string(),
+    reason: z.enum(["expired", "paused", "stale"]),
+  })
+  .strict();
+export type MemoryWithheldStub = z.infer<typeof memoryWithheldStubSchema>;
+
+/** ADR-0061: a recall/search answer WITH its withheld disclosure. */
+export type MemoryRecallEnvelope = {
+  notes: MemoryNote[];
+  /** Cap-class suppression: N more matched, ranked below the cap. Absent =
+   *  nothing cap-suppressed (never a manufactured zero). */
+  suppressedCount?: number;
+  /** Policy-class identifier-only stubs. Absent = none. */
+  withheld?: MemoryWithheldStub[];
+};
+
 const memoryNotesResponseSchema = z.object({
   notes: z.array(memoryNoteSchema),
   degraded: memoryGraphDegradedSchema.optional(),
+  // ADR-0061 D2: both additive, both ABSENT when nothing was suppressed —
+  // an older backend simply never sends them.
+  suppressed_count: z.number().int().nonnegative().optional(),
+  withheld: z.array(memoryWithheldStubSchema).optional(),
+  // ADR-0051: scan honesty for the institutional widening. Absent on an
+  // older backend (which also lacks the knob) → treated as complete.
+  institutional: z
+    .object({ ownershipScanComplete: z.boolean() })
+    .optional(),
 });
+
+// H1 — the bound review thread's digest: ids + structural flags only.
+const reviewThreadDigestSchema = z.object({
+  target: z.object({ targetKind: z.string(), targetId: z.string() }),
+  lastLookedAt: z.string().nullable(),
+  // The server clock when this digest was READ. A surface echoes it back to
+  // `advanceReviewLook` so the cursor stamps the moment it rendered from, not
+  // the moment the button was pressed — otherwise the render→click window is
+  // consumed unseen. Absent on an older backend → the advance stamps now.
+  digestAt: z.string().optional(),
+  handoffs: z.array(
+    z.object({
+      id: z.string(),
+      taskId: z.string(),
+      status: z.string(),
+      createdAt: z.string(),
+      degraded: z.boolean().nullable(),
+      // True = the task's CURRENT packet does not vouch for itself (it
+      // declared `degraded`, or its flag could not be read), so the row rides
+      // the digest cursor-independently. The route is the ONE place this is
+      // classified. Absent on an older backend → a surface falls back to
+      // `degraded !== false`, which is the same rule.
+      standing: z.boolean().optional(),
+      // False = a standing blocker riding the digest cursor-independently
+      // (the task's current packet is degraded/unreadable). Absent on an
+      // older backend → treated as new (the old all-delta semantics).
+      newSinceLook: z.boolean().optional(),
+    })
+  ),
+  approvals: z.array(
+    z.object({
+      id: z.string(),
+      taskId: z.string().nullable(),
+      kind: z.string(),
+      status: z.string(),
+      gateTag: z.string().nullable().optional(),
+      createdAt: z.string(),
+      decidedAt: z.string().nullable(),
+      reviewDigest: z.string().nullable(),
+      // False = still pending from before the cursor: a standing gate.
+      newSinceLook: z.boolean().optional(),
+    })
+  ),
+  openQuestionIds: z.array(z.string()),
+  truncated: z.boolean(),
+});
+
+export type ReviewThreadDigest = z.infer<typeof reviewThreadDigestSchema>;
 
 const memoryGraphRelationSchema = z.enum([
   "SUPERSEDES",
@@ -804,6 +954,10 @@ const memoryExplainResponseSchema = z.object({
   }),
   contradictions: z.array(memoryGraphNodeSchema).max(100),
   provenance: memoryTraversalProvenanceSchema,
+  // ADR-0060 D4: the decision-history section of the dossier. Coordinates
+  // only by schema construction (the protocol shape carries no note text), so
+  // admitting it cannot smuggle prose around the gated `text` field above.
+  history: memoryDecisionHistorySchema.optional(),
   degraded: memoryGraphDegradedSchema.optional(),
 });
 
@@ -992,6 +1146,10 @@ const memoryPackRecordFileSchema = z.object({
     textHash: sha256HexSchema,
   }),
   supersededTextHashes: z.array(z.string()),
+  // ADR-0064 A1 residual: provenance stamps ride the record — parsed with
+  // THE one protocol schema so the CLI's re-serialization keeps the exact
+  // canonical bytes (a stripped key would break the content address).
+  provenance: memoryPackRecordProvenanceSchema.optional(),
 });
 const memoryPackExportSchema = z.object({
   manifest: memoryPackManifestSchema,
@@ -1150,6 +1308,28 @@ const receiptSchema = z.object({
   toolName: z.string(),
   payloadDigest: z.string(),
   manifestFingerprint: z.string().nullable().optional(),
+  expiresAt: z.string(),
+  revokedAt: z.string().nullable().optional(),
+  useCount: z.number(),
+  lastUsedAt: z.string().nullable().optional(),
+  createdAt: z.string().optional(),
+});
+
+// ADR-0056: durable approval grant row as stored by the brain. Same narrowing
+// convention as receipts. Note the absent columns as much as the present ones:
+// no jobId clause (the grade exists to cross runs), and no vendor/lane/agent
+// field at all.
+const grantSchema = z.object({
+  id: z.string(),
+  approvalId: z.string(),
+  taskId: z.string(),
+  workspacePath: z.string(),
+  actionClass: z.enum(["read", "test", "edit"]),
+  toolName: z.string(),
+  payloadDigest: z.string(),
+  resolvedTarget: z.string().nullable().optional(),
+  policyFingerprint: z.string(),
+  originJobId: z.string(),
   expiresAt: z.string(),
   revokedAt: z.string().nullable().optional(),
   useCount: z.number(),
@@ -1354,6 +1534,21 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 class RequestTimeoutError extends Error {}
 
 /**
+ * How often a 401 may re-read the lockfile looking for a rotated token.
+ *
+ * The connection-refused rebase covers a brain that MOVED. It cannot cover a
+ * brain that restarted onto the SAME port with a new token — the embedded port
+ * is stable (DEFAULT_EMBEDDED_BRAIN_PORT), so an externally restarted brain
+ * rebinds it, nothing throws, /health passes (it is unauthenticated), and the
+ * held token 401s forever with no recovery path at all.
+ *
+ * A refused credential is not evidence that the lockfile moved, though, so this
+ * lane is deliberately narrow: one attempt per window, and only for a lockfile
+ * that names the same base with a different token.
+ */
+const TOKEN_ROTATION_REBASE_INTERVAL_MS = 30_000;
+
+/**
  * A non-2xx answer from control, carrying the STATUS alongside the message.
  *
  * "Control REFUSED this credential" (401/403) and "control could not answer"
@@ -1482,18 +1677,62 @@ export class MuonApiClient {
    * accepted and processed it — and retrying there could double a write.
    */
   private tryRebase(): boolean {
-    if (!this.rebase) return false;
-    let next: { readonly baseUrl: string; readonly apiToken?: string } | null;
-    try {
-      next = this.rebase();
-    } catch {
-      return false;
-    }
+    const next = this.resolveRebase();
     if (!next) return false;
     const moved =
       next.baseUrl !== this.baseUrl || next.apiToken !== this.apiToken;
     if (!moved) return false;
     this.baseUrl = next.baseUrl;
+    this.apiToken = next.apiToken;
+    return true;
+  }
+
+  /** Ask the resolver where the brain lives now. A resolver that throws is
+   *  never allowed to mask the failure that prompted the question. */
+  private resolveRebase():
+    | { readonly baseUrl: string; readonly apiToken?: string }
+    | null {
+    if (!this.rebase) return null;
+    try {
+      return this.rebase();
+    } catch {
+      return null;
+    }
+  }
+
+  /** Wall clock of the last token-rotation attempt, so a 401 storm can re-read
+   *  the lockfile at most once per window. 0 = never attempted. */
+  private lastTokenRotationRebaseAt = 0;
+
+  /**
+   * Adopt a ROTATED token for a brain that never moved, and report whether it
+   * did. Same-port restarts are the one auth failure that is recoverable:
+   *
+   *   - SAME base, DIFFERENT token in the lockfile is the signature of a brain
+   *     that restarted under us. A different base is the connection-failure
+   *     lane's business, and the same token means our credential is simply
+   *     refused — retrying that is a loop.
+   *   - Replaying the request is safe for exactly the reason it is safe after a
+   *     refused socket: a 401 is control declining to act, so nothing landed.
+   *   - Bounded twice over: once per {@link TOKEN_ROTATION_REBASE_INTERVAL_MS}
+   *     (the window is stamped on ENTRY, so a storm cannot even re-read the
+   *     lockfile), and once per request via the caller's `retried` flag. A
+   *     second consecutive 401 therefore surfaces normally.
+   */
+  private tryTokenRotationRebase(): boolean {
+    if (!this.rebase) return false;
+    const now = Date.now();
+    if (
+      this.lastTokenRotationRebaseAt !== 0 &&
+      now - this.lastTokenRotationRebaseAt < TOKEN_ROTATION_REBASE_INTERVAL_MS
+    ) {
+      return false;
+    }
+    this.lastTokenRotationRebaseAt = now;
+    const next = this.resolveRebase();
+    if (!next) return false;
+    if (next.baseUrl !== this.baseUrl) return false;
+    if (!next.apiToken || next.apiToken === this.apiToken) return false;
     this.apiToken = next.apiToken;
     return true;
   }
@@ -1554,6 +1793,15 @@ export class MuonApiClient {
     }
 
     if (!response.ok) {
+      // A brain that restarted onto the SAME port answers with a new token's
+      // 401 instead of a connection error, so the rebase above never runs and
+      // this client 401s forever. Ask the lockfile once, and only for a rotated
+      // token on an unmoved base (see tryTokenRotationRebase). The body is left
+      // unread on purpose: a 401 carries no reason worth surfacing over the
+      // retry's answer.
+      if (response.status === 401 && !retried && this.tryTokenRotationRebase()) {
+        return await this.request(path, init, true);
+      }
       // Surface the backend's reason (e.g. "all agents working"), status
       // codes alone make fleet/gate errors unactionable.
       let detail = "";
@@ -1609,6 +1857,34 @@ export class MuonApiClient {
       .parse(await this.request("/api/questions/open"));
   }
 
+  /**
+   * A13 — every OPEN blocking question filed by THIS coordinator's own crew.
+   *
+   * A separate read from `listOpenQuestions` on purpose: that one is the
+   * operator's machine-wide inbox and is operator-tier, which an MCP
+   * coordinator (agent tier, job capability) cannot reach at all. This one is
+   * fenced server-side to the caller's own chat and answers with COORDINATES —
+   * id, task, askedAt. No subject, no body: the coordinator needs to know a
+   * human is blocking its crew, not to read another job's question.
+   */
+  async listCrewOpenQuestions(): Promise<{
+    questions: { id: string; taskId: string; askedAt: string }[];
+    truncated: boolean;
+  }> {
+    return z
+      .object({
+        questions: z.array(
+          z.object({
+            id: z.string(),
+            taskId: z.string(),
+            askedAt: z.string(),
+          })
+        ),
+        truncated: z.boolean().default(false),
+      })
+      .parse(await this.request("/api/questions/crew"));
+  }
+
   /** ADR-0043 operator half, through THIS client so a moved brain is
    *  followed between the poll and the human's answer. Null = no longer open. */
   async answerQuestion(input: {
@@ -1628,6 +1904,45 @@ export class MuonApiClient {
         )
       );
     return { answered: result.question !== null };
+  }
+
+  /**
+   * H5 — the memory half of "what is waiting on the human", as COORDINATES.
+   *
+   * Agent-tier and partition-scoped: the route takes no argument, deriving
+   * chat and workspace from the job capability, so there is nothing to send
+   * here and nothing a caller could point at another partition. Ids, kinds and
+   * timestamps only — no note text ever crosses this wire, which is why it can
+   * answer for UNVOUCHED notes that every recall path correctly hides.
+   */
+  async listPendingMemory(): Promise<{
+    notes: { id: string; kind: MemoryKind; createdAt: string }[];
+    total: number;
+    totalExact: boolean;
+    truncated: boolean;
+  }> {
+    return z
+      .object({
+        notes: z.array(
+          z.object({
+            id: z.string(),
+            kind: z.enum([
+              "decision",
+              "constraint",
+              "convention",
+              "attempt",
+              "question",
+            ]),
+            createdAt: z.string(),
+          })
+        ),
+        total: z.number().int().nonnegative().default(0),
+        // Absent on an older backend → treated as a FLOOR, which is the
+        // direction an omission has to fail in for a bound to stay honest.
+        totalExact: z.boolean().default(false),
+        truncated: z.boolean().default(false),
+      })
+      .parse(await this.request("/api/memory/pending"));
   }
 
   async health(): Promise<Health> {
@@ -1827,6 +2142,9 @@ export class MuonApiClient {
     branch: string;
     title: string;
     body?: string;
+    /** ADR-0065: structured citations — verified server-side against the
+     *  ledger and rendered into the body by the ONE server renderer. */
+    citedNoteIds?: string[];
   }): Promise<GitHubPullRequestActionEnvelope> {
     return githubPullRequestActionEnvelopeSchema.parse(
       await this.request("/api/github/pull-request", {
@@ -2086,6 +2404,18 @@ export class MuonApiClient {
     }).catch(() => undefined);
   }
 
+  /**
+   * ADR-0085 — what happened since the human last looked. Derived
+   * server-side from the previous absence boundary; `since: null` means no
+   * boundary is recorded yet and `sections` is null with a `note` saying
+   * so. Sections are tolerant-parsed: the digest is navigation, and a desk
+   * must render an honest subset rather than refuse the whole frame over
+   * one section's shape.
+   */
+  async getDigest(): Promise<DeskDigest> {
+    return deskDigestSchema.parse(await this.request("/api/digest"));
+  }
+
   async listApprovals(): Promise<ApprovalRequest[]> {
     const payload = approvalsResponseSchema.parse(
       await this.request("/api/approvals")
@@ -2191,6 +2521,14 @@ export class MuonApiClient {
     // P0.4: EXPLICIT operator opt-in to mint a content-bound, expiring receipt
     // alongside an approval. Never sent unless the human asked for it.
     receipt?: { ttlMs: number };
+    /**
+     * ADR-0056: the GRADED opt-in — `once` (mints nothing), `session` (this
+     * run) or `always` (this chat, until it expires or is revoked). The TTL is
+     * computed server-side from the grade, so nothing here carries an
+     * authority-bearing quantity. Mutually exclusive with `receipt` (the server
+     * 400s on both).
+     */
+    grant?: { duration: ApprovalGrantDuration };
     /** Explicit operator attestation for the exact current REVIEW BLIND set. */
     manualReview?: ManualReviewAttestation;
   }): Promise<
@@ -2205,6 +2543,13 @@ export class MuonApiClient {
       /** Honest reason the receipt was skipped (surface it softly, never as an
        *  error). Absent when a receipt was minted or none was requested. */
       receiptSkippedReason?: string;
+      /**
+       * ADR-0056: the durable grant this decision minted, when the operator
+       * chose `always` and the action was eligible. Absent otherwise —
+       * including on any backend older than the field, which is why reading it
+       * must never turn a working decision into a parse error.
+       */
+      grant?: ApprovalGrant;
       /**
        * What approving a `merge` gate ACTUALLY did to the primary checkout.
        *
@@ -2224,6 +2569,7 @@ export class MuonApiClient {
         // Tolerated optional soft-skip signal (absent on mint / no-receipt).
         receiptSkipped: z.boolean().optional(),
         receiptSkippedReason: z.string().optional(),
+        grant: grantSchema.optional(),
         merge: approvalMergeResultSchema.optional(),
       })
       .parse(
@@ -2233,6 +2579,7 @@ export class MuonApiClient {
             status: input.status,
             decisionNotes: input.decisionNotes,
             receipt: input.receipt,
+            grant: input.grant,
             manualReview:
               input.manualReview === undefined
                 ? undefined
@@ -2251,6 +2598,7 @@ export class MuonApiClient {
             receiptSkippedReason: payload.receiptSkippedReason,
           }
         : {}),
+      ...(payload.grant ? { grant: payload.grant as ApprovalGrant } : {}),
       ...(payload.merge ? { merge: payload.merge } : {}),
     };
   }
@@ -2401,6 +2749,82 @@ export class MuonApiClient {
     return payload.receipt as ApprovalReceipt;
   }
 
+  // ── ADR-0056: durable approval grants (the `always` grade) ─────────────────
+
+  /**
+   * Burn-only grant redemption (agent tier), the chat-scoped sibling of
+   * `redeemReceipt`. Same contract: a miss is `redeemed: false`, never an error
+   * status, because the caller's answer to a miss is "file the gate exactly as
+   * today". Non-2xx still throws; the runner wraps it to a miss.
+   */
+  async redeemApprovalGrant(input: {
+    taskId: string;
+    jobId: string;
+    sessionId: string;
+    workspacePath: string;
+    toolName: string;
+    payloadDigest: string;
+    /** The operator-VISIBLE target of this call; declared explicitly for the
+     *  same reason `redeemReceipt` declares it. */
+    resolvedTarget?: string | null;
+  }): Promise<{
+    redeemed: boolean;
+    grant?: {
+      id: string;
+      approvalId: string;
+      expiresAt: string;
+      useCount: number;
+    };
+  }> {
+    return z
+      .object({
+        redeemed: z.boolean(),
+        grant: z
+          .object({
+            id: z.string(),
+            approvalId: z.string(),
+            expiresAt: z.string(),
+            useCount: z.number(),
+          })
+          .optional(),
+      })
+      .parse(
+        await this.request("/api/grants/redeem", {
+          method: "POST",
+          body: JSON.stringify(input),
+        })
+      );
+  }
+
+  /** Operator-only: every durable grant, so none can act unseen. */
+  async listApprovalGrants(filter?: {
+    activeOnly?: boolean;
+    workspacePath?: string;
+    taskId?: string;
+  }): Promise<ApprovalGrant[]> {
+    const params = new URLSearchParams();
+    if (filter?.activeOnly) params.set("activeOnly", "true");
+    if (filter?.workspacePath) params.set("workspacePath", filter.workspacePath);
+    if (filter?.taskId) params.set("taskId", filter.taskId);
+    const query = params.toString();
+    const payload = z
+      .object({ grants: z.array(grantSchema) })
+      .parse(await this.request(`/api/grants${query ? `?${query}` : ""}`));
+    return payload.grants as ApprovalGrant[];
+  }
+
+  /** One-way operator revocation of a live grant; effective on the next call. */
+  async revokeApprovalGrant(grantId: string): Promise<ApprovalGrant> {
+    const payload = z
+      .object({ grant: grantSchema })
+      .parse(
+        await this.request(`/api/grants/${grantId}/revoke`, {
+          method: "POST",
+        })
+      );
+    return payload.grant as ApprovalGrant;
+  }
+
   async dashboard() {
     return dashboardResponseSchema.parse(await this.request("/api/tasks/dashboard"));
   }
@@ -2430,6 +2854,10 @@ export class MuonApiClient {
     trust?: MemoryTrust;
     createdBy: string;
     outcome?: AttemptOutcome;
+    /** ADR-0063: a machine-readable blast-radius assertion the grounding
+     *  verb can re-run `impact` against. Validated server-side; malformed
+     *  is a 400, never a stored row. */
+    impactClaim?: MemoryImpactClaim;
   }): Promise<MemoryNote> {
     return (await this.addMemoryNoteWithAction(input)).note;
   }
@@ -2439,6 +2867,67 @@ export class MuonApiClient {
    * the write (inserted / duplicate / extended / superseded / conflict) so an agent can
    * learn its note was already known or flagged for human review (v3).
    */
+  /**
+   * ADR-0058 grounding, both halves. The FACTS read hands back the note's
+   * checkable coordinates + the last stamp; the WRITE persists a verdict the
+   * server derives from the typed check rows and, on mismatch, files the
+   * unconfirmed contradiction proposal server-side. Neither call can touch
+   * `confirmed` — grounding is provenance, never a trust promotion.
+   */
+  async memoryGroundFacts(
+    noteId: string,
+    chatId?: string
+  ): Promise<{
+    note: {
+      id: string;
+      kind: string;
+      symbols: string[];
+      modules: string[];
+      stale: boolean;
+      staleSince: string | null;
+      createdAt: string;
+      /** ADR-0063: the stored claim, parsed server-side; null = no claim
+       *  (or an unreadable row), and the third check stays not-checkable. */
+      impactClaim: MemoryImpactClaim | null;
+    };
+    lastGrounding: {
+      verdict: string;
+      at: string;
+      groundedBy: string;
+      proposalNoteId: string | null;
+    } | null;
+  }> {
+    const query = chatId ? `?chatId=${encodeURIComponent(chatId)}` : "";
+    return (await this.request(
+      `/api/memory/${encodeURIComponent(noteId)}/ground-facts${query}`
+    )) as Awaited<ReturnType<MuonApiClient["memoryGroundFacts"]>>;
+  }
+
+  async memoryGround(
+    noteId: string,
+    input: {
+      checks: Array<{
+        kind: "anchor-existence" | "staleness" | "impact-agreement";
+        verdict: "holds" | "mismatch" | "not-checkable";
+        detail: string;
+      }>;
+      chatId?: string;
+    }
+  ): Promise<{
+    verdict: "holds" | "mismatch" | "nothing-checkable";
+    groundingId: string;
+    at: string;
+    proposalNoteId: string | null;
+  }> {
+    return (await this.request(
+      `/api/memory/${encodeURIComponent(noteId)}/ground`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      }
+    )) as Awaited<ReturnType<MuonApiClient["memoryGround"]>>;
+  }
+
   async addMemoryNoteWithAction(input: {
     kind: MemoryKind;
     text: string;
@@ -2462,6 +2951,11 @@ export class MuonApiClient {
     trust?: MemoryTrust;
     createdBy: string;
     outcome?: AttemptOutcome;
+    /** ADR-0091: principal strings naming who owns the surface — only
+     *  meaningful (and only accepted server-side) on kind "ownership". */
+    owners?: string[];
+    /** ADR-0063 — see `addMemoryNote`. */
+    impactClaim?: MemoryImpactClaim;
   }): Promise<{
     note: MemoryNote;
     // "related" (KG-3 F1): a dense-only match kept both notes for human review.
@@ -2530,13 +3024,23 @@ export class MuonApiClient {
       filter?: MemoryFilter;
     }
   ): Promise<MemoryNote[]> {
+    // ADR-0061: ONE request assembly — this array reader projects the
+    // enveloped loader's notes, so the two can never drift.
+    return (await this.searchMemoryDisclosed(query, options)).notes;
+  }
+
+  /** ADR-0061 — `searchMemory` WITH the withheld disclosure. Same request,
+   *  same fences; the two additive fields ride along when the server sent
+   *  them. Callers that render memory to a human or an agent surface use
+   *  this; array callers stay on `searchMemory` unchanged. */
+  async searchMemoryDisclosed(
+    query: string,
+    options?: Parameters<MuonApiClient["searchMemory"]>[1]
+  ): Promise<MemoryRecallEnvelope> {
     const params = new URLSearchParams({ q: query });
-    // Bitemporal "what did the brain believe about X at T" + scope (KG-5).
     if (options?.asOf) params.set("asOf", options.asOf);
     if (options?.scope) params.set("scope", options.scope);
-    // #126: a chat-scoped agent search; absent → the global view.
     if (options?.chatId) params.set("chatId", options.chatId);
-    // ADR-0026: two params for two powers, never one reserved token.
     if (options?.workspace) params.set("workspace", options.workspace);
     if (options?.unscoped) params.set("unscoped", "true");
     if (options?.showExpired) params.set("showExpired", "true");
@@ -2544,7 +3048,7 @@ export class MuonApiClient {
     const payload = memoryNotesResponseSchema.parse(
       await this.request(`/api/memory/search?${params.toString()}`)
     );
-    return MuonApiClient.recalledNotes(payload);
+    return MuonApiClient.recalledEnvelope(payload);
   }
 
   /**
@@ -2553,6 +3057,27 @@ export class MuonApiClient {
    * status/confirmed/kind/trust/q filters. Reuses the tested browser-pure
    * loader so the CLI, TUI, and desktop all share one fetch + one schema.
    */
+  /** ADR-0061 D3 — the fence class as PARTITION TOTALS (operator only):
+   *  how many notes each workspace partition holds, counts and paths and
+   *  nothing else. `null` = the §8 unscoped residue. */
+  async listMemoryPartitionTotals(): Promise<
+    { workspacePath: string | null; total: number }[]
+  > {
+    const payload = z
+      .object({
+        partitions: z.array(
+          z
+            .object({
+              workspacePath: z.string().nullable(),
+              total: z.number().int().nonnegative(),
+            })
+            .strict()
+        ),
+      })
+      .parse(await this.request("/api/memory/partitions"));
+    return payload.partitions;
+  }
+
   async listMemoryLibrary(
     query?: MemoryLibraryQuery
   ): Promise<MemoryLibrarySnapshot> {
@@ -2705,34 +3230,41 @@ export class MuonApiClient {
     /** R5 bounded filter grammar; re-validated server-side. */
     filter?: MemoryFilter;
   }): Promise<MemoryNote[]> {
-    const params = new URLSearchParams();
-    if (filter.taskId) params.set("taskId", filter.taskId);
-    if (filter.laneId) params.set("laneId", filter.laneId);
-    if (filter.module) params.set("module", filter.module);
-    if (filter.symbol) params.set("symbol", filter.symbol);
-    if (filter.topic) params.set("topic", filter.topic);
-    if (filter.asOf) params.set("asOf", filter.asOf);
-    if (filter.scope) params.set("scope", filter.scope);
-    if (filter.chatId) params.set("chatId", filter.chatId);
-    if (filter.workspace) params.set("workspace", filter.workspace);
-    if (filter.unscoped) params.set("unscoped", "true");
-    if (filter.showExpired) params.set("showExpired", "true");
-    if (filter.filter) params.set("filter", JSON.stringify(filter.filter));
+    // ADR-0061: projection of the ONE enveloped loader.
+    return (await this.recallMemoryDisclosed(filter)).notes;
+  }
+
+  /** ADR-0061 — `recallMemory` WITH the withheld disclosure; see
+   *  `searchMemoryDisclosed`. */
+  async recallMemoryDisclosed(
+    filter: Parameters<MuonApiClient["recallMemory"]>[0]
+  ): Promise<MemoryRecallEnvelope> {
+    const params = MuonApiClient.recallParams(filter);
     const payload = memoryNotesResponseSchema.parse(
       await this.request(`/api/memory/recall?${params.toString()}`)
     );
-    return MuonApiClient.recalledNotes(payload);
+    return MuonApiClient.recalledEnvelope(payload);
   }
 
   /** ADR-0027 D13: resolve a peer-supplied stable note coordinate through the
    * agent-safe recall route. Hidden/missing ids return no note; the operator-only
    * raw note endpoint remains closed to agent tokens. */
   async recallMemoryById(noteId: string): Promise<MemoryNote[]> {
+    // ADR-0061: projection of the ONE enveloped loader.
+    return (await this.recallMemoryByIdDisclosed(noteId)).notes;
+  }
+
+  /** ADR-0061 — the by-id recall WITH the disclosure: a policy-hidden id the
+   *  caller NAMED (inside their own fence) answers with a stub instead of
+   *  reading as "no such note". */
+  async recallMemoryByIdDisclosed(
+    noteId: string
+  ): Promise<MemoryRecallEnvelope> {
     const params = new URLSearchParams({ noteId });
     const payload = memoryNotesResponseSchema.parse(
       await this.request(`/api/memory/recall?${params.toString()}`)
     );
-    return MuonApiClient.recalledNotes(payload);
+    return MuonApiClient.recalledEnvelope(payload);
   }
 
   /**
@@ -2757,6 +3289,81 @@ export class MuonApiClient {
   }
 
   /**
+   * H1 — the bound review thread: what changed on this target since this
+   * principal last looked. Ids and structural flags off the ledger, never
+   * paraphrased prose. Opening a digest advances nothing.
+   */
+  async getReviewThread(
+    targetKind: "task" | "chat",
+    targetId: string
+  ): Promise<ReviewThreadDigest> {
+    return reviewThreadDigestSchema.parse(
+      await this.request(
+        `/api/review-thread/${targetKind}/${encodeURIComponent(targetId)}`
+      )
+    ) as ReviewThreadDigest;
+  }
+
+  /**
+   * H1 — stamp the cursor at the digest the caller was LOOKING AT. Surfaces
+   * call this on a DECISION or an explicit acknowledge, never on open — that
+   * is what keeps a closed-without-deciding thread bound.
+   *
+   * `digestAt` is the value the GET returned, echoed back unchanged. Passing
+   * it is what stops the render→click window being consumed unseen; omitting
+   * it stamps the server's NOW, which is only right for a caller that has no
+   * rendered digest to speak for. The route clamps a future value and refuses
+   * an unreadable one, so this method never has to guess.
+   */
+  async advanceReviewLook(
+    targetKind: "task" | "chat",
+    targetId: string,
+    options?: { digestAt?: string }
+  ): Promise<{ lastLookedAt: string }> {
+    return z
+      .object({ lastLookedAt: z.string() })
+      .parse(
+        await this.request(
+          `/api/review-thread/${targetKind}/${encodeURIComponent(targetId)}/advance`,
+          {
+            method: "POST",
+            body: JSON.stringify(
+              options?.digestAt ? { digestAt: options.digestAt } : {}
+            ),
+          }
+        )
+      );
+  }
+
+  /**
+   * ADR-0051 §3 — the standing canon PLUS the ownership/why slice: the same
+   * fixed server posture as `recallStandingMemory` widened only by
+   * human-confirmed, workspace-global `decision` notes TAGGED for
+   * ownership/why (no pin required — the tag is the curation there). Still
+   * zero unconfirmed ids by construction, still the caller's own partition.
+   * The runner partitions the response into the standing block and the
+   * institutional pack's ownership slice client-side by topic tag.
+   */
+  async recallInstitutionalMemory(options?: {
+    workspace?: string;
+  }): Promise<{ notes: MemoryNote[]; ownershipScanComplete: boolean }> {
+    const params = new URLSearchParams({
+      standing: "true",
+      institutional: "true",
+    });
+    if (options?.workspace) params.set("workspace", options.workspace);
+    const payload = memoryNotesResponseSchema.parse(
+      await this.request(`/api/memory/recall?${params.toString()}`)
+    );
+    return {
+      notes: MuonApiClient.recalledNotes(payload),
+      // An older backend never truncates a widening it does not perform.
+      ownershipScanComplete:
+        payload.institutional?.ownershipScanComplete ?? true,
+    };
+  }
+
+  /**
    * B3: recall is the one memory read a degraded graph cannot partially serve —
    * the mirror IS the retrieval index here, so the honest degraded body is an
    * EMPTY note list. Returning that array to a caller would assert "the brain
@@ -2769,6 +3376,27 @@ export class MuonApiClient {
    * `/explain`, `/neighbors` all degrade and keep rendering), and what a caller
    * sees here says which subsystem failed and why.
    */
+  /** ONE spelling of the recall query string (ADR-0061 added a second
+   *  reader of the same route; two assemblies is how they would drift). */
+  private static recallParams(
+    filter: Parameters<MuonApiClient["recallMemory"]>[0]
+  ): URLSearchParams {
+    const params = new URLSearchParams();
+    if (filter.taskId) params.set("taskId", filter.taskId);
+    if (filter.laneId) params.set("laneId", filter.laneId);
+    if (filter.module) params.set("module", filter.module);
+    if (filter.symbol) params.set("symbol", filter.symbol);
+    if (filter.topic) params.set("topic", filter.topic);
+    if (filter.asOf) params.set("asOf", filter.asOf);
+    if (filter.scope) params.set("scope", filter.scope);
+    if (filter.chatId) params.set("chatId", filter.chatId);
+    if (filter.workspace) params.set("workspace", filter.workspace);
+    if (filter.unscoped) params.set("unscoped", "true");
+    if (filter.showExpired) params.set("showExpired", "true");
+    if (filter.filter) params.set("filter", JSON.stringify(filter.filter));
+    return params;
+  }
+
   private static recalledNotes(payload: {
     notes: z.infer<typeof memoryNoteSchema>[];
     degraded?: MemoryGraphDegraded;
@@ -2779,6 +3407,21 @@ export class MuonApiClient {
       );
     }
     return payload.notes.map(MuonApiClient.toMemoryNote);
+  }
+
+  /** ADR-0061: `recalledNotes` plus the two disclosure fields, verbatim off
+   *  the wire. Same degraded-throw semantics — a failed consult is a named
+   *  failure, never an empty answer wearing a zero. */
+  private static recalledEnvelope(
+    payload: z.infer<typeof memoryNotesResponseSchema>
+  ): MemoryRecallEnvelope {
+    return {
+      notes: MuonApiClient.recalledNotes(payload),
+      ...(payload.suppressed_count !== undefined
+        ? { suppressedCount: payload.suppressed_count }
+        : {}),
+      ...(payload.withheld ? { withheld: payload.withheld } : {}),
+    };
   }
 
   /** Graph-traversal recall: task -> modules -> notes + lane notes. A chatId
@@ -2794,6 +3437,22 @@ export class MuonApiClient {
      *  §4 forbids the partition ever coming from one. */
     workspace?: string
   ): Promise<MemoryNote[]> {
+    // ADR-0061: projection of the ONE enveloped loader.
+    return (
+      await this.recallRelatedToTaskDisclosed(taskId, chatId, filter, workspace)
+    ).notes;
+  }
+
+  /** ADR-0061 — the traversal recall WITH the disclosure (route-drop floor;
+   *  the route states the traversal's partial coverage). */
+  async recallRelatedToTaskDisclosed(
+    taskId: string,
+    chatId?: string,
+    filter?: MemoryFilter,
+    /** Same positional-last workspace as the plain variant — the disclosed
+     *  reader must not narrow an operator's existing fence options. */
+    workspace?: string
+  ): Promise<MemoryRecallEnvelope> {
     const params = new URLSearchParams({ relatedToTask: taskId });
     if (chatId) params.set("chatId", chatId);
     if (filter) params.set("filter", JSON.stringify(filter));
@@ -2801,7 +3460,7 @@ export class MuonApiClient {
     const payload = memoryNotesResponseSchema.parse(
       await this.request(`/api/memory/recall?${params.toString()}`)
     );
-    return MuonApiClient.recalledNotes(payload);
+    return MuonApiClient.recalledEnvelope(payload);
   }
 
   /** B1 bounded graph traversal. The response schema is an agent-safe allowlist:
@@ -2865,7 +3524,12 @@ export class MuonApiClient {
       workspace?: string;
       unscoped?: boolean;
     }
-  ): Promise<MemoryExplainResult & { degraded?: MemoryGraphDegraded }> {
+  ): Promise<
+    MemoryExplainResult & {
+      history?: MemoryDecisionHistory;
+      degraded?: MemoryGraphDegraded;
+    }
+  > {
     const params = new URLSearchParams();
     if (options?.limit !== undefined) {
       params.set("limit", String(options.limit));
@@ -2886,7 +3550,10 @@ export class MuonApiClient {
           query ? `?${query}` : ""
         }`
       )
-    ) as MemoryExplainResult & { degraded?: MemoryGraphDegraded };
+    ) as MemoryExplainResult & {
+      history?: MemoryDecisionHistory;
+      degraded?: MemoryGraphDegraded;
+    };
   }
 
   /** B3 governed hard delete. Agent scope is supplied only by trusted MCP state. */
@@ -3500,6 +4167,41 @@ export class MuonApiClient {
     return payload.run as WorkflowRunRecord;
   }
 
+  /**
+   * A14 / ADR-0045 — PROPOSE an amendment: an inert draft that appends steps to
+   * a run, changing nothing until a human approves the gate this returns.
+   *
+   * Deliberately no `applyWorkflowAmendment` sibling on this client. Appending
+   * to a running plan is gated exactly as hard as applying one, and adding the
+   * apply wire here would put it one call away from the MCP tool that proposes
+   * — which is the shape ADR-0045 D2 exists to prevent.
+   *
+   * `amendedBy` is sent because the route's schema requires it, but it is NOT
+   * the principal: for an agent-tier caller the server derives the principal
+   * from the capability (D6) and ignores this value.
+   */
+  async proposeWorkflowAmendment(
+    runId: string,
+    input: { amendment: WorkflowAmendment; amendedBy: string },
+    control?: WorkflowCallerControl
+  ): Promise<{ amendment: WorkflowAmendmentRecord | null; gateTag: string }> {
+    return z
+      .object({
+        amendment: workflowAmendmentRecordSchema.nullable(),
+        gateTag: z.string().min(1),
+      })
+      .parse(
+        await this.request(
+          `/api/workflow-runs/${encodeURIComponent(runId)}/amendments`,
+          {
+            method: "POST",
+            body: JSON.stringify(input),
+            headers: workflowCallerHeaders(control),
+          }
+        )
+      );
+  }
+
   async listWorkflowRuns(
     filter?: {
       status?: WorkflowRunStatus;
@@ -4004,6 +4706,13 @@ export class MuonApiClient {
     actionBriefPrefix: z.string().nullable().optional(),
     // Resume lineage (P0.1). Optional so an older backend parses cleanly.
     resumedFromJobId: z.string().nullable().optional(),
+    // ADR-0044/0071 fork provenance (D6) + the runner's materialization
+    // pointer (D5) — authority-inert lineage, rendered distinctly from
+    // delegation.
+    forkedFromJobId: z.string().nullable().optional(),
+    forkSourceTaskId: z.string().nullable().optional(),
+    // A5 packet citation (2026-08 cycle). Optional for older backends.
+    sourcePacketId: z.string().nullable().optional(),
     // Append-once resume claim (P0.1 replay-safety). The resume planner reads
     // these to classify an already-resumed original (skip, never redispatch).
     resumedAt: z.string().nullable().optional(),
@@ -4079,6 +4788,11 @@ export class MuonApiClient {
     // re-created from by an explicit human resume act. The route 400s unless
     // it exists and 409s unless it is terminal.
     resumedFromJobId?: string;
+    // A5: the typed handoff packet this re-dispatch is seeded from. The route
+    // 400s unless it exists and 409s unless it belongs to this chat partition.
+    sourcePacketId?: string;
+    /** ADR-0083: repair IS a verb (see delegateDispatch). */
+    repairOf?: string;
     // S4 machine continuation: the ONE chat-root shape a non-operator caller
     // (the always-alive runner) may create — one bounded reconciliation turn
     // for a governed child that went terminal while the coordinator was idle.
@@ -4141,6 +4855,13 @@ export class MuonApiClient {
       // validates it against the child's execution vendor and persists it as
       // the only key of the child's `actionProfilePatch`.
       model?: string;
+      // A5/A12: the typed handoff packet this child is seeded from. The route
+      // 400s unless it exists and 409s unless it shares the target task's
+      // chat partition. Authority-inert lineage.
+      sourcePacketId?: string;
+      /** ADR-0083: repair IS a verb — derives the citation server-side and
+       *  composes the degradation block into the brief. */
+      repairOf?: string;
     },
     delegationToken: string
   ): Promise<DispatchJobRecord> {
@@ -4266,6 +4987,48 @@ export class MuonApiClient {
           { method: "DELETE" }
         )
       );
+  }
+
+  /**
+   * ADR-0044/0071 — fork a NEW mission from a RECORDED step (a terminal
+   * job). Operator tier only. The server mints the fork's own chat + task
+   * (never the source's — a fork gets its own worktree), enqueues the root
+   * through the ordinary create path (authority/budgets re-derived, nothing
+   * copied), and inherits the offer-set prefix up to the forked step.
+   */
+  async forkMission(input: {
+    sourceJobId: string;
+    brief: string;
+    vendor: string;
+    title?: string;
+    model?: string;
+    maxWallMs?: number;
+    maxDescendantWallMs?: number;
+  }): Promise<{
+    chat: { id: string; title: string };
+    task: { id: string; title: string };
+    job: DispatchJobRecord;
+    forkedFromJobId: string;
+  }> {
+    const payload = z
+      .object({
+        chat: z.object({ id: z.string(), title: z.string() }).passthrough(),
+        task: z.object({ id: z.string(), title: z.string() }).passthrough(),
+        job: MuonApiClient.dispatchJobSchema,
+        forkedFromJobId: z.string(),
+      })
+      .parse(
+        await this.request("/api/dispatch/fork", {
+          method: "POST",
+          body: JSON.stringify(input),
+        })
+      );
+    return {
+      chat: payload.chat,
+      task: payload.task,
+      job: payload.job as DispatchJobRecord,
+      forkedFromJobId: payload.forkedFromJobId,
+    };
   }
 
   async getDispatchJob(jobId: string): Promise<DispatchJobRecord> {

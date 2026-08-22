@@ -2,6 +2,7 @@ import type { Command } from "commander";
 import { failCommand } from "../lib/refusal.js";
 import {
   assignCrewRoles,
+  citationProvenanceLine,
   listPeerMessages,
   loadCoordinationSnapshot,
   loadCrewRoles,
@@ -9,6 +10,7 @@ import {
   selectMissionRootId,
   terminalSafe,
   type CrewRolesView,
+  type MessageCitationAudits,
   type RolePin,
 } from "@muon/client";
 import {
@@ -137,7 +139,8 @@ export function formatCrewRoleLines(
 
 export function formatCoordinationLines(
   snapshot: CoordinationSnapshot,
-  messages: PeerMessage[]
+  messages: PeerMessage[],
+  citationAudits?: MessageCitationAudits
 ): string[] {
   const lines: string[] = [
     `Coordination for chat ${snapshot.chatId} · mission ${snapshot.missionId}`,
@@ -224,6 +227,22 @@ export function formatCoordinationLines(
       lines.push(`    ${terminalSafe(message.body)}`);
       if (refs.length > 0) {
         lines.push(`    refs: ${refs.map(terminalSafe).join(", ")}`);
+      }
+      // ADR-0086 D2 — the SAME provenance sentences the desk renders, from
+      // the one shared classifier: cited ids carry their offered verdict
+      // when the server audited the page; a verdict-less citation renders
+      // with no provenance claim. The announced finding is the sender's
+      // own note — a coordinate, not an offers question.
+      const audit = citationAudits?.find(
+        (entry) => entry.messageId === message.id
+      );
+      for (const noteId of message.refs.noteIds ?? []) {
+        lines.push(
+          `    ${citationProvenanceLine(terminalSafe(noteId), noteId, audit?.citations)}`
+        );
+      }
+      if (message.memoryNoteId) {
+        lines.push(`    ${terminalSafe(message.memoryNoteId)} — finding`);
       }
     }
   }
@@ -437,16 +456,29 @@ export function registerCrewCommands(
             options.mission
           );
 
-          const [snapshot, messages] = await Promise.all([
+          const [snapshot, transcript] = await Promise.all([
             loadCoordinationSnapshot({ apiBase, apiToken, chatId, missionId }),
             listPeerMessages({ apiBase, apiToken, chatId, missionId, limit }),
           ]);
+          const messages = transcript.messages;
 
           if (options.json) {
-            printJson({ snapshot, untrustedPeerMessages: messages });
+            printJson({
+              snapshot,
+              untrustedPeerMessages: messages,
+              // ADR-0086 D2: the audits ride the JSON verbatim — derived
+              // server-side, absent when the ledger was unreadable.
+              ...(transcript.citationAudits
+                ? { citationAudits: transcript.citationAudits }
+                : {}),
+            });
             return;
           }
-          for (const line of formatCoordinationLines(snapshot, messages)) {
+          for (const line of formatCoordinationLines(
+            snapshot,
+            messages,
+            transcript.citationAudits
+          )) {
             process.stdout.write(`${line}\n`);
           }
         } catch (error) {

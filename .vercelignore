@@ -1,14 +1,22 @@
 # Vercel builds ONLY the root Next.js marketing site. Everything below is part of
 # the monorepo but is not needed for (and must not influence) the frontend build.
-backend/
-apps/
-packages/
-scripts/
-docs/
-packaging/
-.muon/
-.kiro/
-.github/
-backend.Dockerfile
-Dockerfile
-docker-compose.yml
+#
+# EVERY PATTERN IS ANCHORED WITH A LEADING SLASH, and that is load-bearing.
+# These behave like .gitignore rules: an unanchored `docs/` matches a directory
+# named `docs` at ANY depth. When the marketing site gained on-site
+# documentation at `src/app/docs/`, that rule silently excluded it from the
+# upload — the build succeeded, every other route deployed, and all seven docs
+# pages 404'd in production while serving 200 from an identical local build.
+# Anchoring restricts each rule to the repo root, which is all it ever meant.
+/backend/
+/apps/
+/packages/
+/scripts/
+/docs/
+/packaging/
+/.muon/
+/.kiro/
+/.github/
+/backend.Dockerfile
+/Dockerfile
+/docker-compose.yml

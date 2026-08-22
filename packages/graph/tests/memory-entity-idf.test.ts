@@ -8,7 +8,7 @@ import {
   type MemoryEntity,
 } from "../src/memory-entities.js";
 
-// ── D-mem0-1: the entity arm needs an IDF term ───────────────────────────────
+// ── D-productM1-1: the entity arm needs an IDF term ───────────────────────────────
 //
 // MEASURED PREMISE, not a hypothetical. On the founder's live brain the entity
 // keys `gitnexus` and `apps/cli/readme.md` each appear on 30 of 212 active notes —
@@ -18,7 +18,7 @@ import {
 // had never been evaluated before the harness shipped: the numbers matched the
 // baseline, and nobody had checked the predicate against them.
 //
-// The fix is IDF, `log((N+1)/(df+1))`, NOT mem0's `1/(1+0.001*(n-1)^2)` — those
+// The fix is IDF, `log((N+1)/(df+1))`, NOT productM1's `1/(1+0.001*(n-1)^2)` — those
 // constants are tuned against an additive similarity score in [0, 0.5], and MUON's
 // entity arm emits a RANK into RRF. See `docs/design/memory-index-decisions.md` §5.
 

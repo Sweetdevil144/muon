@@ -63,15 +63,26 @@ asarUnpack:
 # apps/desktop/staged/backend (run by the `package`/`dist` npm scripts BEFORE
 # electron-builder). Because these are plain files (not asar), the child's
 # require() + dlopen() resolve exactly as they do in `node backend/dist/index.js`.
+#
+# staged/ ALSO carries staged/cli (`scripts/stage-cli.mjs`, run in the same
+# npm scripts, right after stage-backend): the same `muon.mjs`/`muon-tui.mjs`/
+# `muon-mcp.mjs`/`package.json` the npm tarball ships, so a DMG-only install
+# carries the CLI/TUI/MCP too — landing at <Resources>/cli/. The Settings ->
+# Command Line Tools affordance (src/lib/cli-link.ts) is what makes them
+# reachable on the user's PATH; electron-builder only has to ship the bytes.
+# Because it is the bundler's OWN package.json (not hand-rolled), the staged
+# `muon.mjs` sits beside the same `muonDistributed` bake a tarball install
+# ships beside (ADR-0052) — a DMG-provided `muon` is gated identically.
 # ---------------------------------------------------------------------------
 extraResources:
-  # `from: staged` (the PARENT of staged/backend), NOT `from: staged/backend`.
-  # electron-builder's copy filter hardcodes `if (relative === "node_modules")
-  # return false`, it always drops the *root* node_modules directly under `from`
-  # (a NESTED node_modules is kept). Pointing `from` at the parent makes the
-  # backend's deps live at `backend/node_modules` (nested → kept), so the Prisma
-  # engine + LadybugDB addon + @muon/* all ship. staged/ contains only backend/,
-  # so this lands exactly one dir: <Resources>/backend/.
+  # `from: staged` (the PARENT of staged/backend and staged/cli), NOT
+  # `from: staged/backend`. electron-builder's copy filter hardcodes
+  # `if (relative === "node_modules") return false`, it always drops the
+  # *root* node_modules directly under `from` (a NESTED node_modules is
+  # kept). Pointing `from` at the parent makes the backend's deps live at
+  # `backend/node_modules` (nested → kept), so the Prisma engine + LadybugDB
+  # addon + @muon/* all ship. staged/ contains only backend/ and cli/, so
+  # this lands exactly two dirs: <Resources>/backend/ and <Resources>/cli/.
   # (No `filter:`, that path runs globs through globby, which also drops
   # node_modules; the stage already excludes *.ts/*.map.)
   - from: staged

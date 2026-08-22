@@ -1,3 +1,4 @@
+import { hueOnCanvas } from "../desk-tokens.js";
 import Graph from "graphology";
 import type {
   GitNexusGraphData,
@@ -261,7 +262,17 @@ export function brightenColor(hex: string, factor: number): string {
  * layout has somewhere to push from. Dangling edges are already dropped in main.
  */
 export function buildGraph(
-  data: GitNexusGraphData
+  data: GitNexusGraphData,
+  /**
+   * The canvas these nodes will be painted on. Node and edge hues encode KIND,
+   * and the palette is tuned for OSS's near-black ground — on the light desk
+   * the paler ones (the `#9ca3af` node fallback sits at 2.2:1 on white) simply
+   * vanished. `hueOnCanvas` keeps the hue and only pushes it away from the
+   * canvas until it clears WCAG 1.4.11's 3:1 for graphical objects, so a Class
+   * is still amber on both desks and the dark palette comes back untouched.
+   * Optional, defaulting to the dark canvas, so existing callers are unchanged.
+   */
+  canvas: string = "#141414"
 ): Graph<SigmaNodeAttributes, SigmaEdgeAttributes> {
   const graph = new Graph<SigmaNodeAttributes, SigmaEdgeAttributes>({
     multi: true,
@@ -275,7 +286,7 @@ export function buildGraph(
       x: Math.cos(angle) * radius + (i % 7) - 3,
       y: Math.sin(angle) * radius + (i % 5) - 2,
       size: scaledNodeSize(nodeSize(node.label), data.nodes.length),
-      color: nodeColor(node.label),
+      color: hueOnCanvas(nodeColor(node.label), canvas),
       label: nodeLabelText(node),
       nodeType: node.label,
       filePath: node.filePath,
@@ -288,7 +299,7 @@ export function buildGraph(
     try {
       graph.addEdgeWithKey(rel.id, rel.sourceId, rel.targetId, {
         size: 1,
-        color: edgeColor(rel.type),
+        color: hueOnCanvas(edgeColor(rel.type), canvas),
         relationType: rel.type,
         type: "curved",
         curvature: 0.25,

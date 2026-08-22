@@ -2,17 +2,9 @@
 // MUON TUI — THE desk (`npm run tui`).
 //
 // Cut over from the Ink desks on 2026-08-09 (ADR-0046 Phase 4, founder
-// authorised). The Ink desks remain reachable for one release as
-// `npm run tui:ink` and `npm run tui:legacy`, deprecated — kept only so a
-// human who needs a classic-only command is not stranded mid-release.
-//
-// THIS FILE IS WIRING ONLY. It used to be a 600-line script holding every
-// piece of state and every governed call, which meant no test could reach any
-// of it — and four adversarial reviews found that every CRITICAL and HIGH
-// defect lived exactly there. The behaviour now lives in `Desk` (desk.ts),
-// which takes its client, its geometry and its clock as dependencies. What is
-// left here is the part that genuinely needs a real terminal and a real
-// process: startup, the engine, signals, and the ADR-0047 capture on exit.
+// authorised); the Ink desks were then DELETED in ADR-0087 D4
+// (2026-08-22) — every port row in the retirement ledger shipped first,
+// then both desks, their tests and their scripts went in one commit.
 
 import {
   MuonApiClient,
@@ -22,6 +14,7 @@ import {
 } from "@muon/client";
 import { ensureBrain } from "@muon/client/ensure-brain";
 import { createBrainStore } from "../lib/brain-store.js";
+import { guardTuiIdentityGate } from "../lib/identity-gate.js";
 import { resolveStartupTarget } from "../lib/startup.js";
 import { ProcessTerminal } from "../vendor/pi-tui/src/terminal.ts";
 import { TuiAltScreen } from "../vendor/pi-tui/src/tui-alt-screen.ts";
@@ -29,6 +22,16 @@ import type { Shell } from "./shell.js";
 import { Desk } from "./desk.js";
 import { buildEntries, captureSnapshot, consumeSnapshot } from "./restore-snapshot.js";
 import { KeyStreamReader } from "./key-stream.js";
+
+// ADR-0052 — FIRST, before the brain, the client, or the alt screen.
+//
+// THIS is the entry `muon-tui` points at in the workspace manifest
+// (`dist/shell/index.js`), and the release bundles the classic entry under the
+// same bin name — so both had to gate, and neither did. A locked desk must
+// refuse in a plain terminal: once `TuiAltScreen` starts, a refusal written to
+// stderr lands inside a screen that is about to be torn down. In a dev checkout
+// there is no distributed bake, so this is a manifest read and a return.
+guardTuiIdentityGate();
 
 // Same local-first startup as every other entry: ensure the embedded brain,
 // never hijack an explicit --api-base (F1 no-hijack).
@@ -89,11 +92,27 @@ const desk = new Desk({
   // slow to stop a second press from duplicating the write.
   refresh: () => store.refresh(),
   branch: () => currentBranch,
+  // ADR-0087 M7: the crew detail composes the SAME shared loader
+  // `muon crew` reads, scoped to this workspace's active chat by the
+  // resolution rule the classic desk introduced (`lib/active-chat.ts`).
+  loadCrewDetail: async () => {
+    const { loadCrewPanel } = await import("../lib/crew-view.js");
+    const { resolveActiveChat } = await import("../lib/active-chat.js");
+    const chat = await resolveActiveChat(client, process.cwd());
+    if (!chat) return null;
+    return loadCrewPanel({
+      client,
+      chatId: chat.id,
+      apiBase: store.apiBase,
+      apiToken: store.apiToken,
+    });
+  },
 });
 
 // FIRST PAINT IS NEVER EMPTY: with no session, open the picker so the first
 // keystroke starts real work rather than staring at chrome.
 desk.bootstrap();
+
 
 const repaint = () => {
   desk.render();
@@ -123,6 +142,25 @@ process.stdout.on("resize", () => {
 // a restored corpse never appeared and F7 was "PRESENT" against a done-when it
 // did not meet.
 repaint();
+
+// ADR-0085 D2 — the desk LEADS with the digest. Order is load-bearing:
+// starting the desk is asserted presence, and that assertion ROLLS the
+// session boundary server-side (the old lastSeenAt becomes the digest
+// anchor) BEFORE the digest is derived from it. Best-effort both ways — an
+// old daemon without the route must not break the desk.
+void (async () => {
+  const { digestHasContent } = await import("./digest-pane.js");
+  await client.noteHumanPresent("tui").catch(() => undefined);
+  const digest = await client.getDigest().catch(() => null);
+  // A LATE response never interrupts a human already working (review
+  // finding): any keystroke before the fetch resolved means the desk is
+  // active, and a frame appearing over it is an interruption, not a
+  // greeting. `lastPresence` moves on the first keystroke.
+  if (digest && digestHasContent(digest) && lastPresence === 0) {
+    desk.showDigest(digest);
+    repaint();
+  }
+})();
 
 tui.setLayoutRoot(desk.shell);
 tui.setFocus(desk.shell);

@@ -57,8 +57,9 @@ export type CitationSource = {
   readonly refs?: unknown;
 };
 
-/** Read `refs.noteIds` out of arbitrary stored JSON, or nothing. */
-function noteIdsOf(refs: unknown): string[] {
+/** Read `refs.noteIds` out of arbitrary stored JSON, or nothing. Exported
+ *  for the ADR-0065 citation audit, so refs parsing has ONE spelling. */
+export function citedNoteIdsOf(refs: unknown): string[] {
   if (!refs || typeof refs !== "object" || Array.isArray(refs)) return [];
   const ids = (refs as { noteIds?: unknown }).noteIds;
   if (!Array.isArray(ids)) return [];
@@ -95,7 +96,7 @@ export function citationsByNote(
   for (const message of messages) {
     if (!isFindingKind(message.kind)) continue;
     if (message.fromJobId === readerJobId) continue;
-    const noteIds = noteIdsOf(message.refs);
+    const noteIds = citedNoteIdsOf(message.refs);
     for (const noteId of noteIds) {
       const candidate: CitingPeer = {
         jobId: message.fromJobId,

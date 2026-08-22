@@ -309,6 +309,57 @@ describe("coordination rows", () => {
   });
 });
 
+describe("buildMessageRows — citation provenance (ADR-0086 D2)", () => {
+  const message = (patch: Record<string, unknown> = {}) =>
+    peerMessage({
+      refs: { files: [], symbols: [], noteIds: ["mem-off", "mem-rel"] },
+      ...patch,
+    });
+
+  it("renders the shared classifier's sentences per cited id — flagged never drops", () => {
+    const rows = buildMessageRows(
+      [message()] as never,
+      [
+        {
+          messageId: "msg-1",
+          citations: [
+            { noteId: "mem-off", offered: true },
+            { noteId: "mem-rel", offered: false },
+          ],
+        },
+      ] as never
+    );
+    expect(rows[0].citations).toEqual([
+      "mem-off — cited, offered to this job",
+      "mem-rel — cited, never offered — relay",
+    ]);
+  });
+
+  it("no audit is NO claim: the citation still renders, without a provenance sentence", () => {
+    const rows = buildMessageRows([message()] as never, undefined);
+    expect(rows[0].citations).toEqual(["mem-off — cited", "mem-rel — cited"]);
+  });
+
+  it("the announced finding renders as a coordinate, not an offers verdict — and untrusted ids are sanitized", () => {
+    const rows = buildMessageRows(
+      [
+        message({
+          memoryNoteId: "mem-f\u001b[1Aind",
+          refs: { files: [], symbols: [], noteIds: [] },
+        }),
+      ] as never,
+      undefined
+    );
+    // terminalSafe NEUTRALIZES the escape byte (the sequence renders as
+    // inert text); the property that matters is no live ESC on the wire.
+    // The finding is its OWN field — a coordinate, never mixed into the
+    // audited citations (a renderer must not apply provenance to it).
+    expect(rows[0].citations).toEqual([]);
+    expect(rows[0].finding).toBe("mem-f [1Aind");
+    expect(rows[0].finding).not.toContain("\u001b");
+  });
+});
+
 describe("resolveMissionId", () => {
   it("takes the newest dispatch's lineage root", async () => {
     expect(

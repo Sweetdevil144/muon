@@ -1,6 +1,6 @@
 {
   "name": "@muon/cli",
-  "version": "0.3.1",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "bin": {
@@ -18,6 +18,7 @@
     "@muon/adapters": "file:../../packages/adapters",
     "@muon/client": "file:../../packages/client",
     "@muon/core": "file:../../packages/core",
+    "@muon/docgraph": "file:../../packages/docgraph",
     "@muon/orchestrator": "file:../../packages/orchestrator",
     "@muon/protocol": "file:../../packages/protocol",
     "@muon/runner": "file:../../packages/runner",

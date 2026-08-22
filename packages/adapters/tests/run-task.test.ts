@@ -50,7 +50,7 @@ class CursorEchoAdapter extends EchoAdapter {
 }
 
 describe("adapter task execution", () => {
-  it("keeps Cursor to the read-only slice: supportsWorktrees honest, write roles refused", async () => {
+  it("keeps Cursor to the non-write slice: supportsWorktrees honest, write roles refused", async () => {
     const adapter = new CursorAdapter();
 
     expect(await adapter.capabilities()).toEqual({
@@ -81,13 +81,17 @@ describe("adapter task execution", () => {
         role: "docs",
       })
     ).rejects.toThrow(/Cursor cannot hold the 'docs' role/i);
+    // ADR-0057: `orchestrator` is ACCEPTED now (authority `coordinate`, and a
+    // seated vendor has a reserved coordinator lane its own adapter must not
+    // refuse). Asserted positively so the change is pinned rather than merely
+    // no longer contradicted — and the write refusals above still stand.
     await expect(
       adapter.submitTask({
-        taskId: "cursor-write-role",
-        brief: "must not accept a task",
+        taskId: "cursor-coordinator-role",
+        brief: "coordinating is not writing",
         role: "orchestrator",
       })
-    ).rejects.toThrow(/Cursor cannot hold the 'orchestrator' role/i);
+    ).resolves.not.toThrow();
   });
 
   it("runs a task through the lane command runner and emits events", async () => {

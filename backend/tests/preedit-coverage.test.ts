@@ -519,3 +519,35 @@ describe("tallyGateCoverage (the shared re-tally the route reuses)", () => {
     expect(stale.emptyReason).toBeUndefined();
   });
 });
+
+describe("a bare symbol name must not fabricate a module anchor", () => {
+  // `moduleOfSymbol` returns an id without `#` unchanged — correct for a
+  // module-shaped target, wrong for a bare symbol. `resolveDataDir` became a
+  // module anchor literally named "resolveDataDir", giving `requested 1,
+  // resolved 0` — indistinguishable from a real but barren module — and the
+  // gate rendered it as "nothing is recorded here yet, not even unconfirmed"
+  // while two decision notes sat on the symbol's real module.
+  it("requests NO module for an unqualified symbol, so the gate says it looked at nothing", async () => {
+    // A bare symbol whose module DOES carry notes in this fixture, so a wrong
+    // implementation has something to accidentally find.
+    const ctx = await preEditContext(graph, { symbol: "chargeCard" }, { now: NOW });
+    // The symbol was asked about — without this, an implementation that drops
+    // the target entirely also yields 0 modules and `no_anchors`, and this test
+    // would pass while protecting nothing.
+    expect(ctx.coverage.anchors.symbols.requested).toBe(1);
+    expect(ctx.coverage.anchors.modules.requested).toBe(0);
+    expect(ctx.coverage.notes.considered).toBe(0);
+    // Its OWN member, not `no_anchors`: a symbol query DID run. `no_anchors`
+    // documents "no candidate query ran", and telemetry alarms on it.
+    expect(ctx.coverage.emptyReason).toBe("no_module_anchor");
+  });
+
+  it("still derives the module from a QUALIFIED symbol", async () => {
+    const ctx = await preEditContext(
+      graph,
+      { symbol: "src/pay/charge.ts#chargeCard" },
+      { now: NOW }
+    );
+    expect(ctx.coverage.anchors.modules.requested).toBeGreaterThan(0);
+  });
+});

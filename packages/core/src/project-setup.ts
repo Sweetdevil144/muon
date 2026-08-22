@@ -260,13 +260,16 @@ export async function runProjectSetup(input: {
             dataDir: input.dataDir,
           });
         } else {
+          // Pending confirmation is a TYPED state, never a problem entry.
+          // `confirmationRequired` carries the hash and the bound commands;
+          // a problem entry here made every dispatch on a confirmation-bound
+          // repo fail "not test-capable" before the runner could file the
+          // approval gate that records the confirmation.
           return {
             plan,
             confirmationRequired: confirmation,
             setup: setupRuns,
-            problems: [
-              `project lifecycle commands require operator confirmation (hash ${confirmation.setupHash.slice(0, 12)}…)`,
-            ],
+            problems,
           };
         }
       } else {
@@ -274,9 +277,7 @@ export async function runProjectSetup(input: {
           plan,
           confirmationRequired: confirmation,
           setup: setupRuns,
-          problems: [
-            `project lifecycle commands require operator confirmation (hash ${confirmation.setupHash.slice(0, 12)}…)`,
-          ],
+          problems,
         };
       }
     }

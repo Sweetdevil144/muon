@@ -69,6 +69,7 @@ describe("muon MCP tools", () => {
       "memory_delete",
       "memory_clone",
       "memory_add",
+      "memory_ground",
       "memory_preedit",
       "impact_memory",
       "preflight_edit",
@@ -81,8 +82,19 @@ describe("muon MCP tools", () => {
       "review_diff",
       "data_boundaries",
       "flow_scope",
+      // ADR-0053: the docs graph, registered BESIDE the code graph and in the
+      // same position the protocol inventory pins it — this array is the
+      // runtime order, so the two pins are what keep the registration and the
+      // inventory from drifting apart.
+      "docs_query",
+      "docs_context",
+      "docs_impact",
       "capability_preflight",
       "whoami",
+      // H5: pending gates + pending unconfirmed memory as coordinates. A READ,
+      // with no confirm/reject verb — the base tier gained visibility, not
+      // authority.
+      "review_queue",
       // A2A coordination tier: every worker gets it, not just the coordinator.
       "publish_finding",
       "peer_message",
@@ -93,6 +105,7 @@ describe("muon MCP tools", () => {
       // ADR-0043: two powerless ask-a-human tools, widened deliberately.
       "question_ask",
       "question_status",
+      "question_withdraw",
       "crew_roles",
     ]);
   });
@@ -109,6 +122,47 @@ describe("muon MCP tools", () => {
     );
     expect(result.isError).toBeUndefined();
     expect(result.content[0]!.text).toContain("mem-1");
+  });
+
+  it("ADR-0061: the search tool composes ONE suppressed_count across layers and rides the stubs verbatim", async () => {
+    // Server: 25 notes (the tool's own bound clips at 20), server-side cap
+    // count 3, one paused stub. suppressed_count = 3 + 5 (this tool's clip).
+    const notes = Array.from({ length: 25 }, (_, index) => ({
+      ...note,
+      id: `mem-${index + 1}`,
+    }));
+    const fetcher = vi.fn().mockResolvedValue(
+      mockResponse({
+        notes,
+        suppressed_count: 3,
+        withheld: [{ id: "mem-p", kind: "decision", reason: "paused" }],
+      })
+    );
+    const tool = toolByName(fetcher, "memory_search");
+    const result = await tool.handler({ query: "palette" });
+    expect(result.isError).toBeUndefined();
+    const structured = JSON.parse(result.content[0]!.text) as {
+      notes: unknown[];
+      suppressed_count: number;
+      withheld: unknown[];
+    };
+    expect(structured.notes).toHaveLength(20);
+    expect(structured.suppressed_count).toBe(8);
+    expect(structured.withheld).toEqual([
+      { id: "mem-p", kind: "decision", reason: "paused" },
+    ]);
+  });
+
+  it("ADR-0061: zero omission means ABSENT fields — never a manufactured zero", async () => {
+    const fetcher = vi.fn().mockResolvedValue(mockResponse({ notes: [note] }));
+    const tool = toolByName(fetcher, "memory_search");
+    const result = await tool.handler({ query: "palette" });
+    const structured = JSON.parse(result.content[0]!.text) as Record<
+      string,
+      unknown
+    >;
+    expect(structured.suppressed_count).toBeUndefined();
+    expect(structured.withheld).toBeUndefined();
   });
 
   it("memory_recall defaults to graph recall for the current task", async () => {
@@ -1941,6 +1995,29 @@ describe("handoff_read typed packet surfacing (P0.3)", () => {
     expect(payload._muon.evidence.degradedPackets).toBe(1);
   });
 
+  // ── H2: the coordination STATE carries the degrade, not just a counter ─────
+  //
+  // "handoff_available" read identically for a yellow packet and a clean one,
+  // so a coordinator scanning states (not counters) saw success. The state
+  // itself must name the degrade.
+  it("H2: a degraded packet flips the coordination state to handoff_degraded", async () => {
+    const { result } = await readHandoffs([
+      handoffRow({ packetJson: degradedV2Packet }),
+    ]);
+    const envelope = (result.structuredContent as { _muon: { coordination: { state: string } } })
+      ._muon;
+    expect(envelope.coordination.state).toBe("handoff_degraded");
+  });
+
+  it("H2: clean typed packets keep the plain available state", async () => {
+    const { result } = await readHandoffs([
+      handoffRow({ packetJson: validV2Packet }),
+    ]);
+    const envelope = (result.structuredContent as { _muon: { coordination: { state: string } } })
+      ._muon;
+    expect(envelope.coordination.state).toBe("handoff_available");
+  });
+
   it("keeps the data-only trust envelope on typed-packet results", async () => {
     const { payload } = await readHandoffs([
       handoffRow({ packetJson: validV2Packet }),
@@ -2456,5 +2533,135 @@ describe("a refusal must not send the agent somewhere useless", () => {
       /use the read tools \(memory_search/
     );
     expect(text).toMatch(/partitioned BY JOB/);
+  });
+
+  it("does not tell an attached coordinator seat it was hand-launched", async () => {
+    // MEASURED on a live `muon mcp attach claude-code` seat (2026-08-13):
+    // memory_delete answered "This session was hand-launched", which is false
+    // twice over — the seat HAS a job, and it is not a runner fault either.
+    const scope = {
+      jobId: "job-1",
+      chatId: "chat-a",
+      apiBase: "http://127.0.0.1:4000",
+      apiToken: "t",
+      seat: "attached-coordinator" as const,
+    };
+    const tools = createToolDefinitions({} as never, scope);
+    const remove = tools.find((tool) => tool.name === "memory_delete")!;
+
+    const result = await remove.handler({ noteId: "note-1" });
+    const text = result.content[0]?.text ?? "";
+
+    expect(result.isError).toBe(true);
+    expect(text).toMatch(/attached coordinator seat/i);
+    expect(text, "it has a job; it was not hand-launched").not.toMatch(
+      /hand-launched/i
+    );
+    expect(
+      text,
+      "and nothing is broken, so it must not be reported as an incident"
+    ).not.toMatch(/runner's environment/i);
+  });
+
+  it("a lane-less seat and a lane-less DISPATCHED child get opposite advice", () => {
+    const seat = ungovernedSessionRefusal(
+      "memory_clone",
+      "a job- and lane-scoped agent session",
+      { jobId: "job-1", seat: "attached-coordinator" }
+    );
+    const child = ungovernedSessionRefusal(
+      "memory_clone",
+      "a job- and lane-scoped agent session",
+      { jobId: "job-1" }
+    );
+    // The child IS an incident (the runner dropped a coordinate it should have
+    // injected); the seat is the design.
+    expect(child).toMatch(/runner's environment/);
+    expect(seat).not.toMatch(/runner's environment/);
+    expect(seat).toMatch(/by design/);
+  });
+
+  it("does not claim a job history the refusal cannot prove", () => {
+    // `requireAgentJobCapability` (backend/src/lib/auth.ts) emits the SHORT
+    // phrase for a bearer that never had a job at all, so asserting "its job is
+    // no longer active" there states a history that may be false. The longer
+    // app.ts message does carry it, and only then may the remedy say so.
+    const bare = remedyFor("This agent action requires the exact active job capability.");
+    const ended = remedyFor(
+      "This route requires the exact active job capability. The token was issued by MUON but its job is no longer active, so memory and crew routes have no partition to answer in."
+    );
+
+    expect(bare.matched).toBe(true);
+    expect(bare.action).not.toMatch(/its job is no longer active/i);
+    expect(bare.action).toMatch(/ended or it never had one/i);
+    expect(ended.action).toMatch(/no longer active/i);
+    // Same advice either way — only the claim about the past differs.
+    expect(bare.nextActions).toEqual(ended.nextActions);
+    // And the code-graph advice is qualified BY TRANSPORT: this is the one arm
+    // an HTTP-attached session can receive, and its transport refuses the
+    // whole surface for an inactive job — code-graph tools included.
+    const advice = bare.nextActions.join(" ");
+    expect(advice).toMatch(/stdio/i);
+    expect(advice).toMatch(/HTTP transport nothing does|HTTP.*re-attach/i);
+  });
+
+  it("the coordinator seat's remedy says dispatch, not retry", () => {
+    // Fed the GENERATOR'S OWN output, not a copied string: `remedyFor` matches
+    // on prose, and prose produced in one file and matched in another drifts
+    // apart silently — a reword would drop this refusal back to the generic
+    // "inspect muon doctor … retry" fallback with nothing failing. This test
+    // is the compile-time link the strings cannot have.
+    const remedy = remedyFor(
+      ungovernedSessionRefusal("memory_delete", "a job- and lane-scoped agent session", {
+        jobId: "job-1",
+        seat: "attached-coordinator",
+      })
+    );
+    expect(remedy.matched).toBe(true);
+    expect(remedy.nextActions.join(" ")).toMatch(/Do NOT retry/i);
+    expect(remedy.nextActions.join(" ")).toMatch(/dispatch/i);
+  });
+
+  it("the control-plane-bearer refusal lands its SPECIFIC remedy", async () => {
+    // Arm 4's phrase is produced by `coordinationScope` (a private helper), so
+    // the coupling test goes through the public surface: a coordination tool
+    // on a scope that HAS a job but no bearer. Same rationale as its siblings
+    // — generator and matcher live in different files, and a reword on either
+    // side must fail HERE, not silently degrade every coordination refusal to
+    // the generic fallback.
+    const tools = createToolDefinitions({} as never, {
+      jobId: "job-1",
+      chatId: "chat-a",
+    });
+    const inbox = tools.find((tool) => tool.name === "peer_inbox")!;
+    const refusal = await inbox.handler({});
+    const text = refusal.content[0]?.text ?? "";
+
+    expect(refusal.isError).toBe(true);
+    expect(text).toMatch(/control-plane bearer/);
+    const remedy = remedyFor(text);
+    expect(remedy.matched).toBe(true);
+    expect(remedy.action).toMatch(/injected at spawn/i);
+    expect(remedy.nextActions.join(" ")).toMatch(/Do NOT retry/i);
+  });
+
+  it("every arm of the refusal generator lands its SPECIFIC remedy", () => {
+    // The generator emits three shapes; each must reach its own remedy arm,
+    // and none may fall through to the generic fallback. Same rationale as
+    // above: generator and matcher live in different files.
+    const governed = remedyFor(
+      ungovernedSessionRefusal("memory_clone", "a job- and lane-scoped agent session", {
+        jobId: "job-9",
+      })
+    );
+    expect(governed.matched).toBe(true);
+    expect(governed.action).toMatch(/runner's environment/i);
+
+    const handLaunched = remedyFor(
+      ungovernedSessionRefusal("claim_files", "a job-scoped agent session")
+    );
+    expect(handLaunched.matched).toBe(true);
+    expect(handLaunched.action).toMatch(/partitioned by job/i);
+    expect(handLaunched.action).toMatch(/muon chat/i);
   });
 });

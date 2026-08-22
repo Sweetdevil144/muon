@@ -585,3 +585,59 @@ describe("profiles", () => {
     );
   });
 });
+
+// ── ADR-0067: the ratchet ────────────────────────────────────────────────────
+//
+// The relational pins above protect the ablation VERDICT (arm vs arm); they
+// cannot see ABSOLUTE quality drop — a weight change that halves real
+// precision passes every between-arm comparison. This block compares the
+// SHIPPED ranker's scores against the committed baseline, in BOTH
+// directions: a regression fails, and an unexplained improvement fails too,
+// because it means the baseline is stale — move
+// `src/fixtures/graph-value-baseline.json` in the SAME commit as the change
+// that moved the score. That is "every ranking change carries its
+// measurement", enforced by diff review instead of discipline.
+describe("ADR-0067: the shipped ranker's absolute quality is ratcheted", () => {
+  // The TEST owns the required coverage, never the artifact it polices
+  // (review finding: iterating the baseline's own keys meant a deleted
+  // profile or metric silently stopped being measured).
+  const REQUIRED_PROFILES = ["wide", "tight", "denseOff"] as const;
+  const REQUIRED_METRICS = ["recall", "precision", "ndcg"] as const;
+  const REQUIRED_ARM: ArmId = "+centrality";
+
+  it("matches the committed baseline within tolerance — coverage owned by the test, not the file", async () => {
+    const baseline = (
+      await import("../src/fixtures/graph-value-baseline.json", {
+        with: { type: "json" },
+      })
+    ).default as {
+      arm: string;
+      tolerance: number;
+      profiles: Record<string, Record<string, number>>;
+    };
+    expect(baseline.arm).toBe(REQUIRED_ARM);
+    expect(baseline.tolerance).toBeGreaterThan(0);
+    expect(baseline.tolerance).toBeLessThanOrEqual(0.005);
+    const profiles = runGraphValueEvalProfiles(SET);
+    for (const profileName of REQUIRED_PROFILES) {
+      const expected = baseline.profiles[profileName];
+      expect(
+        expected,
+        `baseline is missing required profile '${profileName}'`
+      ).toBeDefined();
+      const shipped = arm(profiles[profileName], REQUIRED_ARM);
+      for (const metric of REQUIRED_METRICS) {
+        const value = expected![metric];
+        expect(
+          typeof value,
+          `baseline is missing required metric '${profileName}.${metric}'`
+        ).toBe("number");
+        const measured = shipped[metric];
+        expect(
+          Math.abs(measured - value!),
+          `${profileName}.${metric}: measured ${measured}, baseline ${value} — if this change is intended, move graph-value-baseline.json in THIS commit`
+        ).toBeLessThanOrEqual(baseline.tolerance);
+      }
+    }
+  });
+});

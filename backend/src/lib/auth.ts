@@ -177,22 +177,56 @@ function attachedCoordinatorGrantCeiling(issuedAt: Date, nowMs: number): number 
   );
 }
 
-export async function resolveActiveAgentJobCapability(
+/**
+ * Why a capability lookup refused — so the auth hook can say something true
+ * without running the lookup twice.
+ *
+ * The first version of this was a second function that re-implemented the
+ * length bounds, the hash, the grant lookup, `capabilityTokenMatches` and the
+ * attached-coordinator horizon guard. Two copies of a security guard is how one
+ * of them drifts, and it re-queried both tables on every failed auth. One pass,
+ * one guard, a reason attached.
+ */
+export type AgentCapabilityRefusal =
+  /** No grant row matches this token: a wrong, forged or revoked credential.
+   *  (`revoke-grants` DELETES the row, so revocation lands here by design.) */
+  | "unrecognised"
+  /** MUON issued it and the row survives, but the lease has expired or the job
+   *  is over — a SCOPE refusal, not a credential fault.
+   *
+   *  Deliberately ONE bucket. An earlier version split "lapsed" out to advise
+   *  waiting for a heartbeat renewal, which cannot happen: renewal
+   *  authenticates with the very capability that has expired, and
+   *  `sweepExpiredAttachedCoordinators` retires the seat. Advice a caller
+   *  cannot act on is worse than none. */
+  | "inactive";
+
+export type AgentCapabilityResult =
+  | { readonly ok: true; readonly capability: AgentJobCapability }
+  | { readonly ok: false; readonly refusal: AgentCapabilityRefusal };
+
+export async function resolveAgentJobCapability(
   presented: string
-): Promise<AgentJobCapability | null> {
+): Promise<AgentCapabilityResult> {
+  const deny = (refusal: AgentCapabilityRefusal): AgentCapabilityResult => ({
+    ok: false,
+    refusal,
+  });
   if (presented.length < 32 || presented.length > 512) {
-    return null;
+    return deny("unrecognised");
   }
   const tokenHash = createHash("sha256").update(presented).digest("hex");
   const grant = await prisma.delegationGrant.findFirst({
     where: { tokenHash },
   });
-  if (
-    !grant ||
-    grant.expiresAt.getTime() <= Date.now() ||
-    !capabilityTokenMatches(grant.tokenHash, presented)
-  ) {
-    return null;
+  // UNRECOGNISED vs INACTIVE, decided here once. A missing row, or a hash that
+  // does not match, is a credential we never issued. A row that exists and
+  // matches but has lapsed is ours, and its job is simply over.
+  if (!grant || !capabilityTokenMatches(grant.tokenHash, presented)) {
+    return deny("unrecognised");
+  }
+  if (grant.expiresAt.getTime() <= Date.now()) {
+    return deny("inactive");
   }
   const job = await prisma.dispatchJob.findUnique({
     where: { id: grant.jobId },
@@ -209,6 +243,13 @@ export async function resolveActiveAgentJobCapability(
       interruptRequested: true,
     },
   });
+  // Evaluated ONCE, against one clock reading. The first version re-derived
+  // this inside the refusal branch with a fresh `Date.now()`, so a grant could
+  // be judged tampered by the guard and untampered a microsecond later.
+  const tampered =
+    job?.capabilityMode === ATTACHED_COORDINATOR_CAPABILITY_MODE &&
+    grant.expiresAt.getTime() >
+      attachedCoordinatorGrantCeiling(grant.issuedAt, Date.now());
   if (
     !job ||
     job.status !== "running" ||
@@ -220,23 +261,30 @@ export async function resolveActiveAgentJobCapability(
     // The lapsed-grant check above already applies to every capability mode;
     // this ADDS the independent horizon so a corrupted far-future
     // `expiresAt` is never trusted as an irrevocable grant (ADR-0028 §3).
-    (job.capabilityMode === ATTACHED_COORDINATOR_CAPABILITY_MODE &&
-      grant.expiresAt.getTime() >
-        attachedCoordinatorGrantCeiling(grant.issuedAt, Date.now()))
+    tampered
   ) {
-    return null;
+    // A TAMPERED grant is UNRECOGNISED, not merely inactive: a corrupted
+    // far-future expiry past the independent horizon (ADR-0028 §3) must fail
+    // closed at authentication. "Your token is genuine, merely out of scope"
+    // is the one sentence a doctored grant must never earn. A job that is
+    // simply finished or interrupted is the ordinary inactive case.
+    return deny(tampered || !job ? "unrecognised" : "inactive");
   }
   return {
-    jobId: job.id,
-    taskId: job.taskId,
-    vendor: job.vendor,
-    ...(job.chatId ? { chatId: job.chatId } : {}),
-    ...(job.parentJobId ? { parentJobId: job.parentJobId } : {}),
-    ...(job.rootJobId ? { rootJobId: job.rootJobId } : {}),
-    ...(job.capabilityMode ? { capabilityMode: job.capabilityMode } : {}),
-    ...(job.workspacePath ? { workspacePath: job.workspacePath } : {}),
+    ok: true,
+    capability: {
+      jobId: job.id,
+      taskId: job.taskId,
+      vendor: job.vendor,
+      ...(job.chatId ? { chatId: job.chatId } : {}),
+      ...(job.parentJobId ? { parentJobId: job.parentJobId } : {}),
+      ...(job.rootJobId ? { rootJobId: job.rootJobId } : {}),
+      ...(job.capabilityMode ? { capabilityMode: job.capabilityMode } : {}),
+      ...(job.workspacePath ? { workspacePath: job.workspacePath } : {}),
+    },
   };
 }
+
 
 export function requireAgentJobCapability(
   app: FastifyInstance,
@@ -527,8 +575,17 @@ export function agentJobRouteAllowed(request: FastifyRequest): boolean {
       is("GET", /^\/api\/fleet$/) ||
       is("GET", /^\/api\/lanes$/) ||
       is("POST", /^\/api\/crew\/roles$/) ||
+      // A13: the coordinator-tier read of what ITS OWN crew is blocked on.
+      // Deliberately not in `common` — a worker reads only its own questions
+      // (`GET /api/questions`), and this one spans a chat's whole crew. The
+      // route re-derives the chat from THIS capability, so it widens nothing.
+      is("GET", /^\/api\/questions\/crew$/) ||
       is("GET", /^\/api\/workflow-runs(?:\/[^/]+)?$/) ||
-      is("POST", /^\/api\/workflow-runs$/)
+      is("POST", /^\/api\/workflow-runs$/) ||
+      // A14 (ADR-0045): PROPOSE an amendment — an inert draft that changes no
+      // running plan. The APPLY route is deliberately absent from this block,
+      // exactly as `/apply` is: an attached seat proposes, a human gate applies.
+      is("POST", /^\/api\/workflow-runs\/[^/]+\/amendments$/)
     );
   }
 
@@ -557,10 +614,18 @@ export function agentJobRouteAllowed(request: FastifyRequest): boolean {
     // lane profile), so the chat's own coordinator may recompute its plan for
     // ITS chat; the route re-derives the partition from this capability.
     is("POST", /^\/api\/crew\/roles$/) ||
+    // A13: see the attached-coordinator block above. Same read, same fence,
+    // stated separately because these are two positive inventories and one
+    // must never inherit from the other.
+    is("GET", /^\/api\/questions\/crew$/) ||
     is("GET", /^\/api\/harnesses(?:\/[^/]+)?$/) ||
     is("GET", /^\/api\/workflow-runs(?:\/[^/]+)?$/) ||
     is("POST", /^\/api\/workflow-runs$/) ||
     is("PATCH", /^\/api\/workflow-runs\/[^/]+$/) ||
+    // A14 (ADR-0045): propose an amendment. Its APPLY sibling
+    // (`/amendments/:id/apply`) is deliberately NOT here — appending to a
+    // running plan is gated exactly as hard as applying one.
+    is("POST", /^\/api\/workflow-runs\/[^/]+\/amendments$/) ||
     is("POST", /^\/api\/workflow-runs\/[^/]+\/apply$/)
   );
 }

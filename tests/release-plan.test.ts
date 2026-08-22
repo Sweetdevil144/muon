@@ -4,7 +4,10 @@ import {
   checksummedArtifacts,
   feedNamesVersion,
   publicChecks,
+  pruneCommands,
   releaseArtifacts,
+  rollbackCommands,
+  snapshotCommands,
 } from "../scripts/lib/release-plan.mjs";
 
 // The release pipeline's artifact contract. These names are load-bearing far
@@ -63,8 +66,8 @@ describe("checksummedArtifacts", () => {
 describe("aliasCommands", () => {
   it("copies on the host, never re-uploads", () => {
     expect(aliasCommands("0.1.0")).toEqual([
-      "cp /data/muon-cli-0.1.0.tgz /data/muon-cli-latest.tgz",
-      "cp /data/MUON-0.1.0-arm64.dmg /data/MUON-latest-arm64.dmg",
+      "ln -f /data/muon-cli-0.1.0.tgz /data/muon-cli-latest.tgz",
+      "ln -f /data/MUON-0.1.0-arm64.dmg /data/MUON-latest-arm64.dmg",
     ]);
   });
 });
@@ -97,5 +100,50 @@ describe("feedNamesVersion", () => {
   it("rejects a stale feed from a previous build directory", () => {
     const feed = "version: 0.0.9\nfiles:\n  - url: MUON-0.0.9-arm64-mac.zip\n";
     expect(feedNamesVersion(feed, "0.1.0")).toBe(false);
+  });
+});
+
+/**
+ * Founder policy (2026-08-20): snapshot the live release, prune everything
+ * else, upload, verify, then retire the old names. The invariant that earns
+ * its own assertions: uploads REWRITE feeds in place (`cat >`), so the
+ * snapshot must COPY the three feed files — a hardlinked feed would be
+ * truncated at the exact moment it becomes the only rollback.
+ */
+describe("snapshot / prune / rollback commands", () => {
+  it("snapshots versioned artifacts as hardlinks and feeds as copies", () => {
+    const cmds = snapshotCommands("0.4.8").join("\n");
+    expect(cmds).toContain("rm -rf /data/.rollback && mkdir -p /data/.rollback/0.4.8");
+    expect(cmds).toContain('ln -f "/data/MUON-0.4.8-arm64.dmg" "/data/.rollback/0.4.8/MUON-0.4.8-arm64.dmg"');
+    expect(cmds).toContain('cp "/data/latest-mac.yml" "/data/.rollback/0.4.8/latest-mac.yml"');
+    // NEVER a hardlinked feed.
+    expect(cmds).not.toContain('ln -f "/data/latest-mac.yml"');
+    expect(cmds).not.toContain('ln -f "/data/SHA256SUMS"');
+    expect(cmds).not.toContain('ln -f "/data/latest-cli.json"');
+  });
+
+  it("prune keeps both named versions and the two aliases, removes strays", () => {
+    const cmd = pruneCommands("0.4.8", "0.4.9")[0];
+    expect(cmd).toContain('"MUON-0.4.8-arm64.dmg"');
+    expect(cmd).toContain('"MUON-0.4.9-arm64.dmg"');
+    expect(cmd).toContain('"MUON-latest-arm64.dmg"');
+    expect(cmd).toContain('"muon-cli-latest.tgz"');
+    expect(cmd).toContain("rm -f");
+    // Feeds are not in the glob set at all.
+    expect(cmd).not.toContain("latest-mac.yml");
+  });
+
+  it("the post-verify prune keeps ONLY the new release", () => {
+    const cmd = pruneCommands("0.4.9")[0];
+    expect(cmd).toContain('"MUON-0.4.9-arm64.dmg"');
+    expect(cmd).not.toContain("0.4.8");
+  });
+
+  it("rollback restores names as hardlinks, feeds as copies, and re-points aliases", () => {
+    const cmds = rollbackCommands("0.4.8").join("\n");
+    expect(cmds).toContain('ln -f "/data/.rollback/0.4.8/MUON-0.4.8-arm64.dmg" "/data/MUON-0.4.8-arm64.dmg"');
+    expect(cmds).toContain('cp "/data/.rollback/0.4.8/latest-mac.yml" "/data/latest-mac.yml"');
+    expect(cmds).toContain("MUON-latest-arm64.dmg");
+    expect(cmds).toContain("muon-cli-latest.tgz");
   });
 });

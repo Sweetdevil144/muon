@@ -174,28 +174,59 @@ describe("Connections — the fields §5 requires, read from the shared report",
 describe("Connections — installable and coordinatorSeat are BOTH shown", () => {
   it("prints both booleans for all four vendors, never one alone", () => {
     // §2.2: conflating "MUON can install into it" with "it can coordinate a
-    // crew" is the documentation failure ADR-0022 warns about. Cursor and
-    // opencode are installable AND seatless, which is the pair a surface that
-    // showed only `installable` would misrepresent.
+    // crew" is the documentation failure ADR-0022 warns about. Since ADR-0057
+    // all four answer YES to both — which is exactly when a surface that
+    // printed `installable` twice would look right. So the seat sentence is
+    // counted against what the ROWS say, and the seatless rendering is proven
+    // separately below with a row that actually holds no seat.
     const built = report();
     panel({ report: built });
     expect(screen.getAllByText("Installable")).toHaveLength(4);
     expect(screen.getAllByText("Coordinator seat")).toHaveLength(4);
 
-    const seatless = built.vendors.filter((row) => !row.coordinatorSeat);
-    expect(seatless.map((row) => row.vendor)).toEqual(["cursor", "opencode"]);
+    const seated = built.vendors.filter((row) => row.coordinatorSeat);
+    expect(seated.map((row) => row.vendor)).toEqual([
+      "claude-code",
+      "codex",
+      "cursor",
+      "opencode",
+    ]);
     for (const row of built.vendors) {
       expect(row.installable).toBe(true);
     }
     // Testing Library normalizes the leading space off these spans.
     expect(
+      screen.getAllByText("— it can be the superagent that dispatches a crew")
+    ).toHaveLength(seated.length);
+    expect(
+      screen.queryByText(
+        "— it can use MUON's memory + code graph, never coordinate a crew"
+      )
+    ).toBeNull();
+  });
+
+  it("still prints the SEATLESS sentence for a row that holds no seat", () => {
+    // Fail-closed rendering with no live example left: fabricate the row rather
+    // than retire the branch. A panel that had started deriving the sentence
+    // from `installable` would print the seat-holder wording here.
+    const built = report();
+    panel({
+      report: {
+        ...built,
+        vendors: built.vendors.map((row) => ({
+          ...row,
+          coordinatorSeat: false,
+        })),
+      },
+    });
+    expect(
       screen.getAllByText(
         "— it can use MUON's memory + code graph, never coordinate a crew"
       )
-    ).toHaveLength(seatless.length);
+    ).toHaveLength(built.vendors.length);
     expect(
-      screen.getAllByText("— it can be the superagent that dispatches a crew")
-    ).toHaveLength(built.vendors.length - seatless.length);
+      screen.queryByText("— it can be the superagent that dispatches a crew")
+    ).toBeNull();
   });
 });
 
@@ -243,13 +274,15 @@ describe("Connections — parity with the shared evaluator", () => {
     expect(summary).toContain("none");
     expect(summary).toContain("lockfile.agentToken");
     expect(summary).toContain("999 tools");
-    // The seat booleans followed the ROW, not the vendor registry: claude-code
-    // and codex really hold the seat, and here they must read as if they do not.
+    // The seat booleans followed the ROW, not the vendor registry: all four
+    // really hold the seat (ADR-0057), and here they must read as if none does.
+    // Counted from the fixture rather than a literal, so the next registry move
+    // cannot make this pass for the wrong reason.
     expect(
       screen.getAllByText(
         "— it can use MUON's memory + code graph, never coordinate a crew"
       )
-    ).toHaveLength(2);
+    ).toHaveLength(base.vendors.filter((row) => row.coordinatorSeat).length);
   });
 });
 
@@ -352,12 +385,15 @@ describe("Connections — ADR-0028 Tier C attach/detach", () => {
   it("shows the attach row only for coordinator-seat vendors, and only Attach when nothing is attached", () => {
     const built = report();
     panel({ report: built, onAttach: vi.fn(), onDetach: vi.fn() });
-    // Two coordinator-seat vendors (claude-code, codex) get the row; cursor
-    // and opencode — seatless — must not.
-    expect(screen.getAllByText("Not attached")).toHaveLength(2);
-    expect(
-      screen.getAllByRole("button", { name: "Attach" })
-    ).toHaveLength(2);
+    // ADR-0057: all four hold the seat, so all four get the row. Counted from
+    // the report so a vendor that lost its seat would fail here rather than
+    // silently losing its Attach button.
+    const seated = built.vendors.filter((row) => row.coordinatorSeat).length;
+    expect(seated).toBe(4);
+    expect(screen.getAllByText("Not attached")).toHaveLength(seated);
+    expect(screen.getAllByRole("button", { name: "Attach" })).toHaveLength(
+      seated
+    );
     expect(screen.queryByRole("button", { name: "Detach" })).toBeNull();
   });
 
@@ -409,8 +445,10 @@ describe("Connections — ADR-0028 Tier C attach/detach", () => {
       ]),
     });
     expect(screen.getByText("Attached coordinator (non-hermetic)")).toBeTruthy();
-    // codex is attached; claude-code (the other coordinator-seat vendor) is not.
-    expect(screen.getByText("Not attached")).toBeTruthy();
+    // codex is attached; the other three seat-holders are not.
+    expect(screen.getAllByText("Not attached")).toHaveLength(
+      built.vendors.filter((row) => row.coordinatorSeat).length - 1
+    );
     expect(
       screen.getByRole("button", { name: "Detach" })
     ).toBeTruthy();

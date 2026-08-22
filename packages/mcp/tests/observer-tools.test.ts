@@ -44,7 +44,11 @@ describe("Tier B attached observer inventory", () => {
     // the base coordination tier. For an attached observer both fail closed
     // at the transport (no exact-job bearer), so the widening is inventory
     // presence only, never authority.
-    expect(tools).toHaveLength(37);
+    // 38 = the prior 37 + H5's review_queue, which rides the base context tier.
+    // 41 = the prior 38 + ADR-0053's three docs-graph READS, same channel: they
+    // ride the base context tier, so an observer holds them too.
+    // 42 = 41 + ADR-0058's memory_ground in the shared base.
+    expect(tools).toHaveLength(43);
     expect(tools.filter((tool) => tool.name === "crew_roles")).toHaveLength(1);
     expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length);
     expect(new Set(tools.map((tool) => tool.name))).toEqual(
@@ -189,5 +193,62 @@ describe("Tier B attached observer inventory", () => {
     // A DIFFERENT session may observe a different chat; one session may not.
     const other = await sessionTwo.handler({ chatId: "chat-b" });
     expect(other.isError).not.toBe(true);
+  });
+});
+
+describe("workflow_status carries the caller job capability", () => {
+  const run = {
+    id: "run-1",
+    status: "proposed",
+    workspacePath: "/w",
+    proposal: { summary: "s", steps: [] },
+  };
+
+  it("forwards the scope's workflow control to the workflow routes", async () => {
+    // `requireWorkflowChatCapability` authenticates the CALLER'S JOB, not the
+    // bearer: without these headers the route answers 403 and the tool could
+    // never read a run — including one `propose_workflow` had just created
+    // from the same seat.
+    const listWorkflowRuns = vi.fn().mockResolvedValue([run]);
+    const listTasks = vi.fn().mockResolvedValue([]);
+    const tools = createObserverToolDefinitions(
+      client({ listWorkflowRuns, listTasks } as never),
+      {
+        apiBase: "http://127.0.0.1:4000",
+        apiToken: "agent-token",
+        chatId: "chat-a",
+        workflowControl: {
+          callerJobId: "job-1",
+          delegationToken: "d".repeat(64),
+        },
+      }
+    );
+    const status = tools.find((tool) => tool.name === "workflow_status")!;
+
+    const result = await status.handler({ runId: "run-1" });
+
+    expect(result.isError).not.toBe(true);
+    expect(listWorkflowRuns).toHaveBeenCalledWith(
+      { chatId: "chat-a" },
+      { callerJobId: "job-1", delegationToken: "d".repeat(64) }
+    );
+  });
+
+  it("a jobless Tier B observer still reads — control is OPTIONAL", async () => {
+    // `requireWorkflowReadCapability` has a deliberate branch for an agent-tier
+    // request with no job capability and no lineage headers: one named chat,
+    // read-only. Sending nothing is the SUPPORTED path for that tier, so this
+    // must not be pre-refused locally.
+    const listWorkflowRuns = vi.fn().mockResolvedValue([run]);
+    const tools = createObserverToolDefinitions(
+      client({ listWorkflowRuns, listTasks: vi.fn().mockResolvedValue([]) } as never),
+      { apiBase: "http://127.0.0.1:4000", apiToken: "agent-token", chatId: "chat-a" }
+    );
+    const status = tools.find((tool) => tool.name === "workflow_status")!;
+
+    const result = await status.handler({ runId: "run-1" });
+
+    expect(result.isError).not.toBe(true);
+    expect(listWorkflowRuns).toHaveBeenCalledWith({ chatId: "chat-a" }, undefined);
   });
 });

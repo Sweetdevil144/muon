@@ -70,14 +70,16 @@ describe("P0-5 Observatory (local, consent-gated, no egress)", () => {
       platform: "darwin",
       arch: "arm64",
       provider: OBSERVATORY_UPLOAD_PROVIDER,
-      schema: 1,
+      schema: 2,
     });
     expect(rows[1]!.reason).toBe("oom");
     // PRIVACY BY SHAPE: no row has any field beyond the closed vocabulary.
+    // (v2 added the surface-event fields: surface, tool, durationMs, error,
+    // client — all closed enums or numbers, per ADR-0095.)
     for (const row of rows) {
       for (const key of Object.keys(row)) {
         expect(
-          ["name", "at", "appVersion", "platform", "arch", "provider", "schema", "reason", "coldStartMs", "updateAvailable"],
+          ["name", "at", "appVersion", "platform", "arch", "provider", "schema", "reason", "coldStartMs", "updateAvailable", "surface", "trigger", "tool", "durationMs", "error", "client"],
           key
         ).toContain(key);
       }

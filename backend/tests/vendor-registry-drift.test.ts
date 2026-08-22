@@ -776,7 +776,8 @@ describe("vendor registry drift-lock — sessions", () => {
     for (const [relativePath, expression] of [
       ["backend/src/routes/dispatch.ts", "!sessionCapability(controlled.vendor).canSend"],
       ["packages/runner/src/execute.ts", "sessionCapability(vendor).canSend"],
-      ["apps/tui/src/lib/session-controller.ts", "sessionCapability(input.lane.key).canSend"],
+      // ADR-0087 D4 removed the third site with the classic desk's
+      // session controller; the two production reads remain.
     ] as const) {
       const source = sourceCode(relativePath);
       expect(source).toContain(expression);

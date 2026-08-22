@@ -12,6 +12,8 @@ import {
   createMemoryWindowStore,
   createStreamRecorder,
   ensureTaskWorktree,
+  hasForkSeed,
+  materializeForkWorktree,
   extractMemoriesViaLane,
   hashMiningOutput,
   ingestCandidates,
@@ -25,7 +27,10 @@ import {
   runLoop,
   resolveRepoRoot,
   selectMemorySliceNotes,
+  selectOwnershipNotes,
   selectStandingNotes,
+  hasOwnershipTag,
+  withInstitutionalPack,
   startManagedSession,
   stdinBriefDeliveryStall,
   summarizeWorktreePreparation,
@@ -91,6 +96,10 @@ import {
   type DispatchJobRecord,
   type MuonApiClient,
 } from "@muon/client";
+import {
+  describeIndexFreshnessGap,
+  probeGitNexusIndexFreshness,
+} from "@muon/client/gitnexus-freshness";
 import { verifyEditPreflightCoverage } from "./preflight-coverage.js";
 import {
   createContextEvidenceRecorder,
@@ -677,6 +686,21 @@ function makeSessionLedger(client: MuonApiClient): SessionLedger {
             : null
         )
         .catch(() => null),
+    // Durable approval-grant redemption (ADR-0056, the `always` grade): same
+    // collapse-to-null contract as receipts above, for the same reason — a
+    // transport failure must mean "ask a human", never deny and never allow.
+    redeemGrant: (input) =>
+      client
+        .redeemApprovalGrant(input)
+        .then((result) =>
+          result.redeemed && result.grant
+            ? {
+                grantId: result.grant.id,
+                expiresAt: result.grant.expiresAt,
+              }
+            : null
+        )
+        .catch(() => null),
   };
 }
 
@@ -1210,6 +1234,10 @@ async function buildTerminalPacket(args: {
       openQuestions: report?.openQuestions,
       uncertainties: report?.uncertainties,
       memoryProposals,
+      // ADR-0062: the worker's answer to "did you update the brain?", when
+      // the optional eleventh report section carried one. Absence is stamped
+      // server-side at the terminal transition, never inferred here.
+      ...(report?.brainReceipt ? { brainReceipt: report.brainReceipt } : {}),
       // THE PACKET'S OWN COPY of what the worker actually said, kept whether or
       // not the report parsed. Until this, a final report survived in exactly
       // one truncated place — the live stream chunk — and for a loop job the
@@ -1713,7 +1741,18 @@ export async function executeJob(
   // already-authorized set, so this cannot widen any read. Empty spec →
   // undefined → byte-identical to the pre-0.4 calls.
   const sliceFilter = memorySliceFilter(harness.memorySlice);
-  const [taskNotes, objectiveNotes, standingNotes] = await Promise.all([
+  // ADR-0051 §3 — the institutional arm supersedes the plain standing arm
+  // when the client carries it: same fixed server posture, widened only by
+  // human-confirmed ownership/why-TAGGED decisions. The runner partitions the
+  // response by tag below; a client without the method falls back to the
+  // standing arm byte-identically, and a failed fetch degrades to an empty
+  // arm exactly like the other two. `null` (vs `[]`) records that the fetch
+  // never succeeded, so the pack renderer cannot claim "no ownership notes
+  // exist" about a question that was never answered.
+  const institutionalCapable =
+    Boolean(opts.jobClient) &&
+    typeof cognitionClient.recallInstitutionalMemory === "function";
+  const [taskNotes, objectiveNotes, fetchedCanon] = await Promise.all([
     cognitionClient
       .recallRelatedToTask(taskId, job.chatId ?? undefined, sliceFilter)
       .catch(() => []),
@@ -1738,11 +1777,40 @@ export async function executeJob(
     // heading that names this one — a false provenance claim. Absence → empty
     // arm, the pre-4.1 brief byte-identical. The `typeof` guard additionally
     // keeps a narrower client that lacks the method on that same path.
-    opts.jobClient &&
-    typeof cognitionClient.recallStandingMemory === "function"
-      ? cognitionClient.recallStandingMemory().catch(() => [])
-      : Promise.resolve([]),
+    institutionalCapable
+      ? cognitionClient
+          .recallInstitutionalMemory()
+          .catch(() => null)
+      : opts.jobClient &&
+          typeof cognitionClient.recallStandingMemory === "function"
+        ? cognitionClient
+            .recallStandingMemory()
+            .then((notes) => ({ notes, ownershipScanComplete: true }))
+            .catch(() => null)
+        : Promise.resolve(null),
   ]);
+  // Partition the canon: ownership/why-tagged notes feed the institutional
+  // pack's named slice; everything else is the standing canon exactly as
+  // before. Without the institutional method the partition is a no-op (the
+  // server never sent tagged-only rows) and `standingNotes` is the whole
+  // response, byte-identical to the pre-0051 arm. `ownershipScanComplete`
+  // is the server's scan honesty: when false, the pack must not assert a
+  // ledger-wide absence of ownership notes.
+  const canonNotes = fetchedCanon?.notes ?? [];
+  const ownershipScanComplete = fetchedCanon?.ownershipScanComplete ?? true;
+  // ADR-0091 D3: the ownership slice is the KIND or the legacy tag — a
+  // first-class ownership note without a tag must not fall into the
+  // standing slice, whose selector rejects its kind (review finding).
+  const inOwnershipSlice = (note: (typeof canonNotes)[number]) =>
+    note.kind === "ownership" || hasOwnershipTag(note);
+  const ownershipNotes =
+    institutionalCapable && fetchedCanon
+      ? canonNotes.filter(inOwnershipSlice)
+      : [];
+  const standingNotes =
+    institutionalCapable && fetchedCanon
+      ? canonNotes.filter((note) => !inOwnershipSlice(note))
+      : canonNotes;
   // No authorship filter here. `selectMemorySliceNotes` below is VOUCHED-only:
   // a human confirm OR the orchestrator's vouch (P0-2), which is the posture
   // deciding, exactly as this comment always said it must. Mined prose rides
@@ -1774,8 +1842,56 @@ export async function executeJob(
     standingSelection.selected.map((note) => note.id)
   );
   const surfacedIds = new Set(surfaced.map((note) => note.id));
+  // ADR-0051: the pack's ownership slice, selected with the same
+  // defense-in-depth predicate the renderer uses, so telemetry and the brief
+  // can never disagree about what rode in.
+  const ownershipSelection = selectOwnershipNotes(
+    ownershipNotes,
+    undefined,
+    job.workspacePath
+  );
+  const ownershipSelectedIds = new Set(
+    ownershipSelection.selected.map((note) => note.id)
+  );
   let includedOrdinal = 0;
   const memoryContextExposures: ContextExposureInput[] = [
+    // Pack slice first: it renders ABOVE the standing canon on the wire, so
+    // its ordinals come first.
+    ...ownershipNotes.map((note) => {
+      // Mirrors selectOwnershipNotes' FULL predicate: a paused note or a
+      // non-canonical kind is structurally INELIGIBLE, not "dropped by the
+      // budget" — telemetry that says eligible-but-excluded for those would
+      // blame a budget that never saw them.
+      const eligible =
+        note.confirmed &&
+        !note.stale &&
+        (note.status == null || note.status === "active") &&
+        // ADR-0091: mirrors selectOwnershipNotes — the first-class kind is
+        // eligible outright (review finding: included-but-ineligible rows
+        // were corrupting coverage metrics).
+        (note.kind === "ownership" ||
+          note.kind === "decision" ||
+          note.kind === "constraint" ||
+          note.kind === "convention") &&
+        !(
+          job.workspacePath != null &&
+          note.workspacePath != null &&
+          note.workspacePath !== job.workspacePath
+        );
+      const included = ownershipSelectedIds.has(note.id);
+      return {
+        artifactKind: "memory_note" as const,
+        artifactId: note.id,
+        eligible,
+        included,
+        reason: "institutional_pack",
+        ...(included ? { ordinal: includedOrdinal++ } : {}),
+        charCount: note.text.length,
+        trustTier: note.confirmed
+          ? ("human_confirmed" as const)
+          : ("trust_floor" as const),
+      };
+    }),
     ...standingNotes.map((note) => {
       const eligible =
         note.confirmed &&
@@ -1913,6 +2029,58 @@ export async function executeJob(
       vendor,
     })
   );
+  // A10 — dispatch-time index freshness. Best-effort like the drift block: a
+  // probe failure adds nothing and can never fail a job. A fresh index feeds
+  // the pack's one-line graph-shape summary. Only a STALE index raises the
+  // loud TOOL GAP block: stale evidence looks authoritative and is not, which
+  // is exactly the silent degrade Feature #10 exists to name. A MISSING index
+  // stays quiet here — the graph tools already report their own absence with
+  // an explicit indexing action, and a block that fires on every dispatch in
+  // an unindexed repo trains agents to skip it where it matters.
+  let indexFreshness:
+    | Awaited<ReturnType<typeof probeGitNexusIndexFreshness>>
+    | undefined;
+  try {
+    if (job.workspacePath) {
+      indexFreshness = await probeGitNexusIndexFreshness(job.workspacePath);
+    }
+  } catch {
+    indexFreshness = undefined;
+  }
+  const indexFreshnessGap =
+    indexFreshness?.status === "stale"
+      ? describeIndexFreshnessGap(indexFreshness)
+      : undefined;
+  // ADR-0051 §3 — the pack exists only when the institutional fetch actually
+  // answered; rendering "no ownership notes exist" off a fetch that never
+  // ran would be a false claim about the ledger.
+  const institutionalPack =
+    institutionalCapable && fetchedCanon
+      ? {
+          ownership: ownershipNotes,
+          ownershipScanComplete,
+          ...(indexFreshness
+            ? {
+                graphShape: {
+                  status: indexFreshness.status,
+                  ...(indexFreshness.indexedAt
+                    ? { indexedAt: indexFreshness.indexedAt }
+                    : {}),
+                  ...(indexFreshness.stats?.files != null
+                    ? { files: indexFreshness.stats.files }
+                    : {}),
+                  ...(indexFreshness.stats?.nodes != null
+                    ? { nodes: indexFreshness.stats.nodes }
+                    : {}),
+                  ...(indexFreshness.stats?.processes != null
+                    ? { processes: indexFreshness.stats.processes }
+                    : {}),
+                },
+              }
+            : {}),
+          scope: { workspacePath: job.workspacePath },
+        }
+      : null;
   const fullBrief = withWorkerPreamble(
     // ADR-0026 §9: the slice states WHICH repository's memory it is, read from
     // `job.workspacePath` — the same authenticated column the backend derives the
@@ -1920,18 +2088,25 @@ export async function executeJob(
     // `MUON_WORKSPACE`: this file remaps that to the governed task worktree for
     // every worker under an editing harness (see `capabilityMode === "worker"`
     // below), which would label each dispatch with its own throwaway path.
-    withStandingMemory(
-      withMemorySlice(job.brief, notes, harness.memorySlice.k, {
-        workspacePath: job.workspacePath,
-      }),
-      standingNotes,
-      { scope: { workspacePath: job.workspacePath } }
+    // Wire order: preamble → institutional pack → standing canon → memory
+    // slice → brief. The pack precedes the canon because "who owns this and
+    // why, and what shape is the graph in" frames how the canon is read.
+    withInstitutionalPack(
+      withStandingMemory(
+        withMemorySlice(job.brief, notes, harness.memorySlice.k, {
+          workspacePath: job.workspacePath,
+        }),
+        standingNotes,
+        { scope: { workspacePath: job.workspacePath } }
+      ),
+      institutionalPack
     ),
     {
       fullAuto: process.env.MUON_FULL_AUTO === "1",
       ...(preambleRole ? { role: preambleRole } : {}),
       ...(environmentDrift.length > 0 ? { environmentDrift } : {}),
       ...(toolGap ? { toolGap } : {}),
+      ...(indexFreshnessGap ? { indexFreshnessGap } : {}),
     }
   );
 
@@ -2076,10 +2251,44 @@ export async function executeJob(
           };
         }
       }
-      const worktree = await ensureTaskWorktree({
+      // ADR-0044/0071 D5: fork paths defer dependency preparation to the
+      // materialisation authority so it runs against the RECORDED state,
+      // not today's HEAD (review finding: a preparation that fails at HEAD
+      // but would succeed at the captured commit permanently blocked the
+      // fork; it also prepared every fork tree twice).
+      const forkPath = hasForkSeed(taskId) || Boolean(job.forkSourceTaskId);
+      const ensured = await ensureTaskWorktree({
         repoRoot,
         taskId,
+        skipPreparation: forkPath,
       });
+      // The ONE core materialisation authority — fail-closed in every
+      // direction (half-tree discard, stash-gone refusal, dependency
+      // preparation at the recorded state on BOTH the apply and the
+      // healthy-reuse branches). Keyed on the STASH, not on which job
+      // created the tree (a harness-less fork root never creates a
+      // worktree — whichever job DOES create it must seed it). The fork
+      // ROOT carries the persisted provenance; the stash must agree with
+      // it (children carry none and seed by stash presence alone).
+      const materialization = await materializeForkWorktree({
+        repoRoot,
+        taskId,
+        worktreePath: ensured.path,
+        worktreeCreated: ensured.created,
+        expectedSourceTaskId: job.forkSourceTaskId ?? undefined,
+      });
+      if (!materialization.ok) {
+        return { status: "failed", result: materialization.reason };
+      }
+      const worktree = materialization.preparation
+        ? { ...ensured, preparation: materialization.preparation }
+        : ensured;
+      if (materialization.seeded) {
+        const seeded = materialization.seeded;
+        log(
+          `fork worktree seeded from the captured step @ ${seeded.baseCommit.slice(0, 12)}: diff ${seeded.appliedDiff ? "applied" : "empty"}, ${seeded.untrackedCopied} untracked file(s) copied, ${seeded.symlinksRestored} symlink(s) restored verbatim`
+        );
+      }
       cwd = worktree.path;
       // The worker is about to be told "run the checks". Say out loud what it
       // was actually handed, so an operator reading the log can tell a real

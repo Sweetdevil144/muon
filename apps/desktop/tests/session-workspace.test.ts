@@ -8,6 +8,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BUDGET_EXHAUSTED_MARKER } from "@muon/client";
@@ -679,7 +680,13 @@ describe("SessionWorkspace", () => {
     expect(screen.getByRole("heading", { name: "Parser review" })).toBeTruthy();
     expect(screen.getByText("Work only")).toBeTruthy();
     expect(screen.getByText("Depth 1 of 3")).toBeTruthy();
-    expect(screen.getByText("/repo")).toBeTruthy();
+    // Scoped to the Overview meta rows: H6 added a ledger-fact strip to the
+    // HEADER that also names this job's tree (and labels it worktree vs
+    // workspace, which the row below cannot). Both are true and both belong;
+    // this assertion is about the Overview contract, so it says which one.
+    expect(
+      within(document.querySelector(".session-meta-grid")!).getByText("/repo")
+    ).toBeTruthy();
 
     fireEvent.click(screen.getByRole("tab", { name: "Commands" }));
     expect(screen.getByText("/review")).toBeTruthy();
@@ -875,14 +882,19 @@ describe("SessionWorkspace inline governance gate (Wave 4.1)", () => {
     expect(banner.textContent).toMatch(/Fail-closed/);
   });
 
-  it("offers EXACTLY three actions and nothing else — no navigation competing with the decision", () => {
+  it("offers EXACTLY four actions and nothing else — no navigation competing with the decision", () => {
     const { onReviewApproval } = renderTab({ approvals: [PENDING_GATE] });
     const banner = screen.getByRole("region", {
       name: "Pending decision for this agent",
     });
     expect(
       Array.from(banner.querySelectorAll("button")).map((b) => b.textContent)
-    ).toEqual(["Approve", "Approve, don’t ask again", "Reject"]);
+    ).toEqual([
+      "Approve",
+      "Approve, don’t ask again",
+      "Approve, always in this chat",
+      "Reject",
+    ]);
     // The old hops are gone: nothing here navigates away from the decision.
     expect(screen.queryByRole("button", { name: /Review & decide/i })).toBeNull();
     expect(
@@ -891,9 +903,9 @@ describe("SessionWorkspace inline governance gate (Wave 4.1)", () => {
     expect(onReviewApproval).not.toHaveBeenCalled();
   });
 
-  it("each action makes its own governed call; 'don't ask again' rides the existing receipt consent", async () => {
+  it("each action makes its own governed call; the two remembering approves ride their own grade", async () => {
     const { onResolveApproval } = renderTab({ approvals: [PENDING_GATE] });
-    const [approve, remember, reject] = gateActions();
+    const [approve, remember, always, reject] = gateActions();
 
     fireEvent.click(approve!);
     await vi.waitFor(() =>
@@ -911,7 +923,18 @@ describe("SessionWorkspace inline governance gate (Wave 4.1)", () => {
       expect(onResolveApproval).toHaveBeenLastCalledWith(
         "approval-9",
         "approved",
-        900_000
+        { grade: "session", receiptTtlMs: 900_000 }
+      )
+    );
+
+    // ADR-0056: the chat-scoped grade, decided inline at the agent's own tab.
+    await vi.waitFor(() => expect(always!.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(always!);
+    await vi.waitFor(() =>
+      expect(onResolveApproval).toHaveBeenLastCalledWith(
+        "approval-9",
+        "approved",
+        { grade: "always", grantDuration: "always" }
       )
     );
 
@@ -926,7 +949,7 @@ describe("SessionWorkspace inline governance gate (Wave 4.1)", () => {
     );
   });
 
-  it("says on screen exactly how far 'don't ask again' reaches", () => {
+  it("says on screen exactly how far EACH remembering approve reaches", () => {
     renderTab({ approvals: [PENDING_GATE] });
     const banner = screen.getByRole("region", {
       name: "Pending decision for this agent",
@@ -937,19 +960,27 @@ describe("SessionWorkspace inline governance gate (Wave 4.1)", () => {
     expect(gateActions()[1]!.getAttribute("title")).toContain(
       "in this run, for the next 15 minutes"
     );
+    expect(banner.textContent).toContain(
+      "Auto-approves this exact action, in this chat only, for the next 7 days. Revoke it any time."
+    );
+    expect(gateActions()[2]!.getAttribute("title")).toContain(
+      "in this chat only, for the next 7 days"
+    );
   });
 
-  it("keeps the row three-wide for an always-ask action, and says why it cannot be remembered", () => {
+  it("keeps the row four-wide for an always-ask action, and says why neither grade applies", () => {
     renderTab({ approvals: [ALWAYS_ASK_GATE] });
-    const [approve, remember, reject] = gateActions();
-    expect(gateActions()).toHaveLength(3);
+    const [approve, remember, always, reject] = gateActions();
+    expect(gateActions()).toHaveLength(4);
     expect(approve!.hasAttribute("disabled")).toBe(false);
     expect(remember!.hasAttribute("disabled")).toBe(true);
+    expect(always!.hasAttribute("disabled")).toBe(true);
     expect(reject!.hasAttribute("disabled")).toBe(false);
-    expect(
-      screen.getByRole("region", { name: "Pending decision for this agent" })
-        .textContent
-    ).toContain("This one always asks");
+    const banner = screen.getByRole("region", {
+      name: "Pending decision for this agent",
+    }).textContent;
+    expect(banner).toContain("This one always asks");
+    expect(banner).toContain("No chat-wide grant here");
   });
 
   it("a merge gate routes to the evidence dialog instead of an approve MUON must refuse", () => {
@@ -1089,8 +1120,8 @@ describe("SessionWorkspace inline governance gate (Wave 4.1)", () => {
       expect(banner.textContent).toMatch(/paused until you decide/);
       // …and it says WHY this one still needs a human despite Full Auto.
       expect(banner.textContent).toMatch(/Full Auto could not grant this one/);
-      // …and the human gets the full three-action decision back.
-      expect(gateActions()).toHaveLength(3);
+      // …and the human gets the full four-action decision back.
+      expect(gateActions()).toHaveLength(4);
     });
 
     it("is inert with Full Auto off — the gate reads exactly as it always has", () => {

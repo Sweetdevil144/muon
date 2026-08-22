@@ -78,6 +78,27 @@ export type SessionLedger = {
     // never redeem the hidden action. `null` for a target-less call.
     resolvedTarget?: string | null;
   }): Promise<{ receiptId: string; expiresAt: string } | null>;
+  /**
+   * Durable approval-grant redemption (ADR-0056, OPTIONAL — a ledger without it
+   * never consults grants). The `always` grade: the same content binding a
+   * receipt carries, scoped to the CHAT rather than the run, so it survives the
+   * dispatch boundary a receipt cannot cross. The server re-guards chat,
+   * workspace, class, policy fingerprint, expiry and revocation, and writes its
+   * own audit row before answering.
+   *
+   * Same contract as `redeemReceipt`: implementations MUST catch transport
+   * errors and return `null`, and `null` means "gate exactly as today" — never
+   * deny and never allow.
+   */
+  redeemGrant?(input: {
+    taskId: string;
+    jobId: string;
+    sessionId: string;
+    workspacePath: string;
+    toolName: string;
+    payloadDigest: string;
+    resolvedTarget?: string | null;
+  }): Promise<{ grantId: string; expiresAt: string } | null>;
 };
 
 export type StartManagedSessionInput = SessionStartInput & {
@@ -481,8 +502,14 @@ export async function startManagedSession(
     const receiptEnabled = Boolean(
       ledger.redeemReceipt && input.workspacePath && input.jobId
     );
+    // ADR-0056: the durable grade rides the SAME preconditions as a receipt — a
+    // ledger method, a governed workspace, a run binding. A ledger that offers
+    // neither leaves this whole block byte-identical to today.
+    const grantEnabled = Boolean(
+      ledger.redeemGrant && input.workspacePath && input.jobId
+    );
     try {
-      if (input.policy || receiptEnabled) {
+      if (input.policy || receiptEnabled || grantEnabled) {
         evidence = sessionApprovalEvidence(
           request.toolName,
           request.input,
@@ -620,6 +647,60 @@ export async function startManagedSession(
                 {
                   source: "receipt",
                   receiptId: hit.receiptId,
+                  actionClass: classified.class,
+                  payloadDigest: evidence.payloadDigest,
+                  ...(input.workspacePath
+                    ? { workspacePath: input.workspacePath }
+                    : {}),
+                }
+              )
+            );
+            return { behavior: "allow" };
+          }
+        }
+
+        // Step 3 — durable approval-grant redemption (ADR-0056, the `always`
+        // grade). Tried only AFTER the run-scoped receipt misses, so the
+        // narrower authority is always spent first and a long-lived grant is
+        // never burned on a call a receipt already covered. Identical
+        // preconditions: same allow-listed classes, same digest requirement,
+        // same visible target. The server re-guards chat, workspace, class,
+        // policy fingerprint, expiry and revocation, and a miss means "file the
+        // gate exactly as today".
+        if (
+          classified &&
+          (RECEIPT_ALLOWED_CLASSES as readonly string[]).includes(
+            classified.class
+          ) &&
+          payloadDigest &&
+          ledger.redeemGrant &&
+          input.workspacePath &&
+          input.jobId
+        ) {
+          const hit = await ledger.redeemGrant({
+            taskId: request.taskId,
+            jobId: input.jobId,
+            sessionId: record.id,
+            workspacePath: input.workspacePath,
+            toolName: request.toolName,
+            payloadDigest,
+            resolvedTarget:
+              classified.class === "test"
+                ? (evidence.details.command ?? null)
+                : (evidence.details.path ?? null),
+          });
+          if (hit) {
+            // The server already wrote the authoritative ledger row; this is
+            // the LIVE echo the desk/TUI streams render, not the audit itself.
+            input.onEvent(
+              makeSessionEvent(
+                request.laneKey,
+                request.taskId,
+                "approval.auto",
+                `grant ${hit.grantId} matched this exact action`,
+                {
+                  source: "grant",
+                  grantId: hit.grantId,
                   actionClass: classified.class,
                   payloadDigest: evidence.payloadDigest,
                   ...(input.workspacePath

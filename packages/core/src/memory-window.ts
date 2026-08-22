@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 
 /**
  * R4 phase 0, the rolling conversational window. Ported in spirit (not in code)
- * from mem0's `add()` pipeline phase 0 and its `PAST_MESSAGE_TRUNCATION_LIMIT`;
- * see docs/research/mem0-capability-reference.md §4 and §7.6. mem0ai/mem0 is
+ * from productM1's `add()` pipeline phase 0 and its `PAST_MESSAGE_TRUNCATION_LIMIT`;
+ * see docs/research/productM1-capability-reference.md §4 and §7.6. productM1/repo is
  * Apache-2.0 (read @ main, 2026-07-26); only the algorithm shape is taken.
  *
  * Why it exists: the extractor used to see ONE blob (this turn's output), so a
@@ -24,9 +24,9 @@ export type MemoryWindowMessage = {
   text: string;
 };
 
-/** Messages retained per session (mem0 loads the last 10). */
+/** Messages retained per session (productM1 loads the last 10). */
 export const MEMORY_WINDOW_MESSAGES = 10;
-/** Per-message clip, mem0's `PAST_MESSAGE_TRUNCATION_LIMIT`. */
+/** Per-message clip, productM1's `PAST_MESSAGE_TRUNCATION_LIMIT`. */
 export const MEMORY_WINDOW_MESSAGE_CHARS = 300;
 /** Hard ceiling on the RENDERED window, so a full window can never dominate
  *  the prompt no matter how the per-message bound is tuned. */

@@ -4,6 +4,7 @@ import type { Command } from "commander";
 import {
   MUON_CONTEXT_TOOL_NAMES,
   MUON_COORDINATION_TOOL_NAMES,
+  MUON_EXCHANGE_CONTRACTS,
   MUON_OBSERVER_TOOL_NAMES,
   coordinatorVendorIds,
   vendorLabel,
@@ -36,6 +37,10 @@ import {
 } from "@muon/client/mcp-probe";
 import { probeMcpToolNames } from "@muon/client/mcp-probe-spawn";
 import {
+  identityGateRefusalFor,
+  type IdentityGateState,
+} from "@muon/client/github-identity-gate";
+import {
   buildMcpStatusReport,
   type McpStatusReport,
   type McpVendorStatus,
@@ -53,6 +58,7 @@ import {
 } from "@muon/client/attached-coordinator-flow";
 import { booleanEnvFlag, resolveApiBase } from "@muon/client";
 import { resolveDataDir } from "@muon/client/paths";
+import { readEnrolment, writeEnrolment } from "@muon/client/enrolment";
 import type { MuonApiClient } from "../lib/api-client.js";
 import { ensureRunner } from "../lib/ensure-runner.js";
 import { printError, printJson } from "../lib/output.js";
@@ -196,7 +202,7 @@ export function registerMcpCommands(
         }
       ) => {
         try {
-          const { io } = resolveDeps();
+          const { io, env } = resolveDeps();
           const spec = requireVendor(vendorToken);
           const scope = parseScope(options.scope) ?? spec.defaultScope;
           const mode = parseInstallMode(options.mode);
@@ -220,6 +226,46 @@ export function registerMcpCommands(
             mode,
             chatId,
           });
+
+          // A per-vendor install IS a setup decision (founder, 2026-08-20):
+          // it MERGES into the recorded setup, so `muon doctor` stops saying
+          // "no recorded setup" to a machine that plainly has one, and
+          // `muon setup --repair` restores this vendor too. Merge means merge
+          // for EVERY field: a hand-installed codex must not erase a recorded
+          // claude-code, and one base install must not flip an
+          // observer-enrolled machine's MODE (the record's mode is what every
+          // later --repair re-applies to every vendor). Only a DEFAULT-SCOPE,
+          // un-partitioned install is recorded at all — the enrolment restores
+          // `spec.defaultScope` with no chat, so recording a --scope project
+          // or --chat install would make repair rewrite a registration the
+          // user never asked for. Dry runs record nothing (they wrote
+          // nothing). Authority-bearing modes cannot reach this point at all:
+          // `parseInstallMode` refuses everything but base/observer.
+          if (
+            outcome.kind !== "refused" &&
+            options.dryRun !== true &&
+            scope === spec.defaultScope &&
+            !chatId
+          ) {
+            // Same dataDir seam every other record in this file uses — an
+            // injected env must never write the operator's REAL enrolment.
+            const enrolmentDir = env.MUON_DATA_DIR?.trim() || resolveDataDir();
+            const stored = readEnrolment(enrolmentDir);
+            const installedMode =
+              mode === "observer" ? ("observer" as const) : ("base" as const);
+            // FAITHFUL since enrolment v2: the mode lives on each vendor, so
+            // this install records exactly what it did — no machine-wide mode
+            // to lie about, no other vendor's repair changed. A re-install of
+            // a recorded vendor in a new mode is an update (writeEnrolment:
+            // last mode wins per id).
+            const existing = stored.ok ? stored.enrolment.vendors : [];
+            writeEnrolment(
+              {
+                vendors: [...existing, { id: spec.id, mode: installedMode }],
+              },
+              enrolmentDir
+            );
+          }
 
           if (options.json) {
             printJson({
@@ -509,6 +555,16 @@ export function registerMcpCommands(
             // The mode is the server's own switch. Probing `base` must NOT
             // inherit an exported MUON_MCP_MODE from this shell, or the report
             // describes a server nobody launches.
+            //
+            // THE REST OF THE ENVIRONMENT IS INHERITED ON PURPOSE, and the
+            // ADR-0052 gate reading is the case worth naming: an exported
+            // `MUON_REQUIRE_GITHUB_LOGIN` or `MUON_DATA_DIR` changes what the
+            // spawned server reports, so this measures the gate AS SEEN FROM
+            // THIS SHELL — which is exactly what a vendor CLI launched from
+            // this shell would see. It is NOT the whole truth for a vendor
+            // launched from Finder, which inherits neither. `MUON_MCP_MODE` is
+            // scrubbed instead because THIS COMMAND sets it from `--mode`, so
+            // an inherited value would contradict the flag the operator typed.
             env: {
               ...process.env,
               MUON_MCP_MODE: mode === "base" ? "" : mode,
@@ -517,20 +573,47 @@ export function registerMcpCommands(
           });
           const verdict = compareLiveTools(outcome.toolNames, mode);
 
+          // A gate state this build cannot read is its own outcome, carried
+          // beside the recognised one rather than folded into it (see
+          // @muon/client/mcp-probe-spawn): folding it in is what made a server
+          // reporting a state MUON does not understand score as `ok`.
+          const unknownGate = outcome.unknownIdentityGate ?? null;
           if (options.json) {
             printJson({
               command: resolution.command,
               commandSource: resolution.source,
               mode,
               verdict,
+              identityGate: outcome.identityGate,
+              unknownIdentityGate: unknownGate,
               failure: outcome.failure ?? null,
+              // ADR-0070: what THIS build speaks on the exchange boundaries.
+              // The probe's own constants, deliberately — the live server's
+              // spoken versions surface via whoami; this row says what the
+              // installed CLI/protocol pair expects.
+              contracts: MUON_EXCHANGE_CONTRACTS,
             });
           } else {
             process.stdout.write(
-              renderProbe(resolution.command, mode, verdict, outcome.failure)
+              renderProbe(
+                resolution.command,
+                mode,
+                verdict,
+                outcome.failure,
+                outcome.identityGate,
+                unknownGate
+              )
+            );
+            process.stdout.write(
+              `contracts: packet family v${MUON_EXCHANGE_CONTRACTS.packetFamily} · memory pack v${MUON_EXCHANGE_CONTRACTS.memoryPack}\n`
             );
           }
-          process.exitCode = probeVerdictIsProblem(verdict) ? 1 : 0;
+          process.exitCode = probeExitCode(
+            verdict,
+            outcome.identityGate,
+            outcome.failure,
+            unknownGate
+          );
         } catch (error) {
           failCommand(error, "Failed to probe the MCP server.");
         }
@@ -554,21 +637,135 @@ export function parseProbeTimeout(raw: string | undefined): number {
   return parsed;
 }
 
+/**
+ * FOUR independent ways this probe is not a pass. A script only ever reads
+ * this number, so it has to carry all of them.
+ *
+ *  - the VERDICT: is the live surface this tree's surface.
+ *  - LOCKED (ADR-0052): a perfect tool list in front of a server that refuses
+ *    every one of them. Exiting 0 there is the same "ok, 31 tools" lie in a
+ *    script's language. `null` — an old build with no `whoami` to ask — stays
+ *    0, because an unknown is not a lock.
+ *  - AN UNREADABLE GATE STATE: the server DID report one and this build does not
+ *    understand it. It used to arrive as `identityGate: null` and exit 0, so a
+ *    future gate state — or a typo'd one — read as healthy. It may well be a
+ *    lock; the honest answer to "I cannot read what it said about its own
+ *    permission state" is not `ok`.
+ *  - FAILURE: the probe can now hold a COMPLETE tool list and still have
+ *    watched the server die, because it kept talking after `tools/list` to ask
+ *    the gate question. That scores `ok`; before the gate question existed the
+ *    same crash scored `unevaluated` and exited 1. A crashing server must not
+ *    start passing because the probe got further into the conversation than it
+ *    used to.
+ *
+ * Extracted rather than inlined so all four can be pinned by test — the
+ * `failure` limb was a live regression, found by review and not by the suite.
+ */
+export function probeExitCode(
+  verdict: McpProbeVerdict,
+  identityGate: IdentityGateState | null,
+  failure: string | undefined,
+  /** REQUIRED for the reason `renderProbe` states below: an optional gate
+   *  argument is one a second caller drops without noticing, and the dropped
+   *  case here is exit 0 over a server whose permission state is unreadable. */
+  unknownIdentityGate: string | null
+): number {
+  return probeVerdictIsProblem(verdict) ||
+    // BOTH locked states. `locked-unregistered` is a different sentence to a
+    // human and the identical fact to a script: this server will refuse every
+    // tool it just listed.
+    identityGate === "locked" ||
+    identityGate === "locked-unregistered" ||
+    unknownIdentityGate !== null ||
+    failure !== undefined
+    ? 1
+    : 0;
+}
+
+/**
+ * ADR-0052 — WHY THE PROBE SAYS "locked" AT ALL, and how it learns it.
+ *
+ * A gated `muon-mcp` answers `initialize` and `tools/list` in full by design,
+ * so this command reported `ok · 31 tools` about a server that would refuse
+ * all 31 and never used the word. The signal is `whoami`'s typed
+ * `identityGate` field — `whoami` is one of the two tools a locked server
+ * still answers, and it is already the honest-identity surface, so it is where
+ * "what am I allowed to do here" belongs. The alternative considered and
+ * rejected: make one deliberately-refused tool call and read the envelope.
+ * That performs a governed call to ask permission, and it reports nothing at
+ * all about the `open` and `unarmed` states.
+ *
+ * The copy is @muon/client's, not a second sentence written here: the operator
+ * reading this line and the agent reading the refusal must be told the same
+ * thing, which is the cross-surface parity rule every governed refusal in this
+ * repo follows. `identityGateRefusalFor` is the selector both sides call, so a
+ * `locked-unregistered` server cannot end up described here as one that needs a
+ * sign-in.
+ */
 export function renderProbe(
   command: string,
   mode: string,
   verdict: McpProbeVerdict,
-  failure: string | undefined
+  failure: string | undefined,
+  /** REQUIRED, not optional: an optional gate argument is one a second caller
+   *  drops without noticing, and the dropped case is silence about a lock.
+   *  `null` is the honest "not measured", and has to be said out loud. */
+  identityGate: IdentityGateState | null,
+  /** The state the server reported that this build cannot read, when there is
+   *  one. Required for the same reason, and the dropped case is worse: silence
+   *  about a server that answered the gate question unintelligibly. */
+  unknownIdentityGate: string | null
 ): string {
   const lines: string[] = [];
+  // ADR-0052 — the refusal for THIS state, from the one selector in
+  // @muon/client. Non-null is exactly "this server refuses its own tool list",
+  // which is what flips the mark and the exit code alike.
+  //
+  // `stillAvailable` is deliberately omitted: it tells an AGENT which two tools
+  // it may still call, and the reader here is the operator who is about to open
+  // the gate. Same sentences either way — the clause is the function's own, not
+  // a second copy edited down.
+  const gateRefusal = identityGate
+    ? identityGateRefusalFor(identityGate, {
+        what: "every MUON tool",
+        surface: "mcp",
+      })
+    : null;
   const mark =
-    verdict.level === "ok" ? "OK" : verdict.level === "unevaluated" ? "??" : "!!";
+    verdict.level === "ok" && !gateRefusal && !unknownIdentityGate
+      ? "OK"
+      : verdict.level === "unevaluated"
+        ? "??"
+        : "!!";
   lines.push(`${mark}  live MCP surface: ${verdict.level}`);
   lines.push(`    command  ${command}`);
   lines.push(`    mode     ${mode}`);
   lines.push(
     `    tools    live ${verdict.liveCount ?? "?"} / defined ${verdict.expectedCount ?? "?"}`
   );
+  if (gateRefusal) {
+    lines.push(
+      identityGate === "locked-unregistered"
+        ? // Named differently on purpose: an operator who reads "LOCKED" here
+          // goes looking for a sign-in they have already done.
+          `    identity LOCKED (registration pending) — verified here, not yet recorded centrally`
+        : `    identity LOCKED — this server serves the list and refuses the work`
+    );
+    for (const line of gateRefusal.split("\n")) {
+      lines.push(`             ${line}`);
+    }
+  }
+  if (unknownIdentityGate) {
+    // NOT "identity ok" and not silence. The server answered the gate question
+    // with a state this build has no meaning for, so the only true sentence is
+    // that MUON cannot tell — and the version mismatch is the thing to act on.
+    lines.push(
+      `    identity UNREADABLE — this server reported identityGate="${unknownIdentityGate}", which this MUON build does not understand`
+    );
+    lines.push(
+      "             It may be refusing every tool it just listed. This CLI and that server are different builds: run `muon update`, then `muon mcp install` to repoint the vendors."
+    );
+  }
   if (verdict.missing.length > 0) {
     lines.push(`    missing  ${verdict.missing.join(", ")}`);
   }

@@ -23,7 +23,7 @@ const SECTION_LABELS = [
 type SectionLabel = (typeof SECTION_LABELS)[number];
 
 export type WorkerMemoryProposal = {
-  kind: "decision" | "constraint" | "convention" | "attempt" | "question";
+  kind: "decision" | "constraint" | "convention" | "attempt" | "question" | "ownership";
   text: string;
   /**
    * Substrate §3.4 — how an ATTEMPT turned out, when the worker said so.
@@ -42,6 +42,12 @@ export type WorkerFinalReport = {
   uncertainties: string[];
   nextAction?: string;
   memoryProposals: WorkerMemoryProposal[];
+  /** ADR-0062: the answer to "did you update the brain?" — parsed from the
+   *  OPTIONAL eleventh section so every ten-label legacy report still
+   *  parses. Absent = the worker did not answer (the server stamps that as
+   *  the `no_brain_receipt` degradation; a malformed answer reads as no
+   *  answer, never as either value). */
+  brainReceipt?: "context_updated" | "no_update_required";
 };
 
 function redactSecrets(text: string): string {
@@ -83,7 +89,7 @@ function parseMemoryProposals(lines: string[]): WorkerMemoryProposal[] {
       return (
         /^[-*]\s+/.test(line) ||
         /^\d+[.)]\s+/.test(line) ||
-        /^(?:\[)?(?:decision|constraint|convention|attempt|question)(?:\])?\s*:/i.test(
+        /^(?:\[)?(?:decision|constraint|convention|attempt|question|ownership)(?:\])?\s*:/i.test(
           line
         )
       );
@@ -102,10 +108,10 @@ function parseMemoryProposals(lines: string[]): WorkerMemoryProposal[] {
       // for byte.
       const typed =
         entry.match(
-          /^\[(decision|constraint|convention|attempt|question)(?::(worked|abandoned|superseded|unknown))?\]\s*(.+)$/i
+          /^\[(decision|constraint|convention|attempt|question|ownership)(?::(worked|abandoned|superseded|unknown))?\]\s*(.+)$/i
         ) ??
         entry.match(
-          /^(decision|constraint|convention|attempt|question)(?::(worked|abandoned|superseded|unknown))?\s*:\s*(.+)$/i
+          /^(decision|constraint|convention|attempt|question|ownership)(?::(worked|abandoned|superseded|unknown))?\s*:\s*(.+)$/i
         );
       const kind = typed?.[1]?.toLowerCase() ?? "attempt";
       const declaredOutcome = typed?.[2]?.toLowerCase();
@@ -130,18 +136,60 @@ function parseMemoryProposals(lines: string[]): WorkerMemoryProposal[] {
     .slice(0, MAX_MEMORY_PROPOSALS);
 }
 
+function parseBrainReceipt(
+  entries: string[]
+): WorkerFinalReport["brainReceipt"] {
+  const value = entries
+    .join(" ")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z_]/g, "");
+  if (value === "context_updated") return "context_updated";
+  if (value === "no_update_required") return "no_update_required";
+  // A malformed answer is NO answer — the closed vocabulary is the contract,
+  // and guessing which side a typo meant would put words in the worker's
+  // mouth that the server then audits as the worker's claim.
+  return undefined;
+}
+
 function parseCandidate(lines: string[], start: number): WorkerFinalReport | undefined {
   const sections = new Map<SectionLabel, string[]>();
+  // ADR-0062: the OPTIONAL eleventh section. Tracked outside the required
+  // sequence so a ten-label legacy report parses exactly as before.
+  let brainReceiptLines: string[] | undefined;
   let expectedIndex = 0;
   let current: SectionLabel | undefined;
 
   for (let index = start; index < lines.length; index += 1) {
     const line = lines[index] ?? "";
     const match = line.match(
-      /^(GOAL|CHANGED|FAILED|COMMANDS RUN|CHECKS|CHANGED FILES|OPEN QUESTIONS|UNCERTAINTIES|NEXT ACTION|MEMORY PROPOSALS):(?:\s*(.*))?$/
+      /^(GOAL|CHANGED|FAILED|COMMANDS RUN|CHECKS|CHANGED FILES|OPEN QUESTIONS|UNCERTAINTIES|NEXT ACTION|MEMORY PROPOSALS|BRAIN RECEIPT):(?:\s*(.*))?$/
     );
     if (match) {
-      const label = match[1] as SectionLabel;
+      const label = match[1] as SectionLabel | "BRAIN RECEIPT";
+      if (label === "BRAIN RECEIPT") {
+        // Only lawful AFTER the ten required sections, exactly once.
+        if (expectedIndex !== SECTION_LABELS.length || brainReceiptLines) {
+          return undefined;
+        }
+        // The receipt is a ONE-LINE scalar (review finding: folding later
+        // lines into it let harmless trailing output — a renderer
+        // diagnostic, a farewell — invalidate a valid answer). Inline value
+        // wins; otherwise the first following line may carry it; everything
+        // after stays OUTSIDE the report grammar, exactly as trailing text
+        // after the ten sections always has.
+        current = undefined;
+        if (match[2]) {
+          brainReceiptLines = [match[2]];
+        } else {
+          const next = lines
+            .slice(index + 1)
+            .find((candidate) => candidate.trim() !== "");
+          brainReceiptLines = next ? [next] : [];
+        }
+        continue;
+      }
       if (label !== SECTION_LABELS[expectedIndex]) {
         return undefined;
       }
@@ -158,6 +206,9 @@ function parseCandidate(lines: string[], start: number): WorkerFinalReport | und
   if (expectedIndex !== SECTION_LABELS.length) {
     return undefined;
   }
+  const brainReceipt = brainReceiptLines
+    ? parseBrainReceipt(brainReceiptLines)
+    : undefined;
 
   const nextActionParts = listEntries(
     sections.get("NEXT ACTION") ?? [],
@@ -172,6 +223,7 @@ function parseCandidate(lines: string[], start: number): WorkerFinalReport | und
     memoryProposals: parseMemoryProposals(
       sections.get("MEMORY PROPOSALS") ?? []
     ),
+    ...(brainReceipt ? { brainReceipt } : {}),
   };
 }
 

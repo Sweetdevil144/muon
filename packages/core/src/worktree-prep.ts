@@ -532,7 +532,9 @@ export function summarizeWorktreePreparation(
   preparation: WorktreePreparation
 ): string {
   if (preparation.links.length === 0) {
-    return "no installed dependencies to mirror";
+    return preparation.setupConfirmationRequired
+      ? `no installed dependencies to mirror; setup awaits operator confirmation (hash ${preparation.setupConfirmationRequired.setupHash.slice(0, 12)}…)`
+      : "no installed dependencies to mirror";
   }
   const shared = preparation.links.reduce((total, link) => total + link.shared, 0);
   const workspace = preparation.links.reduce(
@@ -543,12 +545,15 @@ export function summarizeWorktreePreparation(
     (link) => link.mirroredOutputs.length > 0
   ).length;
   const linked = `${preparation.links.length} package dirs linked (${shared} shared, ${workspace} workspace, ${mirrored} build outputs mirrored)`;
+  const pending = preparation.setupConfirmationRequired
+    ? `; setup awaits operator confirmation (hash ${preparation.setupConfirmationRequired.setupHash.slice(0, 12)}…)`
+    : "";
   if (!preparation.projectSetup) {
-    return linked;
+    return `${linked}${pending}`;
   }
   const declarative = summarizeProjectSetup(preparation.projectSetup);
   if (declarative === "no declarative project setup") {
-    return linked;
+    return `${linked}${pending}`;
   }
-  return `${linked}; ${declarative}`;
+  return `${linked}; ${declarative}${pending}`;
 }

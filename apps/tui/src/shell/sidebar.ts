@@ -1,6 +1,5 @@
 import { terminalSafe } from "@muon/client";
 import type { Component } from "../vendor/pi-tui/src/tui.ts";
-import { railOwnsCursor } from "../next/sections.js";
 import { bold, cyan, dim, statusDot } from "./theme.js";
 
 /**
@@ -97,4 +96,27 @@ export class Sidebar implements Component {
 
     return lines;
   }
+}
+
+/**
+ * ONLY ONE CURSOR IS EVER LIVE (founder-reported: two highlights at once
+ * left it ambiguous what Enter would act on). A pure predicate on purpose:
+ * a colour-only highlight is invisible to a rendered-frame assertion, so
+ * the rule has to be testable here. The scope set is the same one the key
+ * dispatcher uses, so the highlight and the handler cannot disagree about
+ * who is in charge. (Rescued from the retired Ink desk's sections module
+ * in ADR-0087 D4 — this rail is its one surviving consumer.)
+ */
+export function railOwnsCursor(input: {
+  readonly paletteOpen: boolean;
+  readonly formOpen: boolean;
+  readonly reviewOpen: boolean;
+  readonly memoryOpen: boolean;
+}): boolean {
+  return (
+    !input.paletteOpen &&
+    !input.formOpen &&
+    !input.reviewOpen &&
+    !input.memoryOpen
+  );
 }

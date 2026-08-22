@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { MarketingShell } from "@/components/marketing/marketing-shell";
-import { PageIntro } from "@/components/marketing/page-intro";
+import { SiteShell } from "@/components/muon/SiteShell";
+import { PageHero } from "@/components/muon/PageHero";
 
 export const metadata: Metadata = {
   title: "Licenses, MUON",
@@ -11,16 +11,16 @@ export const metadata: Metadata = {
 
 export default function LicensesPage() {
   return (
-    <MarketingShell>
-      <PageIntro
+    <SiteShell>
+      <PageHero
         eyebrow="Licenses"
         intro="MUON's own license, and where the open-source components it is built on are listed."
         title="MUON's license and third-party notices"
       />
       <section className="mx-auto max-w-5xl px-4 py-20 sm:px-6 sm:py-28">
-        <div className="border-t-2 border-[var(--bauhaus-ink)]">
-          <div className="grid gap-3 border-b-2 border-[var(--bauhaus-ink)] py-8 sm:grid-cols-[4rem_1fr] sm:gap-8 sm:py-10">
-            <p className="text-sm font-black text-[var(--bauhaus-red)]">01</p>
+        <div className="border-t-2 border-rule">
+          <div className="grid gap-3 border-b-2 border-rule py-8 sm:grid-cols-[4rem_1fr] sm:gap-8 sm:py-10">
+            <p className="text-sm font-black text-muon-red">01</p>
             <div>
               <h2 className="text-xl font-black uppercase tracking-[-0.03em] sm:text-2xl">
                 MUON&apos;s own license
@@ -41,8 +41,8 @@ export default function LicensesPage() {
             </div>
           </div>
 
-          <div className="grid gap-3 border-b-2 border-[var(--bauhaus-ink)] py-8 sm:grid-cols-[4rem_1fr] sm:gap-8 sm:py-10">
-            <p className="text-sm font-black text-[var(--bauhaus-red)]">02</p>
+          <div className="grid gap-3 border-b-2 border-rule py-8 sm:grid-cols-[4rem_1fr] sm:gap-8 sm:py-10">
+            <p className="text-sm font-black text-muon-red">02</p>
             <div>
               <h2 className="text-xl font-black uppercase tracking-[-0.03em] sm:text-2xl">
                 What MUON includes
@@ -58,8 +58,8 @@ export default function LicensesPage() {
             </div>
           </div>
 
-          <div className="grid gap-3 border-b-2 border-[var(--bauhaus-ink)] py-8 sm:grid-cols-[4rem_1fr] sm:gap-8 sm:py-10">
-            <p className="text-sm font-black text-[var(--bauhaus-red)]">03</p>
+          <div className="grid gap-3 border-b-2 border-rule py-8 sm:grid-cols-[4rem_1fr] sm:gap-8 sm:py-10">
+            <p className="text-sm font-black text-muon-red">03</p>
             <div>
               <h2 className="text-xl font-black uppercase tracking-[-0.03em] sm:text-2xl">
                 The canonical inventory
@@ -81,6 +81,6 @@ export default function LicensesPage() {
           </div>
         </div>
       </section>
-    </MarketingShell>
+    </SiteShell>
   );
 }

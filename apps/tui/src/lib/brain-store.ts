@@ -1,6 +1,7 @@
 import {
   buildCapabilityPreflight,
   type AgentRecord,
+  type ApprovalGrant,
   type ApprovalReceipt,
   type ApprovalRequest,
   type BlockingQuestion,
@@ -78,6 +79,15 @@ export type BrainSnapshot = {
    * successful count.
    */
   activeReceipts: ApprovalReceipt[] | null;
+  /**
+   * ADR-0056 TUI parity: live (unexpired, unrevoked) DURABLE approval grants —
+   * the `always` grade, which outlives the run a receipt is bound to. Its own
+   * field rather than a merge into `activeReceipts` for the same reason it gets
+   * its own line: the two authorities have different blast radii and summing
+   * them would understate the durable half. Same honest-absence contract —
+   * NEVER carried forward across a failed poll.
+   */
+  activeGrants: ApprovalGrant[] | null;
   /** The brain we are pointed at (base + data dir + how we found it). */
   target: BrainTarget;
   error: string | null;
@@ -102,6 +112,7 @@ export function emptyBrainSnapshot(): BrainSnapshot {
     readiness: null,
     preflight: null,
     activeReceipts: null,
+    activeGrants: null,
     target: { base: "http://localhost:4000", dataDir: "", source: "default" },
     error: null,
     updatedAt: new Date(0).toISOString(),
@@ -224,6 +235,7 @@ export function createBrainStore(
           readinessReport,
           runner,
           activeReceipts,
+          activeGrants,
         ] = await Promise.all([
           activeClient
             .health()
@@ -295,6 +307,27 @@ export function createBrainStore(
               );
               return null;
             }),
+          // ADR-0056 TUI parity: live durable grants, same honest-absence rule
+          // as receipts — and the SAME two-failure-class split the questions
+          // fetch above makes, for the same reason: a brain predating
+          // `/api/grants` (404, or a client without the method) degrades
+          // SILENTLY, because a permanent banner would punish every
+          // not-yet-upgraded install for a read-only annotation. Everything
+          // else — auth, outage, malformed — stays visible. Either way the
+          // value is `null`: the count is never guessed, only the noise differs.
+          Promise.resolve()
+            .then(() => activeClient.listApprovalGrants({ activeOnly: true }))
+            .catch((error: unknown) => {
+              const message =
+                error instanceof Error ? error.message : String(error);
+              if (
+                !message.includes("404") &&
+                !message.includes("listApprovalGrants is not a function")
+              ) {
+                endpointErrors.push(`grants: ${message}`);
+              }
+              return null;
+            }),
         ]);
 
         if (!healthResult.ok) {
@@ -308,8 +341,9 @@ export function createBrainStore(
           snapshot = {
             ...snapshot,
             health: null,
-            // Control plane unreachable ⇒ no honest receipts count either.
+            // Control plane unreachable ⇒ no honest receipts/grants count either.
             activeReceipts: null,
+            activeGrants: null,
             preflight: buildCapabilityPreflight({
               brain: { reachable: false, detail: message },
               readiness: null,
@@ -407,6 +441,8 @@ export function createBrainStore(
           // this poll's fetch failed, even if a prior poll succeeded. The
           // ReviewInbox's active-receipts line must never show a stale count.
           activeReceipts,
+          // ADR-0056: same never-carried-forward rule for the durable grade.
+          activeGrants,
           // P0.5: the SAME contract the CLI/MCP surfaces project. Brain is
           // reachable (health OK) even if some routes failed, so this is built
           // with brain reachable — never a false CONTROL_PLANE_UNREACHABLE.
@@ -432,6 +468,7 @@ export function createBrainStore(
         snapshot = {
           ...snapshot,
           activeReceipts: null,
+          activeGrants: null,
           preflight: buildCapabilityPreflight({
             brain: { reachable: false, detail: message },
             readiness: null,

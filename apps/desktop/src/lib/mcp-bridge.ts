@@ -18,6 +18,9 @@ import {
 } from "@muon/client/attached-coordinator-flow";
 import { compareLiveTools } from "@muon/client/mcp-probe";
 import { probeMcpToolNames } from "@muon/client/mcp-probe-spawn";
+// ADR-0052 Decision 5 — the ONE refusal copy, rendered here in MAIN. See
+// `probeMcpServer` for why the desk cannot import this module in the renderer.
+import { identityGateRefusalFor } from "@muon/client/github-identity-gate";
 import type { VendorId } from "@muon/client/vendors";
 import type {
   McpAttachResult,
@@ -101,6 +104,14 @@ export function readMcpStatus(deps: McpBridgeDeps = {}): McpStatusReport {
  * spawn, the same handshake (`@muon/client/mcp-probe-spawn`), the same
  * comparison (`compareLiveTools`). The desk must not be able to disagree with
  * `muon mcp probe` about the same server.
+ *
+ * ADR-0052 — that parity now includes the GATE. The probe asks `whoami` and
+ * gets back a typed `identityGate`; the desk dropped it, so a LOCKED server
+ * still rendered as "ok, N tools" here long after `muon mcp probe` had learned
+ * to say otherwise. The refusal SENTENCE is composed here rather than in the
+ * renderer because the renderer is a browser bundle and the gate module reaches
+ * `node:fs` — same shape as `readMcpStatus` above, where the evaluator runs in
+ * main and only its plain data crosses the bridge.
  */
 export async function probeMcpServer(
   options: { mode?: string; timeoutMs?: number } = {},
@@ -117,6 +128,10 @@ export async function probeMcpServer(
       // `unevaluated` is what the comparison calls that.
       verdict: compareLiveTools(null, mode),
       failure: muonMcpUnresolvedRefusal(resolution.searched),
+      // Nothing was asked, so nothing is known. `null`, never "open".
+      identityGate: null,
+      identityGateRefusal: null,
+      unknownIdentityGate: null,
     };
   }
   const outcome = await probeMcpToolNames({
@@ -138,6 +153,22 @@ export async function probeMcpServer(
     mode,
     verdict: compareLiveTools(outcome.toolNames, mode),
     failure: outcome.failure ?? null,
+    identityGate: outcome.identityGate,
+    // The SAME arguments `muon mcp probe` passes (apps/cli/src/commands/mcp.ts,
+    // `renderProbe`), so the two surfaces say the identical three sentences.
+    // `stillAvailable` is omitted on both: it tells an AGENT which two tools it
+    // may still call, and the reader here is the operator about to open the
+    // gate.
+    identityGateRefusal: outcome.identityGate
+      ? identityGateRefusalFor(outcome.identityGate, {
+          what: "every MUON tool",
+          surface: "mcp",
+        })
+      : null,
+    // A value this build cannot interpret is NOT an absence. Carried verbatim
+    // (the client already bounds its length) so the operator sees what the
+    // server actually said instead of a reassuring blank.
+    unknownIdentityGate: outcome.unknownIdentityGate ?? null,
   };
 }
 

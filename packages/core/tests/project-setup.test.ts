@@ -78,7 +78,10 @@ describe("runProjectSetup", () => {
     });
 
     expect(result.confirmationRequired).toBeDefined();
-    expect(result.problems.join(" ")).toMatch(/operator confirmation/i);
+    // Pending confirmation is a typed state, not a problem: a problem entry
+    // here used to fail the whole dispatch "not test-capable" before the
+    // runner could file the approval gate that records the confirmation.
+    expect(result.problems).toEqual([]);
     expect(existsSync(join(worktree, "ran-setup"))).toBe(false);
   });
 
@@ -290,7 +293,7 @@ describe("prepareWorktreeDependencies declarative setup", () => {
     }
   });
 
-  it("surfaces confirmation-required problems through preparation", async () => {
+  it("surfaces pending confirmation as a typed state, not a problem", async () => {
     await write(
       join(source, PROJECT_SETUP_PATHS.project),
       JSON.stringify({
@@ -307,7 +310,9 @@ describe("prepareWorktreeDependencies declarative setup", () => {
     });
 
     expect(prepared.setupConfirmationRequired).toBeDefined();
-    expect(prepared.problems.join(" ")).toMatch(/operator confirmation/i);
+    // A problem entry here used to fail the dispatch "not test-capable"
+    // before the runner could file the project-setup approval gate.
+    expect(prepared.problems).toEqual([]);
   });
 });
 

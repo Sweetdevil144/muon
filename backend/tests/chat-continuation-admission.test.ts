@@ -20,6 +20,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  */
 
 const prismaMock = vi.hoisted(() => ({
+  // The fork-pointer stamp reads the task on every create (D34).
+  task: { findUnique: vi.fn(async () => null) },
   dispatchJob: {
     findUnique: vi.fn(),
     findFirst: vi.fn(),

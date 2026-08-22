@@ -395,6 +395,51 @@ export function isReadOnlyRole(role: AgentRole): boolean {
   return ROLE_SPECS[role].authority === "read-only";
 }
 
+/**
+ * A role's declared authority.
+ *
+ * Exported because "not read-only" is NOT the same as "writes": `orchestrator`
+ * is `coordinate`, a third value, and an adapter guard written as
+ * `!isReadOnlyRole(role)` refuses it — which was harmless while no
+ * coordinate-authority role could reach those lanes and became a runtime
+ * refusal the moment one could (ADR-0057). A guard that means "refuse writes"
+ * should say so against this value rather than by negating a different one.
+ */
+export function roleAuthorityOf(role: AgentRole): RoleAuthority {
+  return ROLE_SPECS[role].authority;
+}
+
+/**
+ * The authorities that describe WORK MUON hands to a lane. Stated POSITIVELY
+ * (ADR-0022 rule 2), and this repo has now paid for that rule five times.
+ *
+ * `coordinate` is deliberately absent: a coordinator seat is a chat's root
+ * job, not work dispatched into a lane, and `POST /api/dispatch` refuses
+ * `orchestrator` as a task role outright.
+ */
+export const DISPATCHABLE_ROLE_AUTHORITIES = [
+  "read-only",
+  "write",
+] as const satisfies readonly RoleAuthority[];
+
+/**
+ * May this role be DISPATCHED to a lane as work?
+ *
+ * Exists because the alternative kept being written by hand as a negation —
+ * first `authority !== "read-only"` (which ADR-0057's `coordinate` broke at
+ * five surfaces at once), then `authority !== "coordinate"` at nine call
+ * sites, which is the same fragility one enum member later: a FOURTH authority
+ * kind would be silently classified as dispatchable everywhere, fail-open.
+ *
+ * The positive form fails CLOSED instead — a new authority is not dispatchable
+ * until it is added to the list above, deliberately.
+ */
+export function isDispatchableRole(role: AgentRole): boolean {
+  return (DISPATCHABLE_ROLE_AUTHORITIES as readonly RoleAuthority[]).includes(
+    roleAuthorityOf(role)
+  );
+}
+
 /** Raised when a compiled profile is wider than the role it claims to run as. */
 export class RoleAuthorityError extends Error {
   readonly role: AgentRole;

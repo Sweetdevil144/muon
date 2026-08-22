@@ -112,6 +112,29 @@ export function buildInboxRows(
  */
 export const INBOX_NAMED_QUESTIONS = 3;
 
+/** ADR-0086 D3 — ONE renderer for a question row's evidence lines (the
+ *  brain's pre-answer, the crew's 0082 context block): source label,
+ *  coordinate, optional standing tag, 60-char excerpt, honest "+N more".
+ *  Excerpts are transcript-class text and render terminalSafe. */
+function evidenceLine(
+  source: "brain" | "crew",
+  item: {
+    coordinate: string;
+    standing?: string;
+    excerpt: string;
+    total: number;
+  }
+): string {
+  const standing = item.standing ? `[${item.standing}] ` : "";
+  const more = item.total > 1 ? ` (+${item.total - 1} more)` : "";
+  return (
+    dim(`      ◦ ${source}: `) +
+    dim(`${item.coordinate} ${standing}`) +
+    terminalSafe(`"${item.excerpt.slice(0, 60)}"`) +
+    dim(more)
+  );
+}
+
 export class Inbox implements Component {
   private state: InboxState;
 
@@ -154,6 +177,39 @@ export class Inbox implements Component {
           dim(`   ${index + 1}. ${terminalSafe(question.askedByVendor)}: `) +
             terminalSafe(question.subject)
         );
+        // ADR-0086 D3, both evidence blocks through ONE renderer (via
+        // 0069 D1's own promise): when the brain already answered, the
+        // operator sees it AT the decision point — one keystroke from
+        // endorsing instead of retyping — and (via 0082) the CREW's
+        // context block renders beneath it.
+        // Each is one bounded line — source label, coordinate, an optional
+        // standing tag, a clipped excerpt, an honest count of the rest.
+        // The crew's standing string is the contract ("unconfirmed
+        // proposal", "typed_degraded packet"): rendered verbatim, the desk
+        // vouches for nothing.
+        const preAnswer = question.memoryPreAnswer;
+        if (preAnswer && preAnswer.notes.length > 0) {
+          const first = preAnswer.notes[0]!;
+          lines.push(
+            evidenceLine("brain", {
+              coordinate: `${first.kind} ${terminalSafe(first.noteId).slice(0, 12)}`,
+              excerpt: first.excerpt,
+              total: preAnswer.notes.length,
+            })
+          );
+        }
+        const crew = question.crewContext;
+        if (crew && crew.items.length > 0) {
+          const first = crew.items[0]!;
+          lines.push(
+            evidenceLine("crew", {
+              coordinate: `${first.kind} ${terminalSafe(first.id).slice(0, 12)}`,
+              standing: terminalSafe(first.standing),
+              excerpt: first.excerpt,
+              total: crew.items.length,
+            })
+          );
+        }
       });
       if (questionCount > INBOX_NAMED_QUESTIONS) {
         lines.push(

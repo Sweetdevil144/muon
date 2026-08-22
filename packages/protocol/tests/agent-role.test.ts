@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  isDispatchableRole,
+  DISPATCHABLE_ROLE_AUTHORITIES,
+  roleAuthorityOf,
   AGENT_ROLES,
   GOVERNED_MCP_SERVER_NAME,
   ROLE_SPECS,
@@ -559,5 +562,46 @@ describe("narrowProfileForRole covers every authority CHANNEL, not just every fi
     expect(isWriteClassTool("write")).toBe(true);
     expect(isWriteClassTool("WRITE")).toBe(true);
     expect(isWriteClassTool("Write(src/**)")).toBe(true);
+  });
+});
+
+/**
+ * The dispatchability predicate is POSITIVE, and that is the whole point.
+ *
+ * It replaced `authority !== "read-only"` (which ADR-0057's `coordinate` broke
+ * at five surfaces simultaneously) and then `authority !== "coordinate"` (the
+ * same fragility one enum member later, hand-written at nine call sites). A
+ * negation fails OPEN on a new authority kind — every site would silently call
+ * it dispatchable. This file's job is to make that impossible to reintroduce.
+ */
+describe("isDispatchableRole is positive, and fails CLOSED", () => {
+  it("admits exactly the worker authorities, and never `coordinate`", () => {
+    for (const role of AGENT_ROLES) {
+      const authority = roleAuthorityOf(role);
+      expect(isDispatchableRole(role), role).toBe(
+        authority === "read-only" || authority === "write"
+      );
+    }
+    // Named explicitly, because this is the case every negation got wrong.
+    expect(isDispatchableRole("orchestrator")).toBe(false);
+    expect(isDispatchableRole("implementer")).toBe(true);
+    expect(isDispatchableRole("reviewer")).toBe(true);
+  });
+
+  it("is a LIST of admitted authorities, not a subtraction", () => {
+    // The structural half: a fourth `RoleAuthority` must default to NOT
+    // dispatchable. Asserting the inventory is what makes adding one a
+    // deliberate act rather than an accidental widening — this is ADR-0022
+    // rule 2, which the repo has now paid for five times.
+    expect([...DISPATCHABLE_ROLE_AUTHORITIES]).toEqual(["read-only", "write"]);
+    const declared = new Set(AGENT_ROLES.map(roleAuthorityOf));
+    const undispatchable = [...declared].filter(
+      (authority) =>
+        !(DISPATCHABLE_ROLE_AUTHORITIES as readonly string[]).includes(authority)
+    );
+    // Today that is exactly `coordinate`. If a fifth authority appears and is
+    // meant to be dispatchable, it fails HERE — visibly — instead of leaking
+    // into nine call sites.
+    expect(undispatchable).toEqual(["coordinate"]);
   });
 });

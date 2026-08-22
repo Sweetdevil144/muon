@@ -176,9 +176,12 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     const job = existing.jobId
       ? await prisma.dispatchJob.findUnique({ where: { id: existing.jobId } })
       : null;
-    const dirtyFiles = job?.workspacePath
-      ? await dirtyFileCount(job.workspacePath)
-      : null;
+    // Where the job ACTUALLY ran wins over where it was configured to run
+    // (the workspace resolver's own precedence — review finding: take-over
+    // opens in executionPath, so a return that counted workspacePath could
+    // attest a clean tree over dirty take-over edits).
+    const inspectPath = job?.executionPath ?? job?.workspacePath ?? null;
+    const dirtyFiles = inspectPath ? await dirtyFileCount(inspectPath) : null;
     // Re-attest before automation resumes: the same authenticated-probe
     // evidence a dispatch preflight trusts. A degraded probe must NOT wedge
     // ownership — the audit row records the degradation instead.

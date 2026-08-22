@@ -261,6 +261,57 @@ describe("memory pack import (P1.4 slice 2)", () => {
     expect(confirmations[0].principal).toBe("human:dana");
   });
 
+  it("ADR-0064 A1 residual: an enriched record's provenance block is hash-verified DATA — accepted, never materialised; tampering refuses the record", async () => {
+    const base = makeRecord({
+      noteId: "origin-prov-1",
+      text: "Provenance-stamped fact from the origin brain.",
+    });
+    const enriched = {
+      ...base.record,
+      provenance: {
+        grounding: {
+          verdict: "holds",
+          at: "2026-07-02T10:00:00.000Z",
+          checkKinds: ["anchor-exists", "symbol-resolves"],
+        },
+        offers: {
+          distinctChats: 2,
+          distinctJobs: 5,
+          firstOfferedAt: "2026-07-01T10:00:00.000Z",
+          lastOfferedAt: "2026-07-03T10:00:00.000Z",
+        },
+      },
+    };
+    const entry = { hash: packLib.recordHashOf(enriched), record: enriched };
+    const report = expectOk(
+      await importLib.importMemoryPack(makePack([entry]))
+    );
+    expect(report.report.proposed).toHaveLength(1);
+    const localId = report.report.proposed[0].noteId;
+    // The stamps are the ORIGIN's evidence: nothing lands in the local
+    // grounding or offer tables (grounding is re-run against THIS repo).
+    expect(
+      await prisma.memoryGrounding.count({ where: { noteId: localId } })
+    ).toBe(0);
+    expect(
+      await prisma.memoryOffer.count({ where: { noteId: localId } })
+    ).toBe(0);
+
+    // Tampered provenance breaks the content address → that record refuses.
+    const tampered = structuredClone(enriched);
+    tampered.provenance.offers.distinctJobs = 500;
+    const forged = { hash: entry.hash, record: tampered };
+    const report2 = expectOk(
+      await importLib.importMemoryPack(
+        makePack([{ hash: forged.hash, record: forged.record }])
+      )
+    );
+    expect(report2.report.proposed).toHaveLength(0);
+    expect(
+      report2.report.refused.some((r) => r.reason.includes("content address"))
+    ).toBe(true);
+  });
+
   it("re-import of the same pack is idempotent via (originWorkspace, recordHash), including anchor-less records", async () => {
     const anchored = makeRecord({
       noteId: "mem-origin-idem-a",

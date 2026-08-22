@@ -103,6 +103,14 @@ const publishAuthorizationSchema = reviewQuerySchema
 const createPullRequestSchema = publishBaseSchema.extend({
   title: z.string().trim().min(1).max(256),
   body: z.string().max(16_000).optional(),
+  // ADR-0065: the STRUCTURED citation channel on the PR artifact — the note
+  // coordinates the change leaned on. Rendered into the body by ONE
+  // server-side renderer (never a caller grammar) and recorded on the
+  // publish audit. Provenance, never authority.
+  citedNoteIds: z
+    .array(z.string().min(1).max(128))
+    .max(8)
+    .optional(),
 });
 
 const mergePullRequestSchema = publishBaseSchema.extend({
@@ -153,6 +161,8 @@ type GitHubPublishAudit = {
   branch: string;
   pullNumber: number;
   headSha: string;
+  /** ADR-0065: the structured citations the PR body carries, if any. */
+  citedNoteIds?: string[];
 };
 
 const pullRequestListSchema = z
@@ -216,6 +226,9 @@ type GitHubServiceOptions = {
     jobId: string
   ) => Promise<PublishedJobBinding | null>;
   recordPublishAudit?: (input: GitHubPublishAudit) => Promise<void>;
+  /** ADR-0065: which of the cited note ids the brain does NOT hold (empty =
+   *  all verified). Injectable for tests; defaults to the ledger query. */
+  unknownCitedNotes?: (noteIds: string[]) => Promise<string[]>;
 };
 
 class GitHubServiceError extends Error {
@@ -329,6 +342,9 @@ async function recordGitHubPublishAudit(
           branch: input.branch,
           number: input.pullNumber,
           headSha: input.headSha,
+          ...(input.citedNoteIds && input.citedNoteIds.length > 0
+            ? { citedNoteIds: input.citedNoteIds }
+            : {}),
         },
       },
     });
@@ -367,6 +383,16 @@ export function createGitHubService(options: GitHubServiceOptions = {}) {
   const pending = new Map<string, PendingDeviceFlow>();
   const recordPublishAudit =
     options.recordPublishAudit ?? recordGitHubPublishAudit;
+  const unknownCitedNotes =
+    options.unknownCitedNotes ??
+    (async (noteIds: string[]): Promise<string[]> => {
+      const known = await prisma.memoryNote.findMany({
+        where: { id: { in: noteIds } },
+        select: { id: true },
+      });
+      const knownIds = new Set(known.map((note) => note.id));
+      return noteIds.filter((id) => !knownIds.has(id));
+    });
   const authorizePublishedJob =
     options.authorizePublishedJob ??
     (async (jobId: string): Promise<PublishedJobBinding | null> => {
@@ -948,8 +974,32 @@ export function createGitHubService(options: GitHubServiceOptions = {}) {
   ) {
     const parsed = createPullRequestSchema.parse(input);
     const binding = await requirePublishedJob(parsed.jobId);
+    // ADR-0065: citations are verified against the ledger BEFORE any
+    // branch can answer — an unknown id refuses the request (stated
+    // provenance intent must not be silently dropped), and the section is
+    // rendered by THIS one renderer, never composed by the caller.
+    const citedNoteIds = [...new Set(parsed.citedNoteIds ?? [])];
+    if (citedNoteIds.length > 0) {
+      const unknown = await unknownCitedNotes(citedNoteIds);
+      if (unknown.length > 0) {
+        throw new GitHubServiceError(
+          "blocked",
+          `citedNoteIds name notes this brain does not hold: ${unknown.join(", ")}. Cite existing note coordinates or drop them.`
+        );
+      }
+    }
     const existing = await review(parsed);
     if (existing.review.status === "available") {
+      // A PR that already exists cannot receive this call's citations — its
+      // body is already published. Returning "existing" while silently
+      // dropping a stated citation set would let the caller believe the
+      // public artifact carries provenance it does not (review finding).
+      if (citedNoteIds.length > 0) {
+        throw new GitHubServiceError(
+          "blocked",
+          "A pull request for this branch already exists, so its body cannot receive these citations. Re-run without citedNoteIds to read it, or edit the PR body on GitHub."
+        );
+      }
       return {
         operation: "existing" as const,
         review: existing.review,
@@ -959,7 +1009,10 @@ export function createGitHubService(options: GitHubServiceOptions = {}) {
     if (existing.review.status === "degraded") {
       throw new GitHubServiceError("blocked", existing.review.reason);
     }
-
+    const bodyWithCitations =
+      citedNoteIds.length > 0
+        ? `${parsed.body ?? ""}${parsed.body ? "\n\n" : ""}---\nGrounded in MUON brain notes: ${citedNoteIds.join(", ")}`
+        : parsed.body;
     const auth = await accessCredential();
     const repository = repositorySchema.parse(
       await apiJson(
@@ -1002,7 +1055,7 @@ export function createGitHubService(options: GitHubServiceOptions = {}) {
           title: parsed.title,
           head: `${parsed.headOwner ?? parsed.owner}:${parsed.branch}`,
           base: repository.default_branch,
-          ...(parsed.body ? { body: parsed.body } : {}),
+          ...(bodyWithCitations ? { body: bodyWithCitations } : {}),
         }
       )
     );
@@ -1014,6 +1067,7 @@ export function createGitHubService(options: GitHubServiceOptions = {}) {
       branch: parsed.branch,
       pullNumber: createdPull.number,
       headSha: binding.mergeCommit,
+      ...(citedNoteIds.length > 0 ? { citedNoteIds } : {}),
     });
     const created = await review(parsed);
     if (created.review.status !== "available") {

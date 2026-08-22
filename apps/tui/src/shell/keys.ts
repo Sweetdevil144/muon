@@ -9,7 +9,8 @@ import {
   TAB_KEY,
   UP_KEYS,
 } from "./keymap.js";
-import { topSurface } from "./surfaces.js";
+import { topSurface,
+  type Surface } from "./surfaces.js";
 
 /**
  * The shell's key router — pure, table-driven, and the ONLY place a key
@@ -49,6 +50,24 @@ export type ShellScope = {
   readonly crewOpen: boolean;
   readonly timelineOpen: boolean;
   readonly settingsOpen: boolean;
+  /** ADR-0085: the since-you-last-looked frame. */
+  readonly digestOpen: boolean;
+  /** ADR-0087 M10/M11: the task ledger + packets pane family. */
+  readonly tasksOpen: boolean;
+  /** ADR-0087 M3: the workflow-runs consent surface. */
+  readonly workflowsOpen: boolean;
+  readonly workflowsBusy: boolean;
+  /** ADR-0087 M7: roles + coordination detail. */
+  readonly crewDetailOpen: boolean;
+  /** ADR-0087 M6: the pre-edit context result surface. */
+  readonly contextOpen: boolean;
+  /**
+   * The desk's REAL top surface (its stack-ordered `top()`), for the few
+   * keys that belong to one reveal specifically. `topLayer` below cannot
+   * answer this — it runs with an empty stack by design and falls back to
+   * declared order, so with two reveals open it names the wrong one.
+   */
+  readonly topSurface: Surface | null;
   readonly sidebarOpen: boolean;
   readonly inboxFocused: boolean;
   readonly inboxHasRows: boolean;
@@ -70,6 +89,11 @@ export type ShellIntent =
   | { kind: "toggle-crew" }
   | { kind: "toggle-inbox" }
   | { kind: "open-help" }
+  | { kind: "open-tasks" }
+  | { kind: "open-workflows" }
+  | { kind: "open-crew-detail" }
+  | { kind: "open-context" }
+  | { kind: "workflow-act"; action: "apply" | "dismiss" }
   | { kind: "open-destinations" }
   | { kind: "open-spawn-menu" }
   | { kind: "open-memory" }
@@ -86,7 +110,13 @@ export type ShellIntent =
   | { kind: "move"; delta: number }
   | { kind: "cycle-zone"; delta: number }
   | { kind: "activate" }
-  | { kind: "review-decide"; status: "approved" | "rejected" }
+  | {
+      kind: "review-decide";
+      status: "approved" | "rejected";
+      /** I2: present only on the explicit approve-and-remember press. */
+      remember?: boolean;
+    }
+  | { kind: "review-attest" }
   | { kind: "memory-act"; action: "confirm" | "reject" | "pause" | "pin" }
   | { kind: "memory-toggle-expired" }
   | { kind: "none" };
@@ -118,6 +148,11 @@ export function topLayer(scope: ShellScope): string | null {
       crew: scope.crewOpen,
       timeline: scope.timelineOpen,
       settings: scope.settingsOpen,
+      digest: scope.digestOpen,
+      tasks: scope.tasksOpen,
+      workflows: scope.workflowsOpen,
+      "crew-detail": scope.crewDetailOpen,
+      context: scope.contextOpen,
       inbox: scope.inboxFocused,
     },
     []
@@ -158,6 +193,9 @@ export function intentForAction(action: string): ShellIntent {
       case "open-destinations": return { kind: "open-destinations" };
       case "open-memory": return { kind: "open-memory" };
       case "open-help": return { kind: "open-help" };
+      case "open-tasks": return { kind: "open-tasks" };
+      case "open-workflows": return { kind: "open-workflows" };
+      case "open-context": return { kind: "open-context" };
       case "new-tab": return { kind: "new-tab" };
       case "next-tab": return { kind: "next-tab" };
       case "prev-tab": return { kind: "prev-tab" };
@@ -203,6 +241,11 @@ export function routeKey(data: string, scope: ShellScope): ShellIntent {
     if (data === ESC_KEY) return { kind: "pop-layer" };
     if (scope.reviewResolving || !scope.reviewApprovable) return { kind: "none" };
     if (data === "a") return { kind: "review-decide", status: "approved" };
+    // I2: remember rides ONLY the explicit capital-A press, never inferred.
+    if (data === "A")
+      return { kind: "review-decide", status: "approved", remember: true };
+    // I5: attest-and-approve a review-blind merge; the executor guards.
+    if (data === "m") return { kind: "review-attest" };
     if (data === "r") return { kind: "review-decide", status: "rejected" };
     return { kind: "none" };
   }
@@ -217,6 +260,32 @@ export function routeKey(data: string, scope: ShellScope): ShellIntent {
     if (data === "p") return { kind: "memory-act", action: "pause" };
     if (data === "P") return { kind: "memory-act", action: "pin" };
     return { kind: "none" };
+  }
+
+  // ── 3b. THE WORKFLOW CONSENT SURFACE owns two verbs beside the overlay
+  // basics (the memory gate's own pattern): apply and dismiss act on the
+  // run whose FULL step table is on screen.
+  // Stack-resolved top, not mere openness (review finding: a workflows
+  // surface OPEN UNDER the crew drawer swallowed the drawer's keys).
+  if (scope.topSurface === "workflows") {
+    if (data === ESC_KEY) return { kind: "pop-layer" };
+    if (data === TAB_KEY) return { kind: "cycle-zone", delta: 1 };
+    if (data === SHIFT_TAB_KEY) return { kind: "cycle-zone", delta: -1 };
+    if (scope.workflowsBusy) return { kind: "none" };
+    const delta = moveDelta(data);
+    if (delta !== null) return { kind: "move", delta };
+    if (data === "a") return { kind: "workflow-act", action: "apply" };
+    if (data === "x") return { kind: "workflow-act", action: "dismiss" };
+    return { kind: "none" };
+  }
+
+  // ── 3c. ADR-0087 M7: `d` on the crew drawer opens the roles +
+  // coordination DETAIL — one key, resolved against the desk's REAL
+  // stack-ordered top (scope.topSurface), because `topLayer`'s
+  // empty-stack fallback names the wrong reveal when two are open (the
+  // boot spawn-menu under the drawer was the live case).
+  if (scope.topSurface === "crew" && data === "d") {
+    return { kind: "open-crew-detail" };
   }
 
   // ── 4. OVERLAYS. Esc pops ONE; arrows move; Tab cycles — including with

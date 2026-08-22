@@ -11,8 +11,8 @@ import { bold, cyan, dim, yellow } from "./theme.js";
  * desk yet, and a nav that silently omitted them would misrepresent the
  * product: a human would conclude MUON has three places rather than nine.
  * Every destination is listed; the ones that are not here yet say so and say
- * where they ARE, which is the same refusal-with-a-reason rule the spawn menu
- * and the classic desk's sixteen commands use.
+ * where they ARE, which is the same refusal-with-a-reason rule the spawn
+ * menu uses.
  *
  * That also makes this list a live burn-down ledger: `implemented` is one
  * edit away from telling the truth about a row, and the parity matrix and
@@ -41,7 +41,7 @@ export const IMPLEMENTED_DESTINATIONS: ReadonlySet<NavDestination> = new Set<Nav
 ]);
 
 /** Where a not-yet-ported destination CAN be reached. */
-const ELSEWHERE = "desktop app, or `npm run tui:ink`";
+const ELSEWHERE = "desktop app";
 
 export type NavState = {
   readonly active: NavDestination;

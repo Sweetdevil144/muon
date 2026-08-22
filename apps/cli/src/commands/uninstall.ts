@@ -87,11 +87,13 @@ export function registerUninstallCommand(program: Command) {
           }
         }
 
-        let removedAny = false;
+        // Which packages npm really removed — the plan is what MUON might own,
+        // and on most machines only one of them is actually installed.
+        const removed: string[] = [];
         for (const pkg of plan.remove) {
-          if ((await npmUninstall(pkg)) === 0) removedAny = true;
+          if ((await npmUninstall(pkg)) === 0) removed.push(pkg);
         }
-        if (!removedAny) {
+        if (removed.length === 0) {
           failCommand(
             new Error(
               "npm removed nothing. If MUON was installed another way, remove the `muon` and `muon-tui` binaries from your PATH by hand."
@@ -100,7 +102,7 @@ export function registerUninstallCommand(program: Command) {
           );
           return;
         }
-        process.stdout.write(`${describePlan(plan)}\n`);
+        process.stdout.write(`${describePlan(plan, removed)}\n`);
       } catch (error) {
         failCommand(error, "Uninstall failed.");
       }

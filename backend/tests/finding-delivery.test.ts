@@ -133,7 +133,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await app?.close();
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 describe("T3 — a published finding reaches the sibling's edit boundary", () => {

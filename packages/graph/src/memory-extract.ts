@@ -1,7 +1,7 @@
 import type { MemoryKind, MemoryNoteInput } from "./types.js";
 
 /**
- * Deterministic memory extraction (v3 ingestion). The research (mem0/Graphiti)
+ * Deterministic memory extraction (v3 ingestion). The research (productM1/Graphiti)
  * uses an LLM to mine memories from raw conversation; that's the "take
  * inspiration" tier and needs a lane call. This module is the offline,
  * zero-LLM complement: it turns MUON's already-structured work signals,

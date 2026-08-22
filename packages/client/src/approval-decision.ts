@@ -1,4 +1,7 @@
-import type { ManualReviewAttestation } from "@muon/protocol";
+import type {
+  ApprovalGrantDuration,
+  ManualReviewAttestation,
+} from "@muon/protocol";
 
 /**
  * The ONE place a governed approval decision's payload is built.
@@ -38,6 +41,15 @@ export type ApprovalDecisionInput = {
   readonly notes?: string | undefined;
   /** Present only when the surface offered — and the human took — "remember". */
   readonly receiptTtlMs?: number | undefined;
+  /**
+   * ADR-0056: the GRADED form of the same opt-in — `once` (mints nothing),
+   * `session` (this run) or `always` (this chat, until it expires or the
+   * operator revokes). Mutually exclusive with `receiptTtlMs`; the builder
+   * refuses both rather than silently picking one, because a surface that
+   * quietly downgrades a human's chosen grade is exactly the drift this module
+   * exists to prevent.
+   */
+  readonly grantDuration?: ApprovalGrantDuration | undefined;
   readonly manualReview?: ManualReviewAttestation | undefined;
 };
 
@@ -46,12 +58,18 @@ export type ApprovalDecisionPayload = {
   status: "approved" | "rejected";
   decisionNotes: string;
   receipt?: { ttlMs: number };
+  grant?: { duration: ApprovalGrantDuration };
   manualReview?: ManualReviewAttestation;
 };
 
 export function buildApprovalDecision(
   input: ApprovalDecisionInput
 ): ApprovalDecisionPayload {
+  if (input.receiptTtlMs !== undefined && input.grantDuration !== undefined) {
+    throw new Error(
+      "An approval decision carries one durable authority: pass either receiptTtlMs or grantDuration, never both."
+    );
+  }
   const note = input.notes?.trim();
   const attribution = input.manualReview
     ? `manually reviewed from ${input.surface}`
@@ -65,6 +83,11 @@ export function buildApprovalDecision(
     ...(input.receiptTtlMs === undefined
       ? {}
       : { receipt: { ttlMs: input.receiptTtlMs } }),
+    // `once` is a real answer, not an absence: it is sent so the server records
+    // the grade the human actually chose, and it mints nothing by definition.
+    ...(input.grantDuration === undefined
+      ? {}
+      : { grant: { duration: input.grantDuration } }),
     ...(input.manualReview === undefined
       ? {}
       : { manualReview: input.manualReview }),

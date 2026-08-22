@@ -201,6 +201,13 @@ describe("bounded memory traversal", () => {
     expect(result.contradictions[0]?.text).toContain("credential broker");
   });
 
+  it("ADR-0081 D3: contradictionsOf answers from EITHER side of the edge", async () => {
+    // The edge was projected confirmed→crew; both endpoints must see the
+    // dispute — the reader sees it whichever side they happened to fetch.
+    expect(await graph.contradictionsOf(confirmedId)).toContain(crewId);
+    expect(await graph.contradictionsOf(crewId)).toContain(confirmedId);
+  });
+
   it("applies the text gate to contradiction rows too", async () => {
     const result = await graph.memoryExplain(confirmedId, {
       chatId: CHAT_A,

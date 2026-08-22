@@ -1,6 +1,10 @@
 import type { Command } from "commander";
 import { failCommand } from "../lib/refusal.js";
 import type { MuonApiClient } from "../lib/api-client.js";
+import {
+  presentDeviceCode,
+  type DeviceCodePresenterDeps,
+} from "../lib/device-code-prompt.js";
 import { printJson } from "../lib/output.js";
 
 /**
@@ -16,7 +20,10 @@ import { printJson } from "../lib/output.js";
  */
 export function registerGitHubCommands(
   program: Command,
-  createClient: () => MuonApiClient
+  createClient: () => MuonApiClient,
+  /** The gh-style code presenter (clipboard + Enter-to-open). Injectable so
+   *  tests never touch a real clipboard, browser, or stdin. */
+  presenter: DeviceCodePresenterDeps = {}
 ) {
   const github = program
     .command("github")
@@ -65,10 +72,10 @@ export function registerGitHubCommands(
       try {
         const client = createClient();
         const flow = await client.startGitHubDeviceFlow();
-        process.stderr.write(
-          `Open ${flow.verificationUri} and enter this code:\n\n    ${flow.userCode}\n\n` +
-            `Waiting for authorization (code expires ${flow.expiresAt})…\n`
-        );
+        // gh-style (founder, 2026-08-19): code onto the clipboard, Enter opens
+        // the browser — the same presenter `muon login` uses. Waiting at the
+        // Enter prompt is safe: the deadline below is GitHub's own expiry.
+        await presentDeviceCode(flow, presenter);
         const deadline = Date.parse(flow.expiresAt);
         let waitMs = flow.intervalMs;
         for (;;) {

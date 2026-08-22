@@ -15,6 +15,7 @@ const dbMock = vi.hoisted(() => ({
 }));
 
 const ledgerMock = vi.hoisted(() => ({
+  mintContradictionEdge: vi.fn(),
   cloneMemoryNote: vi.fn(),
   compactMemory: vi.fn(),
   deleteMemoryNote: vi.fn(),

@@ -90,6 +90,12 @@ model Task {
   // Target repo folder for dispatch (like opening a folder in an editor).
   // Null = whatever directory the executing client runs from.
   workspacePath String?
+  // ADR-0044/0071 D5: the SOURCE task whose recorded worktree state this
+  // fork-minted task's fresh worktree is seeded from at first claim. Set
+  // only by the fork route (the create route's consistency guard makes this
+  // the sole minting path); null for every ordinary task. Plain column,
+  // no FK.
+  forkSourceTaskId String?
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
   assignments   Assignment[]
@@ -535,6 +541,23 @@ model DispatchJob {
   // (fresh budgets, unweakened delegation fences); lineage lives here only.
   // Plain column, no FK.
   resumedFromJobId            String?
+  // A5 (2026-08 cycle): the typed handoff packet this dispatch was seeded
+  // from — the re-dispatch citation that replaces free-text "try again".
+  // Lineage/audit only: it confers no authority and inherits nothing
+  // (ADR-0044 spirit, no fork). Plain column, no FK; guarded at the route
+  // (must name an existing packet in this dispatch's own chat partition).
+  sourcePacketId              String?
+  // ADR-0044/0071 — FORK provenance (D6): the recorded step (a TERMINAL job)
+  // this mission was branched from. Set ONLY by the fork route, which mints
+  // the fork's own chat+task; carries NO authority, budget, claims, or
+  // standing (D1/D2/D3 — everything is re-derived at create). Plain column,
+  // no FK.
+  forkedFromJobId             String?
+  // The MATERIALIZATION pointer (D5): the source TASK whose recorded worktree
+  // state the runner seeds this fork's fresh worktree from, at first claim.
+  // Denormalized onto the job so the claim payload carries it without a
+  // second (tier-gated) task read. Set only beside forkedFromJobId.
+  forkSourceTaskId            String?
   // Append-once resume claim (P0.1 replay-safety): the redispatch route
   // atomically stamps the ORIGINAL interrupted job the FIRST time it is resumed
   // (guarded updateMany, `resumedAt IS NULL`). A second resume of the same
@@ -592,6 +615,8 @@ model DispatchJob {
   @@index([parentJobId])
   @@index([rootJobId])
   @@index([resumedFromJobId])
+  @@index([forkedFromJobId])
+  @@index([sourcePacketId])
   // ADR-0037's read-time check-history annotation filters by workspacePath and
   // orders by createdAt; the TUI's task-detail poll repeats it. Filter-then-sort
   // order, so the bounded `take` short-circuits on an ordered walk.
@@ -660,6 +685,51 @@ model ApprovalReceipt {
   createdAt           DateTime  @default(now())
 
   @@index([jobId, payloadDigest])
+}
+
+// ADR-0056: the `always` grade of a graded durable approval grant — the one
+// authority a receipt structurally cannot express, because a receipt's `jobId`
+// is a required clause of its redeem match and every dispatch is a new job.
+//
+// A SEPARATE table from ApprovalReceipt on purpose: a receipt binds a RUN
+// (jobId + delegation manifest), a grant binds a CHAT (taskId + policy
+// fingerprint), and the two authority column sets are disjoint. Folding them
+// together would make each other's authority columns nullable and put two query
+// paths over one row set — the exact shape that has widened bounded surfaces
+// here before. Two tables, two total queries, every field stated positively.
+//
+// There is deliberately NO vendor / lane / agent / principal / capabilityMode
+// column: "always approve this agent" must stay unrepresentable, not merely
+// disallowed.
+model ApprovalGrant {
+  id                String    @id @default(cuid())
+  approvalId        String    @unique // the operator decision that minted it
+  // ENFORCED scope: the chat (ADR-0024's unit of work) this grant may act
+  // inside, and the canonical governed workspace. A grant minted while
+  // reviewing one piece of work can never authorize a different one.
+  taskId            String
+  workspacePath     String
+  actionClass       String // read | test | edit — NEVER network/merge/ship
+  toolName          String // exact vendor tool
+  payloadDigest     String // sha256 over the exact tool input
+  // The OPERATOR-VISIBLE resolved target the human actually saw on the card
+  // (P0.4 SEC-1, carried forward unchanged). NULL only for a genuinely
+  // target-less action, and NULL matches NULL exactly — never a wildcard.
+  resolvedTarget    String?
+  // Canonical hash of the EFFECTIVE workspace policy profile at mint,
+  // recomputed from current rows at redemption. Editing/deleting/adding/
+  // re-scoping a profile invalidates every grant minted under the old posture.
+  policyFingerprint String
+  // Provenance ONLY — never matched at redemption. Crossing the run boundary is
+  // the entire point of this grade; matching jobId would make it a receipt.
+  originJobId       String
+  expiresAt         DateTime // absolute expiry, server-computed from the grade
+  revokedAt         DateTime? // one-way operator revocation
+  useCount          Int       @default(0)
+  lastUsedAt        DateTime?
+  createdAt         DateTime  @default(now())
+
+  @@index([taskId, payloadDigest])
 }
 
 // Runner heartbeat (R1): lets surfaces know a live runner exists before they
@@ -740,6 +810,16 @@ model MemoryNote {
   // NULL = legacy prose with no outcome (`worked` | `abandoned` | `superseded` |
   // `unknown`). Only meaningful when `kind = "attempt"`; other kinds leave it NULL.
   outcome       String?
+  // ADR-0091: Json string[] of principal strings — the `ownership` kind's
+  // structured "whom to ask". Orientation, never authority (D2). NULL on
+  // every other kind; the surface half of D1 is the existing anchors.
+  owners        Json?
+  // ADR-0063: the note's machine-readable impact claim (JSON in the
+  // @muon/protocol `memoryImpactClaimSchema` v1 shape), validated at ingest —
+  // malformed is REJECTED, never stored. NULL on every pre-0063 row and every
+  // note whose author asserted no blast radius; `memory_ground`'s third check
+  // reads it and diffs a re-run `impact` against it.
+  impactClaim   String?
   // TODO 4.8 / D7: provenance tier on the NOTE itself, before any derived structure
   // ships. Additive nullable, no backfill — NULL = authored (every pre-migration row
   // and every explicit human/agent statement at ingest). `inferred` is reserved for
@@ -882,6 +962,89 @@ model MemoryEdge {
 
 // Human decisions on a note (append-only). The note's confirmed state is
 // DERIVED from the latest confirmation, so it survives a graph rebuild.
+// ADR-0058: a grounding is EVIDENCE attached to a note — the record of one
+// check of the note's claims against the repository. Deliberately its own
+// table, not Confirmation rows: "confirmed" means human-confirmed everywhere
+// (memory-ledger.ts keys on it), and a grounding is provenance, never a trust
+// promotion. Latest row per note is the "last grounding stamp" recall may
+// carry (ADR-0058 D4).
+model MemoryGrounding {
+  id     String   @id @default(cuid())
+  noteId String
+  /// holds | mismatch | nothing-checkable — the OVERALL verdict, derived
+  /// server-side from the per-check rows (any mismatch wins; all
+  /// not-checkable means nothing-checkable).
+  verdict String
+  /// JSON array of per-check rows: {kind, verdict, detail} for each of the
+  /// ADR-0058 D2 check kinds. Persisted as evidence, rendered by surfaces.
+  checks  String
+  /// Who ran the grounding (a parsed principal string, like createdBy).
+  groundedBy String
+  /// The contradiction proposal filed on mismatch, if any (ADR-0058 D3).
+  proposalNoteId String?
+  at     DateTime @default(now())
+
+  @@index([noteId, at])
+}
+
+/// ADR-0060: the offer ledger — "MUON offered note N to job J" — recorded
+/// SERVER-SIDE inside the serve paths (lib/memory-offers.ts holds the positive
+/// surface list). Append-only evidence, never authority: no read is granted,
+/// widened, or reordered by a row here. A decision's `derived_from` set is
+/// DERIVED from these rows at query time (offers in the decision's partition
+/// with firstAt <= recordedAt), never materialized per decision.
+model MemoryOffer {
+  id        String   @id @default(cuid())
+  /// The memory partition the serve was fenced to — the SAME derived
+  /// coordinate `memoryCallerScope` resolves (a chat id, or a chat-less
+  /// job's task partition). Never a caller claim.
+  partition String
+  /// The exact job the serve answered (capability-derived). The stored fact
+  /// is per-job; a chat's offer set is the union over its jobs.
+  jobId     String
+  /// The workspace fence the serve ran under, when the capability had one.
+  workspacePath String?
+  /// The serving principal string, as derived at serve time.
+  principal String
+  noteId    String
+  /// Which serve path offered it — a value from the positive list in
+  /// lib/memory-offers.ts.
+  surface   String
+  firstAt   DateTime @default(now())
+
+  @@unique([jobId, noteId])
+  @@index([partition, firstAt])
+  @@index([noteId])
+}
+
+/// ADR-0080: the DELIVER ledger — "MUON served packet P to job J" —
+/// recorded SERVER-SIDE at the packet serve path through the 0088 boundary
+/// (lib/memory-offers.ts). Append-only evidence, never authority: no read
+/// is granted, no packet becomes trustworthy, no gate moves because a row
+/// exists (0080 D2). Surfaces derive delivery verdicts from these rows at
+/// read time, never a stored flag.
+model HandoffOffer {
+  id        String   @id @default(cuid())
+  /// The partition the serve was fenced to — the same derived coordinate
+  /// `memoryCallerScope` resolves. Never a caller claim.
+  partition String
+  /// The exact job the serve answered (capability-derived).
+  jobId     String
+  /// The workspace fence the serve ran under, when the capability had one.
+  workspacePath String?
+  /// The serving principal string, as derived at serve time.
+  principal String
+  handoffId String
+  /// Which serve path delivered it — from the positive list in
+  /// lib/memory-offers.ts.
+  surface   String
+  firstAt   DateTime @default(now())
+
+  @@unique([jobId, handoffId])
+  @@index([partition, firstAt])
+  @@index([handoffId])
+}
+
 model Confirmation {
   id        String   @id @default(cuid())
   noteId    String
@@ -1123,6 +1286,25 @@ model OperatorSetting {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
+}
+
+// H1 (2026-08 cycle) — the review thread's per-principal read cursor. What a
+// principal has ALREADY LOOKED AT is durable state, not a renderer ref: the
+// desktop's in-memory seen-set died on every reload, so each review open was
+// archaeology. One row per (principal, target); `lastLookedAt` advances ONLY
+// on an explicit advance (a decision made, a digest acknowledged) — opening a
+// digest never advances it, which is what keeps a closed-without-deciding
+// thread bound. Display/UX state only: nothing here grants, gates, or widens
+// a read; the digest route re-checks operator tier on every call.
+model ReviewLookCursor {
+  id           String   @id @default(cuid())
+  principal    String
+  targetKind   String
+  targetId     String
+  lastLookedAt DateTime
+  updatedAt    DateTime @updatedAt
+
+  @@unique([principal, targetKind, targetId])
 }
 
 // ── A2A + role assignment (VISION §2, packages/protocol/src/a2a.ts) ───────────

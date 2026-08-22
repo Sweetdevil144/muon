@@ -1346,3 +1346,138 @@ describe("aggregateTargetStatus — trigger attribution", () => {
     ).toBeUndefined();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-0054 — the post-merge catch-up.
+//
+// The git-dir watcher already sees the merge commit (the backend runs `git
+// merge` in this very checkout). What it could not do was BEAT the per-target
+// five-minute cooldown, so for up to five minutes after a governed land the
+// graph sat behind the primary checkout — precisely the window in which the
+// next agent asks and `review_diff` goes REVIEW-BLIND.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("GitNexusIndexSupervisor.catchUpAfterMerge", () => {
+  /** Bind, let the first analyze run and exit, leaving the cooldown burnt. */
+  const landedOn = async (headAfterMerge: string) => {
+    let head = "HEADSHA";
+    const harness = makeSupervisor({
+      readMeta: async () => ({
+        indexedAt: "2026-08-17T00:00:00.000Z",
+        lastCommit: "HEADSHA",
+        stats: { nodes: 10 },
+      }),
+      readHead: async () => head,
+    });
+    harness.supervisor.bind("/ws");
+    await flush();
+    harness.clock.fireAll();
+    await flush();
+    // Fresh index, nothing spawned, and `lastAnalyzeAt` is unset — so burn the
+    // cooldown the way a real background run would: force one analyze through.
+    harness.supervisor.reindexNow();
+    await flush();
+    harness.children[0]!.emitExit(0);
+    await flush();
+    harness.clock.fireAll();
+    await flush();
+    harness.calls.length = 0;
+    // The merge lands: HEAD moves past the indexed commit.
+    head = headAfterMerge;
+    return harness;
+  };
+
+  it("beats the cooldown: a landed merge re-indexes NOW, not in five minutes", async () => {
+    const { supervisor, calls, clock } = await landedOn("MERGEDSHA");
+    // Proof the hole is real: the ordinary staleness nudge is suppressed.
+    supervisor.ensureIndexed();
+    clock.fireAll();
+    await flush();
+    expect(calls).toHaveLength(0);
+
+    supervisor.catchUpAfterMerge();
+    clock.fireAll();
+    await flush();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toContain("--index-only");
+    supervisor.stop();
+  });
+
+  it("does NOT force a rebuild — a new commit is incremental work", async () => {
+    const { supervisor, calls, clock } = await landedOn("MERGEDSHA");
+    supervisor.catchUpAfterMerge();
+    clock.fireAll();
+    await flush();
+    expect(calls[0]!.args).not.toContain("--force");
+    supervisor.stop();
+  });
+
+  it("keeps the trigger AUTO — the operator clicked Approve, not Re-index", async () => {
+    const seen: unknown[] = [];
+    let head = "HEADSHA";
+    const harness = makeSupervisor({
+      readMeta: async () => ({ indexedAt: "x", lastCommit: "HEADSHA" }),
+      readHead: async () => head,
+      onChange: (status) => seen.push(status),
+    });
+    harness.supervisor.bind("/ws");
+    await flush();
+    harness.clock.fireAll();
+    await flush();
+    head = "MERGEDSHA";
+    harness.supervisor.catchUpAfterMerge();
+    harness.clock.fireAll();
+    await flush();
+    const indexing = seen.filter(
+      (s): s is GitNexusIndexStatus =>
+        (s as GitNexusIndexStatus).status === "indexing"
+    );
+    expect(indexing.length).toBeGreaterThan(0);
+    // "manual" makes the masthead say "rebuilding the local code graph" — the
+    // copy for a button nobody pressed.
+    expect(indexing.every((s) => s.trigger !== "manual")).toBe(true);
+    harness.supervisor.stop();
+  });
+
+  it("SURVIVES contention: a run already in flight is not refused away", async () => {
+    // `reindexNow` would answer `already-running` and DROP the catch-up, landing
+    // right back in the five-minute hole. Clearing the cooldown instead means
+    // the in-flight child's own exit picks the new commit up immediately.
+    let head = "HEADSHA";
+    const harness = makeSupervisor({
+      readMeta: async () => ({ indexedAt: "x", lastCommit: "OLDSHA" }),
+      readHead: async () => head,
+    });
+    harness.supervisor.bind("/ws");
+    await flush();
+    harness.clock.fireAll();
+    await flush();
+    expect(harness.calls).toHaveLength(1); // the stale index spawned one already
+
+    head = "MERGEDSHA";
+    harness.supervisor.catchUpAfterMerge(); // refused nothing, spawned nothing
+    expect(harness.calls).toHaveLength(1);
+
+    harness.children[0]!.emitExit(0);
+    await flush();
+    harness.clock.fireAll();
+    await flush();
+    // Immediately, not after the cooldown.
+    expect(harness.calls).toHaveLength(2);
+    harness.supervisor.stop();
+  });
+
+  it("is inert with no workspace bound, and after stop()", async () => {
+    const harness = makeSupervisor();
+    expect(() => harness.supervisor.catchUpAfterMerge()).not.toThrow();
+    expect(harness.calls).toHaveLength(0);
+    harness.supervisor.bind("/ws");
+    await flush();
+    harness.supervisor.stop();
+    harness.calls.length = 0;
+    harness.supervisor.catchUpAfterMerge();
+    harness.clock.fireAll();
+    await flush();
+    expect(harness.calls).toHaveLength(0);
+  });
+});

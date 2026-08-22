@@ -199,7 +199,7 @@ describe("Crew — the roster is the registry's, and Ollama is gone", () => {
     expect(screen.queryByText(/ollama/i)).toBeNull();
   });
 
-  it("says on the lane which vendors cannot hold the coordinator seat", () => {
+  it("ADR-0057: a seat-holding lane says so, and is NOT labelled crew-only", () => {
     renderCrew(
       crewState({
         readiness: [
@@ -213,9 +213,26 @@ describe("Crew — the roster is the registry's, and Ollama is gone", () => {
         readinessMeta: meta("fresh", 1_000),
       } as Partial<DesktopState>)
     );
+    // The stale claim must be gone…
     expect(
-      screen.getByText("Cannot hold the coordinator seat — it runs as crew only.")
-    ).toBeTruthy();
+      screen.queryByText(
+        "Cannot hold the coordinator seat — it runs as crew only."
+      )
+    ).toBeNull();
+    // …and the seat must be STATED, not merely un-denied: silence would leave
+    // "why isn't Cursor in the Vendor dropdown?" unanswered, which is the
+    // question this line was added for in the first place.
+    // (rendered on more than one surface in this view — the lane row and the
+    //  Crew roster both derive it from the same `scope.summary`.)
+    expect(
+      screen.getAllByText(/can hold MUON's coordinator seat/i).length
+    ).toBeGreaterThan(0);
+    // The worker ceiling is still on the lane, unchanged by the seat.
+    expect(
+      screen.getAllByText(
+        /read-only crew roles only: reviewer, qa, architect, scout/i
+      ).length
+    ).toBeGreaterThan(0);
   });
 });
 

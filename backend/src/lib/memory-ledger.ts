@@ -25,11 +25,13 @@ import {
   isNoteDerivation,
   isNoteReviewStatus,
   lifecycleDaysForKind,
+  MEMORY_LIFECYCLE_KINDS,
   matchesMemoryFilter,
   normalizeNoteDerivation,
   parseMemoryLifecyclePolicy,
   type MemoryFilter,
   type MemoryFilterRecord,
+  type MemoryImpactClaim,
   type MemoryIngestPolicy,
   type MemoryLifecycleKind,
   type MemoryLifecyclePolicy,
@@ -457,7 +459,7 @@ async function loadNoteVectors(
   return byId;
 }
 
-// ── R3 TTL for low-trust agent notes (mem0 §6 `expiration_date`) ─────────────
+// ── R3 TTL for low-trust agent notes (productM1 §6 `expiration_date`) ─────────────
 //
 // The problem: every note an agent writes lived forever, so an unconfirmed guess
 // from three months ago competed with a human-confirmed fact for recall.
@@ -585,9 +587,13 @@ function ttlExpiresAt(args: {
   if (
     ttlRedeemed({
       authorIsHuman: args.authorIsHuman,
+      // A kind the stored policy predates (ownership on a pre-0091 record)
+      // reads undefined → false: confirmation does not redeem its TTL under
+      // that policy — moot in practice, because its days are undefined too
+      // and the note never receives a deadline at all.
       confirmed:
         (args.confirmed ?? false) &&
-        policy.permanentWhenConfirmedByKind[args.kind],
+        (policy.permanentWhenConfirmedByKind[args.kind] ?? false),
       trust: args.trust,
       pinned: args.pinned,
     })
@@ -668,6 +674,14 @@ function toRecord(
       createdAt: row.recordedAt.toISOString(),
     },
     outcome: row.outcome && isAttemptOutcome(row.outcome) ? row.outcome : null,
+    // ADR-0091: only an ownership note carries owners; a malformed column
+    // reads null, never a partial cast.
+    owners:
+      row.kind === "ownership" &&
+      Array.isArray(row.owners) &&
+      row.owners.every((entry: unknown) => typeof entry === "string")
+        ? (row.owners as string[])
+        : null,
     derivation: normalizeNoteDerivation(row.derivation),
     reviewStatus:
       row.reviewStatus && isNoteReviewStatus(row.reviewStatus)
@@ -705,14 +719,20 @@ function isExpiredRow(
   });
 }
 
-async function isConfirmed(noteId: string): Promise<boolean> {
+export async function isConfirmed(
+  noteId: string,
+  // Snapshot injection (ADR-0069 review): a caller assembling a multi-read
+  // fact passes its OWN transaction so status and confirmation are judged
+  // at one instant. Default stays the global client.
+  db: Pick<typeof prisma, "confirmation"> = prisma
+): Promise<boolean> {
   // A note is "confirmed" ONLY when a HUMAN principal blessed it (KG-6 F1). The
   // confirming principal is stored on each Confirmation row (KG-6), so we take the
   // latest HUMAN decision and ignore agent/system rows entirely, an `agent:*`
   // (or omitted → system) confirm can NEVER flip this flag. This is the single
   // source of truth that the gate, KG-5 confirmed-victim protection, and KG-4
   // confirmed-ranking all key on, so "confirmed" means human-confirmed everywhere.
-  const confirmations = await prisma.confirmation.findMany({
+  const confirmations = await db.confirmation.findMany({
     where: { noteId },
     orderBy: { at: "desc" },
   });
@@ -725,11 +745,18 @@ async function isConfirmed(noteId: string): Promise<boolean> {
 }
 
 async function latestConflict(noteId: string): Promise<string | null> {
+  // ADR-0081 D3: either direction — a disputed TARGET carries the dispute
+  // exactly as the disputing note does; before this, only the outgoing side
+  // rendered and the wrong finding served clean.
   const edge = await prisma.memoryEdge.findFirst({
-    where: { fromId: noteId, kind: "contradicts" },
+    where: {
+      kind: "contradicts",
+      OR: [{ fromId: noteId }, { toId: noteId }],
+    },
     orderBy: { at: "desc" },
   });
-  return edge?.toId ?? null;
+  if (!edge) return null;
+  return edge.fromId === noteId ? edge.toId : edge.fromId;
 }
 
 /** Hydrate a single note into a full record (derives confirmed + conflict). */
@@ -1177,6 +1204,191 @@ export async function promoteMemoryNoteToGlobal(
 }
 
 /**
+ * THE partition fence for agent-tier acts ON a note (clone, grounding): the
+ * same rule a read gets — an agent acts inside its own partition or not at
+ * all, a capability with no workspace fails closed, and the confirmed-global
+ * bypass covers only the CHAT clause, never the workspace one. ONE function,
+ * because the clone fence was reproduced by an adversarial review once
+ * already and a second hand-written copy is how the next surface misses a
+ * clause. Returns the refusal reason, or null when the act may proceed.
+ */
+function agentPartitionFence(
+  source: { workspacePath: string | null; chatId: string | null },
+  caller: MemoryMutationCaller,
+  visibility: {
+    confirmed: boolean;
+    crewVouched: boolean;
+    confirmedGlobal: boolean;
+  },
+  opts: {
+    /**
+     * This fence is MODULE-PRIVATE: the only doors are the named
+     * action-specific scope loaders (clone / grounding / dispute), so no
+     * caller outside this file can flip this flag ad hoc — the loader IS
+     * the fixed action policy a reviewer asked for.
+     *
+     * ADR-0081: clone and grounding EXPOSE the note's content/history to
+     * the actor, so they additionally require confirmed-or-crew-vouched.
+     * A DISPUTE does not — the disputer supplies its own text and the act
+     * discloses only linkage. The relaxation equals the caller's READ
+     * reach exactly: every same-partition ACTIVE note is already servable
+     * to this caller by its own surfaces (the agent recall's unconfirmed
+     * remainder, which 0082's crew-context block re-presents — and with
+     * the crew-visibility gate OFF that serve is coordinates-only, which
+     * still discloses the note's id and existence; the dispute discloses
+     * no text and mutates nothing on the target, so the id reach IS the
+     * dispute reach — "unseen same-chat proposal" is not a class that
+     * exists here), and
+     * the confirmed-global chat bypass stays because confirmed-global
+     * canon is in every same-workspace chat's read view — disputing stale
+     * canon from the chat that discovered the staleness is the ADR's own
+     * point, and grounding already files cross-chat mismatch proposals
+     * against exactly those notes. The workspace clause and active-status
+     * remain mandatory; this flag relaxes ONLY the content-visibility
+     * clause, by name, default-strict.
+     */
+    requireVisibleContent?: boolean;
+  } = {}
+): string | null {
+  if (caller.tier !== "agent") return null;
+  if ((source.workspacePath ?? "") !== (caller.workspacePath ?? "\u0000none")) {
+    return "The source note belongs to another workspace.";
+  }
+  const requireVisibleContent = opts.requireVisibleContent !== false;
+  const contentClause =
+    requireVisibleContent &&
+    !visibility.confirmed &&
+    !(caller.crewVisible && visibility.crewVouched);
+  if (
+    !caller.chatId ||
+    (!visibility.confirmedGlobal &&
+      (source.chatId !== caller.chatId || contentClause))
+  ) {
+    return "The source note is outside this chat's confirmed/crew-visible memory.";
+  }
+  return null;
+}
+
+/**
+ * ADR-0058: may this caller GROUND this note? Grounding reads the note's
+ * anchors and history, stamps evidence, and can file a contradiction
+ * proposal — a write-class act on the note, so it takes the clone's exact
+ * fence, via the same function.
+ */
+export async function memoryNoteGroundingScope(
+  noteId: string,
+  caller: MemoryMutationCaller
+): Promise<
+  | { status: "ok"; note: MemoryLedgerNote }
+  | { status: "missing"; reason: string }
+  | { status: "forbidden"; reason: string }
+> {
+  const source = await prisma.memoryNote.findUnique({ where: { id: noteId } });
+  if (!source || source.status !== "active" || isLedgerTombstone(source)) {
+    return { status: "missing", reason: "Only an active memory note can be grounded." };
+  }
+  const confirmed = await isConfirmed(noteId);
+  const record = await noteRecordById(noteId);
+  if (!record) {
+    return { status: "missing", reason: "Only an active memory note can be grounded." };
+  }
+  const fence = agentPartitionFence(source, caller, {
+    confirmed,
+    crewVouched: record.confirmedBy === "orchestrator",
+    confirmedGlobal: confirmed && source.scope === "global",
+  });
+  if (fence) return { status: "forbidden", reason: fence };
+  return { status: "ok", note: record };
+}
+
+/**
+ * ADR-0081: may this caller DISPUTE this note (file a typed contradiction
+ * finding against it)? The same ONE fence as clone/grounding — with the
+ * content-visibility clause relaxed by name (see `agentPartitionFence`):
+ * the dispute reads nothing, and the crew already received the finding's
+ * text through its own serve surfaces.
+ */
+export async function memoryNoteDisputeScope(
+  noteId: string,
+  caller: MemoryMutationCaller
+): Promise<
+  | { status: "ok"; note: MemoryLedgerNote }
+  | { status: "missing"; reason: string }
+  | { status: "forbidden"; reason: string }
+> {
+  const source = await prisma.memoryNote.findUnique({ where: { id: noteId } });
+  if (!source || source.status !== "active" || isLedgerTombstone(source)) {
+    return {
+      status: "missing",
+      reason: "Only an active memory note can be disputed.",
+    };
+  }
+  const confirmed = await isConfirmed(noteId);
+  const record = await noteRecordById(noteId);
+  if (!record) {
+    return {
+      status: "missing",
+      reason: "Only an active memory note can be disputed.",
+    };
+  }
+  const fence = agentPartitionFence(
+    source,
+    caller,
+    {
+      confirmed,
+      crewVouched: record.confirmedBy === "orchestrator",
+      confirmedGlobal: confirmed && source.scope === "global",
+    },
+    { requireVisibleContent: false }
+  );
+  if (fence) return { status: "forbidden", reason: fence };
+  return { status: "ok", note: record };
+}
+
+/**
+ * ADR-0081: file the typed dispute — the `contradicts` edge Prisma upsert
+ * (replay-clean) PLUS the graph mirror, in ONE spelling for every
+ * producer. Without the mirror a route-minted contradiction is invisible
+ * to every graph-backed derivation (preedit's `contradictionsOf`,
+ * neighbors, dossiers) until a full rebuild, while the ledger views see it
+ * — the exact split-brain the mirror exists to prevent (review finding).
+ * A producer whose edge must land atomically WITH its own records (the
+ * 0058 grounding stamp) creates the edge in its own transaction and calls
+ * this afterward: the upsert no-ops and the mirror leg still runs. Mirror
+ * failures are fail-open-LOUD exactly like every other mirror write.
+ */
+export async function mintContradictionEdge(
+  fromId: string,
+  toId: string
+): Promise<void> {
+  await prisma.memoryEdge.upsert({
+    where: { fromId_toId_kind: { fromId, toId, kind: "contradicts" } },
+    update: {},
+    create: { fromId, toId, kind: "contradicts" },
+  });
+  mirrorToGraph(async (graph) => {
+    // BOTH endpoints in THIS chain before the edge (the clone path's
+    // structural-ordering rule): `projectMemoryEdge` is a MATCH+MERGE, and
+    // with an endpoint the mirror never saw it writes nothing, silently.
+    // ACTIVE only (review finding): a note deleted in the fence→write
+    // window must not be re-projected here after the delete's own graph
+    // cleanup ran — the edge MERGE then finds no endpoint and no-ops,
+    // which is the self-healing outcome for that race.
+    const fromRecord = await noteRecordById(fromId);
+    if (fromRecord && fromRecord.status === "active") {
+      await graph.projectMemoryNote(fromRecord);
+    }
+    const toRecord = await noteRecordById(toId);
+    if (toRecord && toRecord.status === "active") {
+      await graph.projectMemoryNote(toRecord);
+    }
+    await graph.projectMemoryEdge(fromId, toId, "contradicts", {
+      awaitEndpoints: true,
+    });
+  }, "memory.dispute");
+}
+
+/**
  * Clone an active note without running dedup: the copy gets a fresh id,
  * caller-derived trust/author, no Confirmation row, and a durable CLONED_FROM
  * edge. Agent callers remain same-chat and may read unconfirmed source text only
@@ -1214,29 +1426,13 @@ export async function cloneMemoryNote(
     // A clone is a WRITE, so the rule is the same one a read gets: an agent acts
     // inside its own partition or not at all. A capability with no workspace fails
     // closed here for the same reason it does on the read path.
-    if (
-      caller.tier === "agent" &&
-      (source.workspacePath ?? "") !== (caller.workspacePath ?? "\u0000none")
-    ) {
-      return {
-        status: "forbidden",
-        sourceNoteId,
-        reason: "The source note belongs to another workspace." as string,
-      };
-    }
-    if (
-      caller.tier === "agent" &&
-      (!caller.chatId ||
-        (!confirmedGlobal &&
-          (source.chatId !== caller.chatId ||
-            (!confirmed && !(caller.crewVisible && crewVouched)))))
-    ) {
-      return {
-        status: "forbidden",
-        sourceNoteId,
-        reason:
-          "The source note is outside this chat's confirmed/crew-visible memory.",
-      };
+    const fence = agentPartitionFence(source, caller, {
+      confirmed,
+      crewVouched,
+      confirmedGlobal,
+    });
+    if (fence) {
+      return { status: "forbidden", sourceNoteId, reason: fence };
     }
 
     const author = parsePrincipal(caller.principal);
@@ -1274,6 +1470,15 @@ export async function cloneMemoryNote(
       {
         kind: source.kind as MemoryNoteInput["kind"],
         text: source.text,
+        // ADR-0091: the structured owners travel with the clone — a clone
+        // of an ownership note without them is not the same fact (review
+        // finding).
+        owners:
+          source.kind === "ownership" &&
+          Array.isArray(source.owners) &&
+          source.owners.every((entry: unknown) => typeof entry === "string")
+            ? (source.owners as string[])
+            : undefined,
         taskId: source.taskId ?? undefined,
         laneId: source.laneId ?? undefined,
         chatId:
@@ -1571,10 +1776,19 @@ export async function sweepExpiredMemory(
       };
     }
     const { policy } = lifecycle;
-    const dayValues = Object.values(policy.daysByKind);
-    const ttlDays = dayValues.every((days) => days === dayValues[0])
-      ? (dayValues[0] ?? null)
-      : null;
+    // A kind the stored policy predates (ownership on a pre-0091 record)
+    // has NO configured days — a "uniform TTL" claim that ignores it would
+    // misstate retention for exactly the notes it doesn't cover (review
+    // finding). Uniform requires every KNOWN kind to carry the same value.
+    const dayValues = MEMORY_LIFECYCLE_KINDS.map(
+      (kind) => policy.daysByKind[kind]
+    );
+    const ttlDays =
+      dayValues.every(
+        (days) => typeof days === "number" && days === dayValues[0]
+      )
+        ? ((dayValues[0] as number | undefined) ?? null)
+        : null;
     const limit = Math.max(
       1,
       Math.min(
@@ -1750,6 +1964,185 @@ export async function sweepExpiredMemory(
  * presents that digest, so a changed note, verdict, trust level, legacy setting,
  * or already-active table forces a fresh one-screen preview first.
  */
+/** Page size for the ownership-recast sweep's keyset scan. The scan runs
+ *  to table exhaustion (review finding: any fixed row cap re-scanned the
+ *  same prefix every run and could never reach rows past it — a cursor
+ *  local to one invocation does not "continue next time"). Keyset paging
+ *  bounds memory, and the id-ordered loop terminates at the table end. */
+const OWNERSHIP_RECAST_PAGE = 500;
+
+/**
+ * ADR-0091 D3 — the one-time kind-recast sweep. For each ACTIVE
+ * decision/constraint/convention note carrying an ownership tag, file an
+ * UNCONFIRMED recast proposal (machines propose — 0051; the human confirms
+ * by re-filing as `ownership` or rejects to keep the kind) anchored where
+ * the note is anchored, linked by a `related` edge and by provenance
+ * (`ownership-recast` / `note:<id>`), which is also the idempotency key: a
+ * note whose recast proposal EXISTS in any status is never re-proposed — a
+ * rejected recast is a human decision, not a retry.
+ *
+ * Deliberately NOT proposes_supersede: confirming that shape would replace
+ * the tagged note with the proposal itself, and the proposal is advice
+ * about the note, not its successor.
+ */
+export async function migrateOwnershipKindRecasts(options: {
+  dryRun: boolean;
+}): Promise<{
+  scanned: number;
+  truncated: boolean;
+  candidates: { noteId: string; kind: string; excerpt: string }[];
+  /** True when the candidates PREVIEW clipped; counts stay full-run. */
+  candidatesTruncated: boolean;
+  filed: number;
+  skippedAlreadyFiled: number;
+  /** Edges restored onto proposals whose original edge write failed. */
+  repairedEdges: number;
+}> {
+  // KEYSET pagination (review finding: a single oldest-first page could
+  // never advance past 500 rows — the sweep must see the whole ledger).
+  type RecastRow = {
+    id: string;
+    kind: string;
+    text: string;
+    topics: unknown;
+    modules: unknown;
+    symbols: unknown;
+    chatId: string | null;
+    workspacePath: string | null;
+  };
+  const tagged: RecastRow[] = [];
+  let scannedCount = 0;
+  let cursor: string | null = null;
+  for (;;) {
+    const page: RecastRow[] = await prisma.memoryNote.findMany({
+      where: {
+        status: "active",
+        kind: { in: ["decision", "constraint", "convention"] },
+      },
+      orderBy: { id: "asc" },
+      take: OWNERSHIP_RECAST_PAGE,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      select: {
+        id: true,
+        kind: true,
+        text: true,
+        topics: true,
+        modules: true,
+        symbols: true,
+        chatId: true,
+        workspacePath: true,
+      },
+    });
+    if (page.length === 0) break;
+    scannedCount += page.length;
+    cursor = page[page.length - 1]!.id;
+    for (const row of page) {
+      const topics = Array.isArray(row.topics) ? row.topics : [];
+      if (
+        topics.some(
+          (topic) =>
+            typeof topic === "string" &&
+            (OWNERSHIP_TOPIC_TAGS as readonly string[]).includes(
+              topic.toLowerCase()
+            )
+        )
+      ) {
+        tagged.push(row);
+      }
+    }
+    if (page.length < OWNERSHIP_RECAST_PAGE) break;
+  }
+  const candidates: { noteId: string; kind: string; excerpt: string }[] = [];
+  let filed = 0;
+  let skippedAlreadyFiled = 0;
+  let repairedEdges = 0;
+  for (const row of tagged) {
+    const episodes = await prisma.episode.findMany({
+      where: { sourceType: "ownership-recast", rawRef: `note:${row.id}` },
+      select: { id: true },
+    });
+    if (episodes.length > 0) {
+      const existing = await prisma.memoryNote.findFirst({
+        where: { episodeId: { in: episodes.map((episode) => episode.id) } },
+        select: { id: true },
+      });
+      if (existing) {
+        // REPAIRABLE, not skipped-forever (review finding): a crash between
+        // the proposal's ingest and its edge left an unlinked proposal that
+        // no retry could fix. The re-run repairs the edge instead.
+        if (!options.dryRun) {
+          const linked = await prisma.memoryEdge.findUnique({
+            where: {
+              fromId_toId_kind: {
+                fromId: existing.id,
+                toId: row.id,
+                kind: "related",
+              },
+            },
+          });
+          if (!linked) {
+            await prisma.memoryEdge.create({
+              data: { fromId: existing.id, toId: row.id, kind: "related" },
+            });
+            repairedEdges += 1;
+          }
+        }
+        skippedAlreadyFiled += 1;
+        continue;
+      }
+    }
+    candidates.push({
+      noteId: row.id,
+      kind: row.kind,
+      excerpt: row.text.slice(0, 80),
+    });
+    if (options.dryRun) continue;
+    const proposal = await ingestMemoryNote(
+      {
+        kind: "question",
+        text: `Recast proposal (ADR-0091): note ${row.id.slice(0, 8)} ("${row.text.slice(0, 80)}") is ownership-shaped — re-file it as an ownership note (owners + why) and retire it, or reject this proposal to keep its current kind.`,
+        modules: Array.isArray(row.modules) ? (row.modules as string[]) : [],
+        topics: [],
+        symbols: Array.isArray(row.symbols) ? (row.symbols as string[]) : [],
+        trust: "low",
+        createdBy: "human",
+        proposalOnly: true,
+        ...(row.chatId ? { chatId: row.chatId } : {}),
+        ...(row.workspacePath ? { workspacePath: row.workspacePath } : {}),
+        provenance: {
+          sourceType: "ownership-recast",
+          rawRef: `note:${row.id}`,
+        },
+      },
+      { orchestratorConfirm: false }
+    );
+    await prisma.memoryEdge.upsert({
+      where: {
+        fromId_toId_kind: {
+          fromId: proposal.note.id,
+          toId: row.id,
+          kind: "related",
+        },
+      },
+      update: {},
+      create: { fromId: proposal.note.id, toId: row.id, kind: "related" },
+    });
+    filed += 1;
+  }
+  return {
+    scanned: scannedCount,
+    // The keyset scan runs to exhaustion; kept for API shape stability.
+    truncated: false,
+    // The RESPONSE is bounded (review finding) — the counts above cover
+    // the full run; the list is a preview, and says when it clipped.
+    candidatesTruncated: candidates.length > 200,
+    candidates: candidates.slice(0, 200),
+    filed,
+    skippedAlreadyFiled,
+    repairedEdges,
+  };
+}
+
 export async function migrateMemoryLifecyclePolicy(
   proposed: MemoryLifecyclePolicy,
   options:
@@ -1793,7 +2186,15 @@ export async function migrateMemoryLifecyclePolicy(
     const digestRows: unknown[] = [];
 
     for (const row of rows) {
-      if (!(row.kind in policy.daysByKind)) {
+      // A kind the vocabulary does not know still aborts (the original
+      // guard); a KNOWN kind the proposed policy predates (ownership rows
+      // against a five-key pre-0091 policy) resolves non-destructively —
+      // `ttlExpiresAt` reads its absent days as "never expires" (review
+      // finding: the old `in daysByKind` check aborted the whole migration
+      // the moment one ownership note existed).
+      if (
+        !(MEMORY_LIFECYCLE_KINDS as readonly string[]).includes(row.kind)
+      ) {
         throw new Error(
           `Unknown memory kind ${row.kind}; no lifecycle settings were changed.`,
         );
@@ -2370,7 +2771,7 @@ export type MemoryLibraryFilter = {
   scope?: MemoryNoteRecord["scope"];
   stale?: boolean;
   limit?: number;
-  /** mem0's `show_expired`: include R3-expired notes. Default false (hidden). */
+  /** productM1's `show_expired`: include R3-expired notes. Default false (hidden). */
   showExpired?: boolean;
   /** R5 bounded filter grammar, already VALIDATED by @muon/protocol. */
   filter?: MemoryFilter;
@@ -2698,6 +3099,29 @@ async function scanMemoryLibrary(
 }
 
 /** Operator-facing ledger read: all memory states plus bounded provenance/edges. */
+/**
+ * ADR-0061 D3 — the FENCE class, as the operator may see it: how many notes
+ * each partition holds, and NOTHING else. Counts only — no ids, no text, no
+ * kinds — because the operator is the authority the fence protects, but the
+ * card that renders this is one copy-paste away from an agent-facing view,
+ * and a count is the most a fence-class disclosure is ever allowed to be.
+ * `null` workspace = the §8 unscoped residue, reported as its own row.
+ */
+export async function listMemoryPartitionTotals(): Promise<
+  { workspacePath: string | null; total: number }[]
+> {
+  const grouped = await prisma.memoryNote.groupBy({
+    by: ["workspacePath"],
+    _count: { _all: true },
+  });
+  return grouped
+    .map((partition) => ({
+      workspacePath: partition.workspacePath ?? null,
+      total: partition._count._all,
+    }))
+    .sort((a, b) => b.total - a.total);
+}
+
 export async function listMemoryLibrary(
   filter: MemoryLibraryFilter = {},
 ): Promise<MemoryLibrarySnapshot> {
@@ -2860,9 +3284,13 @@ export async function listMemoryLibrary(
   const episodesById = new Map(episodeRows.map((row) => [row.id, row]));
   const conflicts = new Map<string, string>();
   for (const edge of edges) {
-    if (edge.kind === "contradicts" && !conflicts.has(edge.fromId)) {
-      conflicts.set(edge.fromId, edge.toId);
-    }
+    if (edge.kind !== "contradicts") continue;
+    // ADR-0081 D3: BOTH endpoints carry the dispute — the reader sees it
+    // whichever side they fetched. Edges arrive `at desc`, so first-wins is
+    // latest-wins per side, unchanged. The scoped fetch above already
+    // requires both endpoints served, so this cannot leak a fenced id.
+    if (!conflicts.has(edge.fromId)) conflicts.set(edge.fromId, edge.toId);
+    if (!conflicts.has(edge.toId)) conflicts.set(edge.toId, edge.fromId);
   }
 
   return {
@@ -2949,6 +3377,75 @@ export async function listStandingDecisionLog(options: {
     limit: Math.max(1, Math.min(options.limit ?? 64, 64)),
   });
   return snapshot.notes;
+}
+
+/**
+ * ADR-0051 §3/§4 — the ownership/why canon for the institutional pack. No new
+ * `kind`: the slice is human-confirmed, workspace-global, active, non-stale
+ * `decision` notes TAGGED with an ownership/why topic. Constraints tagged the
+ * same way already ride the standing arm (every confirmed global constraint is
+ * standing canon), so this list adds exactly what the standing filter drops:
+ * the unpinned tagged decisions. Selection posture mirrors
+ * `listStandingDecisionLog` minus the pin requirement; the topic filter runs
+ * here in JS over the bounded snapshot rather than in SQL, which keeps the
+ * read LIMIT-complete the same way the library scanner is.
+ */
+export const OWNERSHIP_TOPIC_TAGS = [
+  "ownership",
+  "owner",
+  "why",
+  "rationale",
+] as const;
+
+export async function listOwnershipCanon(options: {
+  workspacePath?: string;
+  unscopedWorkspace?: boolean;
+  limit?: number;
+}): Promise<{ notes: MemoryLedgerNote[]; scanComplete: boolean }> {
+  // The tag filter runs in JS AFTER the SQL row cap, so the cap is a SCAN
+  // bound, not a result bound: with more confirmed global decisions than the
+  // bound, a tagged note past it is invisible. `scanComplete` says whether
+  // the scan saw the whole candidate set — the pack renderer downstream must
+  // NOT assert "no ownership notes exist" off an incomplete scan (an absence
+  // that lies is this codebase's named failure class). Bound raised to 256:
+  // ownership canon is curated and rare; a workspace with more confirmed
+  // global decisions than that still gets an honest "scan incomplete".
+  const snapshot = await listMemoryLibrary({
+    workspacePath: options.workspacePath,
+    unscopedWorkspace: options.unscopedWorkspace,
+    status: "active",
+    confirmed: "confirmed",
+    kind: "decision",
+    scope: "global",
+    stale: false,
+    showExpired: false,
+    limit: Math.max(1, Math.min(options.limit ?? 256, 256)),
+  });
+  const tags = new Set<string>(OWNERSHIP_TOPIC_TAGS);
+  // ADR-0091 D3: the ownership KIND joins the tagged-decision window — one
+  // canon serve reading both vocabularies until the tag path empties.
+  const kindSnapshot = await listMemoryLibrary({
+    workspacePath: options.workspacePath,
+    unscopedWorkspace: options.unscopedWorkspace,
+    status: "active",
+    confirmed: "confirmed",
+    kind: "ownership",
+    scope: "global",
+    stale: false,
+    showExpired: false,
+    limit: Math.max(1, Math.min(options.limit ?? 256, 256)),
+  });
+  const tagged = snapshot.notes.filter((note) =>
+    (note.topics ?? []).some((topic) => tags.has(topic.toLowerCase()))
+  );
+  const seen = new Set(tagged.map((note) => note.id));
+  return {
+    notes: [
+      ...tagged,
+      ...kindSnapshot.notes.filter((note) => !seen.has(note.id)),
+    ],
+    scanComplete: !snapshot.truncated && !kindSnapshot.truncated,
+  };
 }
 
 /** D1: `resolution` is spelled EXPLICITLY on every row, including the `null`s. An
@@ -3191,6 +3688,9 @@ async function anchorScopedCandidates(
  */
 type LedgerMemoryNoteInput = MemoryNoteInput & {
   provenance?: { sourceType: string; rawRef?: string | null };
+  /** ADR-0063: the ALREADY-VALIDATED impact claim (the route's schema is the
+   *  gate — malformed never reaches here). Serialized onto the row. */
+  impactClaim?: MemoryImpactClaim | null;
 };
 
 function noteCreateOps(
@@ -3281,10 +3781,25 @@ function noteCreateOps(
           isAttemptOutcome(input.outcome)
             ? input.outcome
             : null,
+        // ADR-0091 D1: the structured "whom to ask", stored only on the
+        // ownership kind (the same only-meaningful-here rule as outcome).
+        owners:
+          input.kind === "ownership" &&
+          Array.isArray(input.owners) &&
+          input.owners.length > 0
+            ? input.owners.filter(
+                (entry) => typeof entry === "string" && entry.trim().length > 0
+              )
+            : undefined,
         derivation:
           input.derivation && isNoteDerivation(input.derivation)
             ? input.derivation
             : null,
+        // ADR-0063: serialized claim, validated by the route's schema before
+        // it reached this input. NULL = the author asserted no blast radius.
+        impactClaim: input.impactClaim
+          ? JSON.stringify(input.impactClaim)
+          : null,
       },
     }),
   ];
@@ -3799,6 +4314,15 @@ export async function updateMemoryNote(
         {
           kind: row.kind as MemoryNoteInput["kind"],
           text: update.text,
+          // ADR-0091: a text-edit successor keeps the structured owners —
+          // fixing a typo must not silently strip "whom to ask" (review
+          // finding).
+          owners:
+            row.kind === "ownership" &&
+            Array.isArray(row.owners) &&
+            row.owners.every((entry: unknown) => typeof entry === "string")
+              ? (row.owners as string[])
+              : undefined,
           taskId: row.taskId ?? undefined,
           laneId: row.laneId ?? undefined,
           // #126: a text-edit successor inherits the predecessor's chat so an
@@ -5128,7 +5652,11 @@ export async function projectLedgerToGraph(
   const conflictById = new Map<string, string>();
   for (const edge of edges) {
     if (edge.kind === "contradicts") {
+      // ADR-0081 D3: BOTH endpoints, or a graph REBUILD would silently
+      // undo the either-direction serve rule — disputed targets regaining
+      // clean ranking after a rebuild while the live ledger demotes them.
       conflictById.set(edge.fromId, edge.toId); // asc order → latest wins
+      conflictById.set(edge.toId, edge.fromId);
     }
   }
 

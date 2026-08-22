@@ -411,3 +411,323 @@ describe("the open inbox (surface-parity audit 2026-08-11)", () => {
     expect(ids).not.toContain(question.id);
   });
 });
+
+// ── ADR-0069: a question consults the brain before the human ─────────────────
+//
+// The pre-answer is HUMAN-CONFIRMED canon only, fenced by the asker's own
+// capability, filed as a spine event both sides read; unconfirmed notes never
+// enter the answer path. A withdrawal that proceeds on the cited answer
+// records the typed reason + citations — never impersonating a human close.
+describe("ADR-0069: the brain answers first", () => {
+  it("attaches a confirmed pre-answer; unconfirmed notes never ride it; the typed withdrawal records its citations", async () => {
+    const ledger = await import("../src/lib/memory-ledger.js");
+    const { repoRootOf } = await import("../src/lib/workspace-identity.js");
+    const repoRoot = await repoRootOf(WORKSPACE);
+    const confirmed = await ledger.ingestMemoryNote({
+      kind: "constraint",
+      text: "The retry budget is capped at three attempts per lane.",
+      createdBy: "human:operator",
+      chatId: "chat-q",
+      workspacePath: repoRoot,
+    });
+    // Confirm through the REAL route (a raw Confirmation row would leave the
+    // graph mirror's own confirmed flag stale, which the agent-tier
+    // governedOnly candidate read honours — production confirms re-mirror).
+    const confirmRes = await app.inject({
+      method: "PATCH",
+      url: `/api/memory/${confirmed.note.id}`,
+      headers: auth(OPERATOR),
+      payload: { confirmed: true, principal: "human:operator" },
+    });
+    expect(confirmRes.statusCode).toBe(200);
+    // A matching but UNCONFIRMED note: must never enter the answer path.
+    const unconfirmed = await ledger.ingestMemoryNote({
+      kind: "decision",
+      text: "Maybe the retry budget should be five attempts per lane instead.",
+      createdBy: "agent:job:job-other-q",
+      proposalOnly: true,
+      chatId: "chat-q",
+      workspacePath: repoRoot,
+    });
+
+    // ADR-0082 fixture: an EXPIRED unconfirmed match — the ledger's expiry
+    // fence applies to the crew branch too, so it must never surface.
+    const expired = await ledger.ingestMemoryNote({
+      kind: "attempt",
+      text: "An old expired take on the retry budget from last month.",
+      createdBy: "agent:job:job-other-q",
+      proposalOnly: true,
+      chatId: "chat-q",
+      workspacePath: repoRoot,
+    });
+    await db.prisma.memoryNote.update({
+      where: { id: expired.note.id },
+      data: { expiresAt: new Date(Date.now() - 60_000) },
+    });
+
+    // A matching PACKET on the asker's task — the crew's
+    // other artifact — plus lanes for its relations.
+    await db.prisma.lane.createMany({
+      data: [
+        {
+          id: "lane-q-a",
+          key: "codex",
+          name: "Codex",
+          provider: "openai",
+          role: "worker",
+        },
+        {
+          id: "lane-q-b",
+          key: "claude-code",
+          name: "Claude Code",
+          provider: "anthropic",
+          role: "peer",
+        },
+      ],
+    });
+    await db.prisma.handoff.create({
+      data: {
+        id: "handoff-q-1",
+        taskId: "task-q",
+        fromLaneId: "lane-q-a",
+        toLaneId: "lane-q-b",
+        packetTitle: "Implemented the retry budget change",
+        packetBody: "Raised the retry budget handling; checks green.",
+        status: "pending",
+      },
+    });
+
+    const res = await ask(IMPL, {
+      subject: "retry budget",
+      body: "What is the retry budget per lane for this task?",
+    });
+    expect(res.statusCode).toBe(200);
+    const question = res.json().question;
+    expect(question.memoryPreAnswer).toBeDefined();
+    const preIds = question.memoryPreAnswer.notes.map(
+      (note: { noteId: string }) => note.noteId
+    );
+    expect(preIds).toContain(confirmed.note.id);
+    expect(preIds).not.toContain(unconfirmed.note.id);
+
+    // ADR-0082: the crew block carries the UNCONFIRMED matching note and
+    // the matching packet, each labeled with its own standing — and never
+    // pollutes the confirmed pre-answer above.
+    expect(question.crewContext).toBeDefined();
+    const crewById = new Map(
+      (question.crewContext.items as {
+        kind: string;
+        id: string;
+        standing: string;
+        excerpt: string;
+      }[]).map((item) => [item.id, item])
+    );
+    const crewNote = crewById.get(unconfirmed.note.id);
+    expect(crewNote).toBeDefined();
+    expect(crewNote!.kind).toBe("note");
+    expect(crewNote!.standing).toContain("unconfirmed");
+    expect(crewNote!.standing).toContain("agent:job:job-other-q");
+    expect(crewById.has(expired.note.id)).toBe(false);
+    const crewPacket = crewById.get("handoff-q-1");
+    expect(crewPacket).toBeDefined();
+    expect(crewPacket!.kind).toBe("packet");
+    expect(crewPacket!.standing).toContain("packet from codex");
+    // Both crew serves RECORDED through the boundaries: the note in the
+    // offer ledger, the packet in the 0080 delivery ledger.
+    expect(
+      await db.prisma.memoryOffer.count({
+        where: {
+          jobId: "job-impl-q",
+          noteId: unconfirmed.note.id,
+          surface: "question-crew-context",
+        },
+      })
+    ).toBe(1);
+    expect(
+      await db.prisma.handoffOffer.count({
+        where: {
+          jobId: "job-impl-q",
+          handoffId: "handoff-q-1",
+          surface: "question-crew-context",
+        },
+      })
+    ).toBe(1);
+
+    // D2, structurally: a typed withdrawal citing a CREW id is refused —
+    // crew context can never close a question.
+    const crewCite = await app.inject({
+      method: "POST",
+      url: `/api/questions/${question.id}/withdraw`,
+      headers: auth(IMPL),
+      payload: {
+        reason: "answered_from_memory",
+        citedNoteIds: [unconfirmed.note.id],
+      },
+    });
+    expect(crewCite.statusCode).toBe(400);
+    expect(crewCite.json().message).toContain("own pre-answer");
+    expect(
+      question.memoryPreAnswer.notes.find(
+        (note: { noteId: string }) => note.noteId === confirmed.note.id
+      ).excerpt
+    ).toContain("capped at three");
+
+    // The typed withdrawal: recorded + cited on the fold, visible to the
+    // operator's per-task read.
+    const withdrawal = await app.inject({
+      method: "POST",
+      url: `/api/questions/${question.id}/withdraw`,
+      headers: auth(IMPL),
+      payload: {
+        reason: "answered_from_memory",
+        citedNoteIds: [confirmed.note.id],
+      },
+    });
+    expect(withdrawal.statusCode).toBe(200);
+    const listed = await app.inject({
+      method: "GET",
+      url: "/api/questions/task/task-q",
+      headers: auth(OPERATOR),
+    });
+    const folded = (
+      listed.json().questions as {
+        id: string;
+        status: string;
+        withdrawnReason?: string;
+        withdrawnCitedNoteIds?: string[];
+        memoryPreAnswer?: unknown;
+      }[]
+    ).find((row) => row.id === question.id);
+    expect(folded).toMatchObject({
+      status: "withdrawn",
+      withdrawnReason: "answered_from_memory",
+      withdrawnCitedNoteIds: [confirmed.note.id],
+    });
+    expect(folded!.memoryPreAnswer).toBeDefined();
+
+    // ADR-0060 via 0088's research: the pre-answer is a SERVE and records
+    // its offers under the ASKER's job — without these rows, the typed
+    // withdrawal's citations audit as offered:false relays.
+    const offered = await db.prisma.memoryOffer.findMany({
+      where: { jobId: "job-impl-q", noteId: confirmed.note.id },
+    });
+    expect(offered).toHaveLength(1);
+    expect(offered[0]).toMatchObject({ surface: "question-preanswer" });
+
+    // ADR-0069 D2's OVERRIDE leg: the human answers the memory-closed
+    // question — the ONE legal second terminal. The override supersedes
+    // the memory answer AND files the contradiction as an unconfirmed
+    // proposal against the cited note ("the brain learns it was stale the
+    // moment it misleads").
+    const override = await app.inject({
+      method: "POST",
+      url: `/api/questions/${question.id}/answer`,
+      headers: auth(OPERATOR),
+      payload: {
+        taskId: "task-q",
+        answer: "No: the retry budget moved to five attempts last sprint.",
+      },
+    });
+    expect(override.statusCode).toBe(200);
+    expect(override.json().question).toMatchObject({
+      status: "answered",
+      overrodeMemoryAnswer: true,
+      answeredBy: "operator",
+      // The overridden memory answer survives as the override's provenance.
+      withdrawnReason: "answered_from_memory",
+      withdrawnCitedNoteIds: [confirmed.note.id],
+    });
+    // The contradiction proposal: unconfirmed, low-trust, anchored where
+    // the cited note is anchored, edged `contradicts` against it.
+    const edge = await db.prisma.memoryEdge.findFirst({
+      where: { toId: confirmed.note.id, kind: "contradicts" },
+    });
+    expect(edge).toBeTruthy();
+    const proposal = await db.prisma.memoryNote.findUnique({
+      where: { id: edge!.fromId },
+    });
+    expect(proposal).toMatchObject({ status: "active", trust: "low" });
+    expect(proposal!.text).toContain("human override contradicted");
+    expect(proposal!.text).toContain("five attempts last sprint");
+    expect(
+      await db.prisma.confirmation.count({ where: { noteId: proposal!.id } })
+    ).toBe(0);
+
+    // The override is itself terminal: a second answer refuses.
+    const again = await app.inject({
+      method: "POST",
+      url: `/api/questions/${question.id}/answer`,
+      headers: auth(OPERATOR),
+      payload: { taskId: "task-q", answer: "another go" },
+    });
+    expect(again.statusCode).toBe(409);
+  });
+
+  it("a PLAIN withdrawal has no override path — answering it still refuses", async () => {
+    const filed = await ask(IMPL, {
+      subject: "plainly withdrawn",
+      body: "This one the asker simply takes back.",
+    });
+    const id = filed.json().question.id;
+    const withdrawn = await app.inject({
+      method: "POST",
+      url: `/api/questions/${id}/withdraw`,
+      headers: auth(IMPL),
+      payload: {},
+    });
+    expect(withdrawn.statusCode).toBe(200);
+    const answered = await app.inject({
+      method: "POST",
+      url: `/api/questions/${id}/answer`,
+      headers: auth(OPERATOR),
+      payload: { taskId: "task-q", answer: "too late" },
+    });
+    expect(answered.statusCode).toBe(409);
+  });
+
+  it("ADR-0082: packets are an INDEPENDENT crew source — an ask matching only a packet gets crew context with no pre-answer, and a degraded packet says so", async () => {
+    await db.prisma.handoff.create({
+      data: {
+        id: "handoff-q-frob",
+        taskId: "task-q",
+        fromLaneId: "lane-q-a",
+        toLaneId: "lane-q-b",
+        packetTitle: "Frobnicate pipeline landed",
+        packetBody: "The frobnicate stage is wired; checks pending review.",
+        status: "pending",
+        packetJson: { degraded: { flag: true, reasons: ["checks unrun"] } },
+      },
+    });
+    const res = await ask(IMPL, {
+      subject: "frobnicate pipeline",
+      body: "Did anyone already wire the frobnicate stage here?",
+    });
+    expect(res.statusCode).toBe(200);
+    const question = res.json().question;
+    // No confirmed canon matches — the ANSWER path stays silent…
+    expect(question.memoryPreAnswer).toBeUndefined();
+    // …while the crew's packet still surfaces, honestly classified: the
+    // fixture's packetJson is a schema FRAGMENT, and the ONE shared
+    // classifier calls that packet_parse_failed — never clean (the exact
+    // malformed-shape case the review raised against an ad-hoc parser).
+    expect(question.crewContext).toBeDefined();
+    const packetItem = (question.crewContext.items as {
+      kind: string;
+      id: string;
+      standing: string;
+    }[]).find((item) => item.id === "handoff-q-frob");
+    expect(packetItem).toBeDefined();
+    expect(packetItem!.kind).toBe("packet");
+    expect(packetItem!.standing).toContain("packet_parse_failed");
+  });
+
+  it("an ask with no matching confirmed canon simply has no pre-answer — and still files", async () => {
+    const res = await ask(IMPL, {
+      subject: "quarterly billing threshold",
+      body: "Nothing in this brain speaks to invoicing cadence at all.",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().question.status).toBe("open");
+    expect(res.json().question.memoryPreAnswer).toBeUndefined();
+  });
+});

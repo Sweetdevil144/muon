@@ -5,13 +5,13 @@ import type { MemoryNoteRecord, MemoryTrust } from "./types.js";
  * retrieval quality of the shared brain is unit-testable and deterministic.
  *
  * The design decision (docs/research/memory-graph-v3.md): MUON takes
- * INSPIRATION from mem0 / Graphiti / Zep, not a clone. It keeps its
+ * INSPIRATION from productM1 / Graphiti / Zep, not a clone. It keeps its
  * differentiators, human confirm/reject governance, provenance, temporal
  * validity, and adds the two things a code-work brain most needs and lacks:
  *   1. a composite relevance+recency+trust+usage reranker over hybrid
  *      (lexical/FTS + graph) candidate signals, and
  *   2. dedup/supersede on write so the brain stops accumulating near-
- *      duplicate and contradictory notes (mem0's ADD/UPDATE/NOOP idea,
+ *      duplicate and contradictory notes (productM1's ADD/UPDATE/NOOP idea,
  *      done deterministically so it works offline with no LLM).
  */
 
@@ -487,7 +487,7 @@ export function rerankCalibrated(
     .map((entry) => entry.input.note);
 }
 
-// ---- dedup / contradiction on write (mem0-style, deterministic) ----
+// ---- dedup / contradiction on write (productM1-style, deterministic) ----
 
 export type DuplicateVerdict =
   | { action: "insert" }
@@ -629,7 +629,7 @@ export const DEFAULT_DEDUP_THRESHOLDS: DedupThresholds = {
 
 /**
  * Decide what to do with a proposed note given the active notes already in
- * the brain (mem0's ADD/UPDATE/DELETE/NOOP, deterministic):
+ * the brain (productM1's ADD/UPDATE/DELETE/NOOP, deterministic):
  * - same-kind strict token extension + anchor   → extends (both stay), even at
  *   duplicate-strength similarity so added detail is never dropped
  * - very high text similarity + shared anchor  → duplicate (NOOP)

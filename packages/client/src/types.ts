@@ -142,6 +142,30 @@ export type ApprovalReceipt = {
   createdAt?: string;
 };
 
+// ADR-0056: the `always` grade — the same content binding a receipt carries,
+// scoped to the CHAT rather than the run, so it survives the dispatch boundary
+// a receipt cannot cross. Deliberately carries no vendor/lane/agent field:
+// "always approve this agent" stays unrepresentable, not merely disallowed.
+export type ApprovalGrant = {
+  id: string;
+  approvalId: string;
+  taskId: string;
+  workspacePath: string;
+  actionClass: "read" | "test" | "edit";
+  toolName: string;
+  payloadDigest: string;
+  resolvedTarget?: string | null;
+  /** Effective workspace policy at mint; a posture change invalidates it. */
+  policyFingerprint: string;
+  /** Provenance only — never matched at redemption. */
+  originJobId: string;
+  expiresAt: string;
+  revokedAt?: string | null;
+  useCount: number;
+  lastUsedAt?: string | null;
+  createdAt?: string;
+};
+
 export type RecordedEvent = {
   id: string;
   laneId: string;
@@ -207,6 +231,9 @@ export type HandoffDetail = {
   createdAt: string;
   fromLane?: Lane;
   toLane?: Lane;
+  /** ADR-0080 D3: delivery renderings, present on OPERATOR reads only —
+   *  evidence ("filed, unread" vs "read by J"), never authority. */
+  deliveries?: { jobId: string; firstAt: string }[];
 };
 
 export type ApprovalDetail = {
@@ -270,7 +297,8 @@ export type MemoryKind =
   | "constraint"
   | "convention"
   | "attempt"
-  | "question";
+  | "question"
+  | "ownership";
 
 export type MemoryTrust = "low" | "medium" | "high";
 
@@ -322,6 +350,9 @@ export type MemoryNote = {
   confirmedBy?: "human" | "orchestrator" | null;
   /** Structured result for attempt memory; null for legacy/non-attempt notes. */
   outcome?: AttemptOutcome | null;
+  /** ADR-0091: structured owners on the ownership kind — orientation,
+   *  never authority. */
+  owners?: string[] | null;
 };
 
 export type MemoryGraphRelation =
@@ -911,6 +942,14 @@ export type DispatchJobRecord = {
   // Resume lineage (P0.1): the terminal job this dispatch was re-created from
   // by an explicit human resume act. Null for every non-resumed job.
   resumedFromJobId?: string | null;
+  /** ADR-0044/0071: the recorded step this mission was forked from (D6). */
+  forkedFromJobId?: string | null;
+  /** ADR-0044/0071 D5: the source task whose worktree state seeds this
+   *  fork's fresh worktree at first claim. */
+  forkSourceTaskId?: string | null;
+  /** A5: the typed handoff packet this dispatch was seeded from (lineage,
+   *  authority-inert). Absent on an older backend → null. */
+  sourcePacketId?: string | null;
   // Append-once resume claim (P0.1 replay-safety): stamped ONCE on an
   // interrupted ORIGINAL the first time it is resumed. `resumedAt` present ⇒ a
   // fresh child (`resumedByJobId`) already claimed it, so the resume planner

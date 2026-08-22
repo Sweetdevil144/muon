@@ -21,6 +21,33 @@ export type ObserverScope = {
   /** Durable chat coordinate explicitly written by `muon mcp install --chat`. */
   chatId?: string;
   workspacePath?: string;
+  /**
+   * The workflow routes authenticate the CALLER'S JOB, not the bearer alone:
+   * `requireWorkflowChatCapability` wants `x-muon-caller-job-id` and the
+   * matching delegation token, and refuses 403 without them.
+   *
+   * A plain Tier B observer authenticates with the shared agent bearer and has
+   * no job at all, which `requireWorkflowReadCapability` allows explicitly for
+   * ONE named chat — so this stays OPTIONAL, and omitting it is the supported
+   * path, not a broken one.
+   *
+   * A Tier C attached coordinator is the case that needed it: its bearer DOES
+   * carry a job capability, so the read falls through to the strict arm and
+   * 403s without these headers. Measured on 2026-08-13 — the seat could call
+   * `propose_workflow` and then never read back the run it had just created.
+   */
+  workflowControl?: { callerJobId: string; delegationToken: string };
+  /**
+   * The job this session's authority rides on, when it has one — Tier C's
+   * attach-minted root job. `budget_status` promises "omit jobId for this
+   * chat's mission" and resolves the omission from the orchestrator scope's
+   * `jobId`; this wrapper used to drop that coordinate unconditionally, so a
+   * coordinator seat holding a perfectly good mission job was refused with
+   * "no jobId in scope" — a tool whose own description advertised the call it
+   * then rejected (measured by the 30-tool sweep, 2026-08-13). Plain Tier B
+   * observers have no job; for them this stays unset and the refusal stands.
+   */
+  missionJobId?: string;
 };
 
 const CHAT_ID_MAX = 128;
@@ -85,6 +112,10 @@ function observerOrchestratorScope(
     apiToken: scope.apiToken,
     chatId,
     workspacePath: scope.workspacePath,
+    // Lets `budget_status` keep its "omit jobId for this chat's mission"
+    // promise from a seat. Read-only: every use still passes the same
+    // `assertJobInScope` chat fence as an explicit jobId argument would.
+    jobId: scope.missionJobId,
   };
 }
 
@@ -200,7 +231,10 @@ function customObserverReads(
         const runId = String(args.runId ?? "").trim();
         if (!runId) return fail("runId is required");
         const [runs, tasks] = await Promise.all([
-          client.listWorkflowRuns({ chatId: selected.chatId }),
+          client.listWorkflowRuns(
+            { chatId: selected.chatId },
+            scope.workflowControl
+          ),
           client.listTasks(),
         ]);
         const run = runs.find((entry) => entry.id === runId);

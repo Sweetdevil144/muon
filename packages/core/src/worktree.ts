@@ -6,7 +6,7 @@ import {
   readFileSync,
   realpathSync,
 } from "node:fs";
-import { mkdir, readdir, realpath } from "node:fs/promises";
+import { mkdir, readdir, realpath, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -62,7 +62,7 @@ export async function isLinkedWorktree(cwd: string): Promise<boolean> {
   }
 }
 
-function sanitizeTaskId(taskId: string): string {
+export function sanitizeTaskId(taskId: string): string {
   const sanitized = taskId.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/\.+/g, ".");
   if (sanitized.length === 0 || /^[.-]+$/.test(sanitized)) {
     throw new Error(`Task id '${taskId}' cannot be mapped to a worktree name.`);
@@ -365,6 +365,14 @@ export function locateTaskWorktreePath(
 export async function ensureTaskWorktree(input: {
   repoRoot: string;
   taskId: string;
+  /**
+   * Skip the dependency-preparation pass. ONLY for callers that will
+   * immediately re-materialise the tree to a different commit and prepare
+   * it there (the fork seed path — review finding: preparing against
+   * today's HEAD before the detach both wastes the work and can loudly
+   * block a fork whose RECORDED state would prepare fine).
+   */
+  skipPreparation?: boolean;
 }): Promise<TaskWorktree> {
   const path = locateTaskWorktreePath(input.repoRoot, input.taskId);
   let created = false;
@@ -389,6 +397,10 @@ export async function ensureTaskWorktree(input: {
     created = true;
   }
 
+  if (input.skipPreparation) {
+    return { path, created, preparation: { links: [], problems: [] } };
+  }
+
   const preparation = await prepareWorktreeDependencies({
     sourceRoot: input.repoRoot,
     worktreePath: path,
@@ -400,6 +412,26 @@ export async function ensureTaskWorktree(input: {
   }
 
   return { path, created, preparation };
+}
+
+/** Remove a worktree this process just created and could not seed, so the
+ *  next claim re-creates and re-applies instead of reusing a half-tree. */
+export async function discardCreatedWorktree(input: {
+  repoRoot: string;
+  worktreePath: string;
+}): Promise<void> {
+  try {
+    await git(
+      input.repoRoot,
+      "worktree",
+      "remove",
+      "--force",
+      input.worktreePath
+    );
+  } catch {
+    // Best effort beyond the primary removal path:
+    await rm(input.worktreePath, { recursive: true, force: true });
+  }
 }
 
 /**

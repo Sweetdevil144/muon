@@ -14,7 +14,7 @@ const human = (text: string): MemoryWindowMessage => ({ role: "human", text });
 const agent = (text: string): MemoryWindowMessage => ({ role: "agent", text });
 
 describe("truncateWindowMessage", () => {
-  it("clips to mem0's 300-char limit, HEAD for a human ask, TAIL for an agent reply", () => {
+  it("clips to productM1's 300-char limit, HEAD for a human ask, TAIL for an agent reply", () => {
     const long = `START${"x".repeat(400)}END`;
     const askedFirst = truncateWindowMessage(human(long));
     const saidLast = truncateWindowMessage(agent(long));

@@ -59,6 +59,26 @@ export function McpProbeRow(props: {
   };
 
   const level = report?.verdict.level ?? null;
+  // ADR-0052. A LOCKED server answers `initialize` and `tools/list` in full, so
+  // its verdict can legitimately be `ok` — and an `ok` chip in front of a server
+  // that will refuse all N tools is the same "ok, N tools" lie `muon mcp probe`
+  // stopped telling. The chip keeps naming the level it measured (that reading
+  // is still true) and stops wearing the level's tone, exactly as the CLI keeps
+  // printing `live MCP surface: ok` while flipping its mark to `!!`.
+  //
+  // BOTH locked states. `locked-unregistered` refuses exactly as hard, so
+  // reading only `locked` here would put a calm `ok` chip in front of a server
+  // that answers nothing — the same lie, one state later.
+  const locked =
+    report?.identityGate === "locked" ||
+    report?.identityGate === "locked-unregistered";
+  const registrationPending = report?.identityGate === "locked-unregistered";
+  // A gate value this build cannot interpret. NOT folded into `locked`: we do
+  // not know that it is locked, and claiming either way would be the same lie
+  // in the opposite direction. What we do know is that the reading is
+  // unreadable here, which is itself worth showing — `muon mcp probe` exits
+  // non-zero on exactly this state rather than reporting a healthy server.
+  const unreadableGate = report?.unknownIdentityGate ?? null;
   return (
     <div className="mcp-probe">
       <div className="mcp-probe-head">
@@ -86,7 +106,21 @@ export function McpProbeRow(props: {
           ))}
         </select>
         {level ? (
-          <span className={`mcp-probe-chip ${level}`}>{level}</span>
+          <span
+            className={`mcp-probe-chip ${
+              locked || unreadableGate ? "locked" : level
+            }`}
+          >
+            {level}
+          </span>
+        ) : null}
+        {locked ? (
+          <span className="mcp-probe-chip locked">
+            {registrationPending ? "registration pending" : "identity locked"}
+          </span>
+        ) : null}
+        {!locked && unreadableGate ? (
+          <span className="mcp-probe-chip locked">identity unreadable</span>
         ) : null}
       </div>
       {error ? (
@@ -96,6 +130,40 @@ export function McpProbeRow(props: {
           <p className="mcp-note">
             Mode <strong>{report.mode}</strong>: {report.verdict.detail}
           </p>
+          {locked ? (
+            // The CLI's own clause, word for word (`renderProbe` prints
+            // "identity LOCKED — this server serves the list and refuses the
+            // work", and names the pending case separately). It is the probe
+            // surface's framing rather than the governed refusal below, and it
+            // earns its place here because the line directly above is reporting
+            // "live 27 / defined 27, ok".
+            <p className="mcp-note mcp-bad">
+              {registrationPending
+                ? "Verified here, not yet recorded centrally. This server serves the list and refuses the work until it is."
+                : "This server serves the list and refuses the work."}
+            </p>
+          ) : null}
+          {!locked && unreadableGate ? (
+            // Names the value, because "unknown state" is unactionable and the
+            // string itself is the only clue to which MUON wrote it. Remedy is
+            // the CLI's: this build is older than the server it just probed.
+            <p className="mcp-note mcp-bad">
+              This server reported an identity state this build does not
+              recognise (<code>{unreadableGate}</code>), so whether it will
+              serve or refuse is unknown here. Update MUON (<code>muon update</code>)
+              so the two agree.
+            </p>
+          ) : null}
+          {report.identityGateRefusal ? (
+            // VERBATIM, as main handed it over. This is `githubIdentityGateRefusal`'s
+            // three sentences — the same ones `muon mcp probe` prints and the same
+            // ones a gated tool call returns to an agent. The desk composes none of
+            // it: an operator and an agent reading about the same lock must be told
+            // the same thing, which is why the copy has exactly one author.
+            <p className="mcp-note mcp-bad mcp-probe-refusal">
+              {report.identityGateRefusal}
+            </p>
+          ) : null}
           {report.verdict.missing.length > 0 ? (
             // BY NAME. A count would say "three fewer tools"; the operator
             // needs to know WHICH, because that is what tells them whether the

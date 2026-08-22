@@ -1,6 +1,6 @@
 import type { AgentRecord, VendorReadiness } from "@muon/client";
 import { vendorRoleScope, type VendorRoleScope } from "@muon/client/onboarding";
-import { coordinatorVendorIds, vendorLabel } from "@muon/client/vendors";
+import { vendorLabel } from "@muon/client/vendors";
 import type { ReadinessSnapshotMeta } from "../../shared/ipc.js";
 import { formatCostOrdinalLabel } from "./cost-ordinal-label.js";
 
@@ -71,7 +71,8 @@ export type LaneStatus = {
   known: boolean;
   /** What the lane is FOR, from the role model — never a hardcoded vendor test. */
   roleScope: VendorRoleScope;
-  /** May this lane hold the coordinator seat? (claude-code and codex only.) */
+  /** May this lane hold the coordinator seat? Read from the registry — since
+   *  ADR-0057 every public vendor does; do not restate a vendor list here. */
   coordinatorEligible: boolean;
   /** Configured seats for this lane (0–3). */
   count: number;
@@ -192,9 +193,14 @@ export function buildLaneStatus(input: {
     needsAttention: known && state !== "ready" && state !== "ready-byok",
     known,
     roleScope,
-    coordinatorEligible: (coordinatorVendorIds() as readonly string[]).includes(
-      input.vendor
-    ),
+    // ONE derivation, in `vendorRoleScope`. This used to call
+    // `coordinatorVendorIds()` directly, which meant two independently-derived
+    // answers to the same question living one field apart — the exact drift
+    // this file's other fields are written to avoid. `coordinates` is also the
+    // stricter and more honest of the two: it requires the seat AND the
+    // coordinating role, because a seat nothing can occupy is not a seat
+    // (ADR-0057 D4).
+    coordinatorEligible: roleScope.coordinates,
     count: input.count ?? 0,
     working: agents.filter((agent) => agent.status === "working").length,
     version: input.readiness?.cliVersion ?? null,

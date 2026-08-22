@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
-import { MarketingShell } from "@/components/marketing/marketing-shell";
-import { PageIntro } from "@/components/marketing/page-intro";
+
+import { SiteShell } from "@/components/muon/SiteShell";
+import { PageHero } from "@/components/muon/PageHero";
 
 export const metadata: Metadata = {
   title: "Terms, MUON",
@@ -51,43 +52,24 @@ const sections = [
   },
 ] as const;
 
-export default function TermsPage() {
+export default function Page() {
   return (
-    <MarketingShell>
-      <PageIntro
-        eyebrow="Terms"
-        intro="Plain-language terms of use for MUON's free early releases. Short, on purpose, because pretending a pre-1.0 tool has enterprise-grade legal terms would be its own kind of dishonesty."
-        title="Terms of use"
+    <SiteShell>
+      <PageHero
+        eyebrow="Legal"
+        title="Terms, MUON"
+        intro="Plain-language terms of use for MUON's free early releases, ahead of a counsel review before general availability."
       />
-      <section className="mx-auto max-w-5xl px-4 py-20 sm:px-6 sm:py-28">
-        <p className="mb-10 max-w-3xl text-sm leading-7 text-black/55">
-          Last updated 2026-08-05.
-        </p>
-        <div className="border-t-2 border-[var(--bauhaus-ink)]">
-          {sections.map((section, index) => (
-            <div
-              className="grid gap-3 border-b-2 border-[var(--bauhaus-ink)] py-8 sm:grid-cols-[4rem_1fr] sm:gap-8 sm:py-10"
-              key={section.title}
-            >
-              <p className="text-sm font-black text-[var(--bauhaus-red)]">
-                {String(index + 1).padStart(2, "0")}
-              </p>
-              <div>
-                <h2 className="text-xl font-black uppercase tracking-[-0.03em] sm:text-2xl">
-                  {section.title}
-                </h2>
-                <p className="mt-4 max-w-3xl text-lg leading-8 text-black/60">
-                  {section.copy}
-                </p>
-              </div>
-            </div>
-          ))}
-        </div>
-        <p className="mt-14 max-w-3xl text-sm leading-7 text-black/55">
-          This is a plain-language draft for the early releases and will be
-          reviewed by counsel before general availability.
-        </p>
-      </section>
-    </MarketingShell>
+      <div className="mx-auto max-w-3xl pb-24">
+        {sections.map((section) => (
+          <section key={section.title} className="border-t border-rule py-8">
+            <h2 className="font-sans text-lg font-semibold tracking-[-0.02em] text-foreground">
+              {section.title}
+            </h2>
+            <p className="prose-body mt-3">{section.copy}</p>
+          </section>
+        ))}
+      </div>
+    </SiteShell>
   );
 }

@@ -13,8 +13,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 describe("fullAuto setting", () => {
-  it("is OFF by default", () => {
-    expect(DEFAULT_SETTINGS.fullAuto).toBe(false); // RED: property missing
+  it("is ON by default (Auto mode — every managed lane)", () => {
+    expect(DEFAULT_SETTINGS.fullAuto).toBe(true);
+    expect(DEFAULT_SETTINGS.fullAutoVendors).toEqual([
+      ...FULL_AUTO_SELECTABLE_VENDORS,
+    ]);
   });
   it("round-trips through persist + load", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "muon-fa-"));
@@ -66,15 +69,15 @@ describe("fullAuto setting", () => {
         .fullAuto
     ).toBe(true);
   });
-  it("OFF projection keeps fullAuto false alongside additive non-secret settings", () => {
+  it("ON projection keeps fullAuto true alongside additive non-secret settings", () => {
     const r = toRendererSettings(DEFAULT_SETTINGS, undefined);
     expect(r).toEqual({
       apiBase: DEFAULT_SETTINGS.apiBase,
       apiTokenSet: false,
       autoUpdate: false,
       autoContinue: true,
-      fullAuto: false,
-      fullAutoVendors: [],
+      fullAuto: true,
+      fullAutoVendors: [...FULL_AUTO_SELECTABLE_VENDORS],
       portPreviewEnabled: false,
       telemetryEnabled: false,
       presets: DEFAULT_SETTINGS.presets,

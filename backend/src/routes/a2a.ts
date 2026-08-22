@@ -46,7 +46,17 @@ import {
   recordClaimRefused,
 } from "../lib/coordination-telemetry.js";
 import { MEMORY_INJECTED_EVENT_KIND } from "../lib/injection-telemetry.js";
-import { ingestMemoryNote } from "../lib/memory-ledger.js";
+import { ingestMemoryNote, recordMemoryUsed } from "../lib/memory-ledger.js";
+import {
+  auditCitationOffers,
+  auditPeerMessageRows,
+} from "../lib/citation-audit.js";
+import { serveNoteContent } from "../lib/memory-offers.js";
+import {
+  memoryNoteDisputeScope,
+  mintContradictionEdge,
+  resolveMemoryNoteByIdOrPrefix,
+} from "../lib/memory-ledger.js";
 import { repoRootOf } from "../lib/workspace-identity.js";
 
 // ── A2A: governed agent-to-agent coordination (packages/protocol/src/a2a.ts) ──
@@ -674,8 +684,33 @@ export async function registerA2ARoutes(app: FastifyInstance) {
       },
     });
 
+    // ADR-0065: audit the citations against the offer ledger — derived,
+    // fenced to the SENDER's own partition, returned as immediate feedback.
+    // A verified citation is the delivery loop's acted-on leg, so it counts
+    // as a real "used" signal (fire-and-forget ranking hint, never
+    // authority); a flagged one buys nothing and drops nothing (a D13 relay
+    // is legitimate).
+    const citations =
+      payload.refs.noteIds.length > 0
+        ? await auditCitationOffers({
+            jobId: identity.jobId,
+            partition: identity.chatId,
+            noteIds: payload.refs.noteIds,
+            at: row.createdAt,
+          })
+        : [];
+    const offeredIds = (citations ?? [])
+      .filter((entry) => entry.offered)
+      .map((entry) => entry.noteId);
+    if (offeredIds.length > 0) {
+      recordMemoryUsed(offeredIds);
+    }
+
     reply.code(201);
-    return { message: toPeerMessage(row) };
+    return {
+      message: toPeerMessage(row),
+      ...(citations ? { citations } : {}),
+    };
   });
 
   // Pull-based delivery: nobody is pushed a peer's untrusted text mid-turn. The
@@ -735,6 +770,14 @@ export async function registerA2ARoutes(app: FastifyInstance) {
       }
     }
 
+    // ADR-0065: derive each cited message's citation audit against the
+    // SENDER's partition at the message's own instant. Fenced by
+    // construction (peer messages are same-chat), bounded by the page ×
+    // MAX_PEER_REFS, and absent — never false-for-everything — when the
+    // ledger was unreadable. ONE assembly (ADR-0086 D4): the operator
+    // transcript serves the same sibling from the same helper.
+    const citationAudits = await auditPeerMessageRows(rows);
+
     return peerInboxSchema.parse({
       messages: rows.map((row) =>
         toPeerMessage(
@@ -745,6 +788,7 @@ export async function registerA2ARoutes(app: FastifyInstance) {
       ),
       unread,
       truncated: unread > rows.length,
+      ...(citationAudits.length > 0 ? { citationAudits } : {}),
     });
   });
 
@@ -1040,6 +1084,36 @@ export async function registerA2ARoutes(app: FastifyInstance) {
       );
     }
 
+    // ADR-0081: a DISPUTED target is fenced BEFORE anything is minted —
+    // the same partition fence every agent act-on-a-note takes (clone,
+    // grounding; this is its third consumer). Forbidden reads as missing:
+    // existence must not be probeable across the boundary.
+    let contradictsTarget: { id: string } | null = null;
+    if (payload.contradictsNoteId) {
+      const resolvedTarget = await resolveMemoryNoteByIdOrPrefix(
+        payload.contradictsNoteId
+      );
+      const scoped = resolvedTarget
+        ? await memoryNoteDisputeScope(resolvedTarget.id, {
+            tier: "agent",
+            principal: agentJobPrincipal(
+              requireAgentJobCapability(app, request)
+            ),
+            chatId: identity.chatId,
+            workspacePath: identity.workspacePath
+              ? await repoRootOf(identity.workspacePath)
+              : undefined,
+            crewVisible: false,
+          })
+        : null;
+      if (!scoped || scoped.status !== "ok") {
+        throw app.httpErrors.notFound(
+          `No memory note '${payload.contradictsNoteId}'.`
+        );
+      }
+      contradictsTarget = { id: scoped.note.id };
+    }
+
     // The coordinate vocabulary the ledger already has: a `#` makes it a
     // SYMBOL anchor, anything else a MODULE. Same split `claimKindFor` makes
     // for claims, so a finding and a claim can name the same ground.
@@ -1072,6 +1146,33 @@ export async function registerA2ARoutes(app: FastifyInstance) {
 
     const noteId = ingested.note.id;
 
+    // ADR-0081: the typed disagreement — a `contradicts` edge from the
+    // minted finding to the disputed note, exactly the 0058 D3 shape (its
+    // third consumer; the grounding mismatch and the 0069 A4 override are
+    // the other two). Never destructive: the disputed note stands until
+    // the gate decides, and both render together wherever contradiction
+    // edges already do.
+    //
+    // NOT one transaction, deliberately (review finding, answered): the
+    // ingest owns its own transactionality (a nested tx is SQLite's
+    // single-writer deadlock — the D46 lesson), so an edge failure leaves
+    // the finding persisted and the route erroring honestly — noise, never
+    // lost governance (0058's own acceptance). The RETRY converges rather
+    // than forking: identical text from the same author dedups back onto
+    // the same note, and the edge write is an upsert.
+    if (contradictsTarget) {
+      if (noteId === contradictsTarget.id) {
+        // Dedup landed the dispute text ON the disputed note itself (the
+        // ledger's one-text-one-note rule) — a note cannot contradict
+        // itself, and silently minting a self-loop would render every
+        // reader a phantom dispute.
+        throw app.httpErrors.badRequest(
+          "The dispute's text is identical to the disputed note's own text, so it deduplicated onto the same note. State the disagreement in your own words."
+        );
+      }
+      await mintContradictionEdge(noteId, contradictsTarget.id);
+    }
+
     let row;
     try {
       row = await prisma.peerMessage.create({
@@ -1101,8 +1202,43 @@ export async function registerA2ARoutes(app: FastifyInstance) {
       );
     }
 
+    // ADR-0060 gap, closed here: this route mints its note through
+    // `ingestMemoryNote` directly — never the memory POST route — so the
+    // offer ledger never saw the write, and ADR-0062's receipt audit would
+    // have falsely contradicted an honest `context_updated` from a job whose
+    // only write was a published finding. Same rule as ingest: a session has
+    // read what it wrote.
+    const servedNoteId = await serveNoteContent(
+      {
+        chatId: identity.chatId,
+        jobId: identity.jobId,
+        principal: agentJobPrincipal(requireAgentJobCapability(app, request)),
+        workspacePath,
+      },
+      "add",
+      noteId,
+      [noteId],
+      app.log
+    );
+    // ADR-0065: the published note is its own first citation (refs.noteIds
+    // carries it); audit it like any other so the sender's feedback loop is
+    // uniform — it reads `offered: true` via the offer row just recorded.
+    const citations = await auditCitationOffers({
+      jobId: identity.jobId,
+      partition: identity.chatId,
+      noteIds: [noteId],
+      at: new Date(),
+    });
+
     reply.code(201);
-    return publishFindingResultSchema.parse({ noteId, messageId: row.id });
+    return publishFindingResultSchema.parse({
+      noteId: servedNoteId,
+      messageId: row.id,
+      ...(citations ? { citations } : {}),
+      ...(contradictsTarget
+        ? { contradictsNoteId: contradictsTarget.id }
+        : {}),
+    });
   });
 
   // Release is self-only: the `jobId` filter is the bearer's, so one agent can
@@ -1156,7 +1292,18 @@ export async function registerA2ARoutes(app: FastifyInstance) {
       orderBy: [{ createdAt: "desc" }, { id: "desc" }],
       take: query.limit,
     });
-    return { messages: rows.map(toPeerMessage) };
+    // ADR-0086 D2 — the operator's transcript carries the SAME per-message
+    // citation audits the agent inbox serves, from the SAME assembly
+    // (auditPeerMessageRows): the verdict derives at the reading surface,
+    // and it testifies about the CITER (the sender's own offer set at the
+    // message's instant), whoever reads it. Sibling field: absent when the
+    // ledger was unreadable or nothing on the page cites, never
+    // false-for-everything.
+    const citationAudits = await auditPeerMessageRows(rows);
+    return {
+      messages: rows.map(toPeerMessage),
+      ...(citationAudits.length > 0 ? { citationAudits } : {}),
+    };
   });
 
   // COORDINATES ONLY. Deliberately no message text: this is the snapshot the

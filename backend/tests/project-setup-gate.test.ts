@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
@@ -30,9 +30,14 @@ let app: FastifyInstance;
 let SETUP_HASH = "";
 
 beforeAll(async () => {
-  dir = mkdtempSync(path.join(tmpdir(), "muon-t5-gate-"));
-  repoDir = mkdtempSync(path.join(tmpdir(), "muon-t5-gate-repo-"));
+  dir = realpathSync(mkdtempSync(path.join(tmpdir(), "muon-t5-gate-")));
+  // realpath'd so the stored task workspace equals what the approve hook's
+  // workspace validation resolves — the fence compares canonical paths.
+  repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), "muon-t5-gate-repo-")));
   process.env.DATABASE_URL = `file:${path.join(dir, "test.db")}`;
+  // The approve hook now refuses a repoRoot outside the operator's allowed
+  // workspace roots (adversarial finding 5); the temp repo must be allowed.
+  process.env.MUON_WORKSPACE_ROOTS = repoDir;
   process.env.MUON_GRAPH_DIR = path.join(dir, "graph");
   process.env.MUON_GRAPH_DISABLE_FTS = "1";
   process.env.MUON_OPERATOR_TOKEN = OPERATOR;
@@ -70,6 +75,7 @@ afterAll(async () => {
   await app?.close();
   await db.prisma.$disconnect();
   delete process.env.MUON_DATA_DIR;
+  delete process.env.MUON_WORKSPACE_ROOTS;
   rmSync(dir, { recursive: true, force: true });
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -163,6 +169,64 @@ describe("T5 project-setup gate", () => {
     // The repo's real plan hash stays the only recorded confirmation.
     const record = await readProjectSetupConfirmation({ repoRoot: repoDir });
     expect(record!.setupHash).toBe(SETUP_HASH);
+  });
+
+  it("F5: a repoRoot outside the task's own repo never records — consent binds to a server-derived subject", async () => {
+    // A second real repo with its own valid plan and hash: the hash check
+    // alone would PASS here, so only the workspace fence stands between an
+    // agent-aimed repoRoot and a recorded confirmation for the wrong repo.
+    const otherRepo = realpathSync(
+      mkdtempSync(path.join(tmpdir(), "muon-t5-gate-other-"))
+    );
+    try {
+      mkdirSync(path.join(otherRepo, ".muon"), { recursive: true });
+      writeFileSync(
+        path.join(otherRepo, ".muon", "project.json"),
+        JSON.stringify({
+          version: 1,
+          setup: [{ command: "touch", args: ["pwned"] }],
+        })
+      );
+      const otherPlan = await resolveEffectiveProjectSetup({ repoRoot: otherRepo });
+      const otherHash = projectSetupConfirmationRequest(otherPlan)!.setupHash;
+      // Widen the roots so ONLY the task fence is under test.
+      process.env.MUON_WORKSPACE_ROOTS = `${repoDir},${otherRepo}`;
+
+      const filed = await app.inject({
+        method: "POST",
+        url: "/api/approvals",
+        headers: auth(AGENT),
+        payload: {
+          taskId: "task-t5",
+          requestedBy: "runner",
+          kind: "command",
+          reason: "Repo-declared project lifecycle wants 1 command.",
+          gateTag: `project-setup:${otherHash}`,
+          evidence: {
+            action: "project-setup",
+            scope: otherRepo,
+            riskLevel: "high",
+            impactIfApproved: "Repo-declared setup commands execute later.",
+            details: { repoRoot: otherRepo, setupHash: otherHash },
+          },
+        },
+      });
+      expect(filed.statusCode, filed.body).toBe(201);
+      const approve = await app.inject({
+        method: "PATCH",
+        url: `/api/approvals/${filed.json().approval.id}`,
+        headers: auth(OPERATOR),
+        payload: { status: "approved" },
+      });
+      expect(approve.statusCode, approve.body).toBe(200);
+      // The decision landed, but the OTHER repo got no confirmation.
+      expect(
+        await readProjectSetupConfirmation({ repoRoot: otherRepo })
+      ).toBeUndefined();
+    } finally {
+      process.env.MUON_WORKSPACE_ROOTS = repoDir;
+      rmSync(otherRepo, { recursive: true, force: true });
+    }
   });
 
   it("a mismatched evidence hash never records a confirmation", async () => {

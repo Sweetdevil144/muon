@@ -92,6 +92,9 @@ describe("capability_preflight MCP tool", () => {
     expect(cursor.dispatchReady).toBe(false);
     expect(cursor.boundary).toBe("role-scoped");
     expect(cursor.dispatchRoles).toEqual([
+      // DISPATCHABLE roles only: the ADR-0057 seat is not among them, because
+      // the dispatch route refuses `orchestrator` as a task role. Cursor still
+      // holds no write role either.
       "reviewer",
       "qa",
       "architect",

@@ -20,6 +20,10 @@ const prismaMock = vi.hoisted(() => ({
     findMany: vi.fn(),
     findUnique: vi.fn(),
   },
+  // ADR-0061: the disclosure classifier's ledger canary.
+  memoryNote: {
+    findMany: vi.fn(async () => []),
+  },
   task: {
     create: vi.fn(),
     findMany: vi.fn(),
@@ -76,6 +80,17 @@ const graphMock = vi.hoisted(() => ({
   ingestMemoryNote: vi.fn(),
   searchMemory: vi.fn(),
   recallMemory: vi.fn(),
+  // ADR-0061: the disclosed façades ride the SAME underlying fns, so every
+  // existing mockResolvedValue seeding keeps working; tests that want
+  // candidates override these directly.
+  searchMemoryDisclosed: vi.fn(async (...args: unknown[]) => ({
+    notes: await (graphMock.searchMemory as (...a: unknown[]) => Promise<unknown[]>)(...args),
+    withheldCandidates: [],
+  })),
+  recallMemoryDisclosed: vi.fn(async (...args: unknown[]) => ({
+    notes: await (graphMock.recallMemory as (...a: unknown[]) => Promise<unknown[]>)(...args),
+    withheldCandidates: [],
+  })),
   updateMemoryNote: vi.fn(),
   suggestLanes: vi.fn(),
 }));
@@ -84,6 +99,7 @@ const graphMock = vi.hoisted(() => ({
 // reads still come from the graph projection (graphMock). The real ledger is
 // exercised end-to-end against real SQLite in tests/memory-ledger.test.ts.
 const ledgerMock = vi.hoisted(() => ({
+  mintContradictionEdge: vi.fn(),
   ingestMemoryNote: vi.fn(),
   updateMemoryNote: vi.fn(),
   projectLedgerToGraph: vi.fn(),
@@ -670,6 +686,10 @@ describe("muon backend API", () => {
     });
     expect(searched.statusCode).toBe(200);
     expect(searched.json().notes).toHaveLength(1);
+    // ADR-0061 D2: absent fields mean nothing suppressed — the default read
+    // carries NEITHER disclosure field.
+    expect(searched.json().suppressed_count).toBeUndefined();
+    expect(searched.json().withheld).toBeUndefined();
     // KG-5: search now threads limit + bitemporal/scope options (both absent here).
     expect(graphMock.searchMemory).toHaveBeenCalledWith("palette", 20, {
       asOf: undefined,
@@ -685,6 +705,66 @@ describe("muon backend API", () => {
       showExpired: true,
     });
     await app.close();
+  });
+
+  it("ADR-0061: the search response DISCLOSES what was withheld — count for the cap, stubs for policy", async () => {
+    const note = (id: string, patch: Record<string, unknown> = {}) => ({
+      id,
+      kind: "decision",
+      text: `note ${id}`,
+      taskId: null,
+      laneId: null,
+      modules: [],
+      topics: [],
+      trust: "medium",
+      confirmed: true,
+      stale: false,
+      status: "active",
+      createdBy: "human",
+      createdAt: "2026-07-09T00:00:00.000Z",
+      updatedAt: "2026-07-09T00:00:00.000Z",
+      ...patch,
+    });
+    graphMock.searchMemoryDisclosed.mockResolvedValueOnce({
+      notes: [note("mem-served")],
+      withheldCandidates: [
+        { note: note("mem-tail-1"), reason: "cap" },
+        { note: note("mem-tail-2"), reason: "cap" },
+        { note: note("mem-stale", { stale: true }), reason: "stale" },
+        { note: note("mem-paused", { status: "paused" }), reason: "paused" },
+      ],
+    });
+    // Ledger truth: real rows for every candidate (the canary), everything
+    // live, nothing expired; the paused one is paused IN THE LEDGER.
+    prismaMock.memoryNote.findMany.mockResolvedValueOnce([
+      { id: "mem-tail-1", status: "active" },
+      { id: "mem-tail-2", status: "active" },
+      { id: "mem-stale", status: "active" },
+      { id: "mem-paused", status: "paused" },
+    ]);
+    ledgerMock.applyMemoryExpiry.mockImplementation(
+      async (notes: { id: string }[]) =>
+        notes.map((entry) => ({
+          ...entry,
+          live: true,
+          expired: false,
+          confirmedBy: "human",
+          pinned: false,
+          expiresAt: null,
+        }))
+    );
+    const app = buildApp();
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/memory/search?q=note",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().notes).toHaveLength(1);
+    expect(res.json().suppressed_count).toBe(2);
+    expect(res.json().withheld).toEqual([
+      { id: "mem-stale", kind: "decision", reason: "stale" },
+      { id: "mem-paused", kind: "decision", reason: "paused" },
+    ]);
   });
 
   it("KG-5 F1: recall normalizes a second-precision asOf to canonical ms-UTC-Z before the graph", async () => {

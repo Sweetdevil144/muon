@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import type { Command } from "commander";
+import readline from "node:readline";
+import { buildSeedPlan } from "../lib/memory-seed.js";
 import { failCommand, exitCodeForError, formatRefusal } from "../lib/refusal.js";
 import type {
   MemoryGraphNode,
@@ -27,6 +29,7 @@ const kindSchema = z.enum([
   "convention",
   "attempt",
   "question",
+  "ownership",
 ]);
 const trustSchema = z.enum(["low", "medium", "high"]);
 const graphRelationSchema = z.enum([
@@ -399,6 +402,26 @@ function writeMemoryPack(storeDir: string, pack: MemoryPackExport): string {
   return dir;
 }
 
+/** ADR-0061 — the human rendering of the two disclosure fields. One line
+ *  each, only when present: absent means nothing was suppressed. */
+function printWithheldDisclosure(envelope: {
+  suppressedCount?: number;
+  withheld?: { id: string; kind: string; reason: string }[];
+}): void {
+  if (envelope.suppressedCount) {
+    process.stdout.write(
+      `withheld: ${envelope.suppressedCount} more matched, ranked below the cap\n`
+    );
+  }
+  if (envelope.withheld && envelope.withheld.length > 0) {
+    for (const stub of envelope.withheld) {
+      process.stdout.write(
+        `withheld: ${stub.id} (${stub.kind}) — ${stub.reason}\n`
+      );
+    }
+  }
+}
+
 export function registerMemoryCommands(
   program: Command,
   createClient: () => MuonApiClient
@@ -406,6 +429,151 @@ export function registerMemoryCommands(
   const memory = program
     .command("memory")
     .description("Work memory: decisions, constraints, conventions, attempts");
+
+  memory
+    .command("seed")
+    .description(
+      "Seed memory from what is already on disk — ADRs, CLAUDE.md rules, postmortems — as UNCONFIRMED proposals you review"
+    )
+    .option("--repo <path>", "Repository root (default: current directory)")
+    .option(
+      "--limit <n>",
+      "Cap candidates per source kind (the rest are reported, not staged)",
+      "100"
+    )
+    .option("--yes", "Stage without the confirmation prompt")
+    .option("--dry-run", "Print the plan and stage nothing")
+    .option("--json", "Print the outcome as JSON")
+    .action(
+      async (options: {
+        repo?: string;
+        limit: string;
+        yes?: boolean;
+        dryRun?: boolean;
+        json?: boolean;
+      }) => {
+        try {
+          // ADR-0059. Operator-initiated (this command IS the operator
+          // surface), a POSITIVE source list, and every note lands an
+          // UNCONFIRMED proposal — authorship of a file is not confirmation
+          // of each extracted claim. The plan is stated BEFORE anything is
+          // staged, with what was capped disclosed (D4).
+          const repoRoot = path.resolve(options.repo ?? process.cwd());
+          const limit = Math.max(1, Math.min(500, Number(options.limit) || 100));
+          const plan = buildSeedPlan(repoRoot);
+          const sections: Array<{
+            label: string;
+            kind: "decision" | "constraint" | "attempt";
+            all: typeof plan.decisions;
+          }> = [
+            { label: "decisions (from docs/adr)", kind: "decision", all: plan.decisions },
+            { label: "constraints (from CLAUDE.md / AGENTS.md)", kind: "constraint", all: plan.constraints },
+            { label: "incident lessons (from postmortems)", kind: "attempt", all: plan.lessons },
+          ];
+          const planLines = sections.map((section) => {
+            const capped = Math.max(0, section.all.length - limit);
+            return `  ${section.label}: ${Math.min(section.all.length, limit)} candidate(s)${
+              capped > 0 ? ` (+${capped} beyond --limit ${limit}, NOT staged)` : ""
+            }`;
+          });
+          const total = sections.reduce(
+            (sum, section) => sum + Math.min(section.all.length, limit),
+            0
+          );
+          if (!options.json) {
+            process.stdout.write(
+              `Seed plan for ${repoRoot}:\n${planLines.join("\n")}\n`
+            );
+          }
+          if (total === 0) {
+            if (options.json) printJson({ staged: 0, plan: [] });
+            else
+              process.stdout.write(
+                "Nothing to seed — no recognized sources with extractable items.\n"
+              );
+            return;
+          }
+          if (options.dryRun) {
+            if (options.json)
+              printJson({
+                dryRun: true,
+                candidates: sections.flatMap((section) =>
+                  section.all.slice(0, limit)
+                ),
+              });
+            else
+              process.stdout.write(
+                "Dry run — nothing staged. Re-run without --dry-run to stage these as proposals.\n"
+              );
+            return;
+          }
+          if (!options.yes && process.stdin.isTTY && process.stdout.isTTY) {
+            const rl = readline.createInterface({
+              input: process.stdin,
+              output: process.stdout,
+            });
+            const answer = await new Promise<string>((resolve) => {
+              let settled = false;
+              const settle = (value: string) => {
+                if (!settled) {
+                  settled = true;
+                  resolve(value.trim().toLowerCase());
+                }
+              };
+              rl.question(
+                `Stage ${total} proposal(s) for your review? [y/N] `,
+                (line) => {
+                  settle(line);
+                  rl.close();
+                }
+              );
+              rl.on("close", () => settle(""));
+            });
+            if (answer !== "y" && answer !== "yes") {
+              process.stdout.write("Nothing staged.\n");
+              return;
+            }
+          }
+          const client = createClient();
+          let staged = 0;
+          let duplicates = 0;
+          for (const section of sections) {
+            for (const candidate of section.all.slice(0, limit)) {
+              const result = await client.addMemoryNoteWithAction({
+                kind: candidate.kind,
+                text: candidate.text,
+                // The source file is the note's MODULE ANCHOR, so ADR-0058's
+                // anchor-existence check covers seeded notes from birth: a
+                // seeded note whose source doc moves or dies is confrontable.
+                modules: [candidate.sourcePath],
+                topics: [...candidate.topics],
+                trust: "low",
+                createdBy: "seed:disk",
+                // No outcome is asserted for a seeded lesson: the extractor
+                // read a title, not the retrospective's verdict, and a wrong
+                // outcome on a proposal is exactly what the reviewer would
+                // have to notice. Absent is the honest value.
+              });
+              if (result.action === "duplicate") duplicates += 1;
+              else staged += 1;
+            }
+          }
+          if (options.json) {
+            printJson({ staged, duplicates });
+            return;
+          }
+          process.stdout.write(
+            `Staged ${staged} proposal(s)${
+              duplicates > 0
+                ? ` (${duplicates} already known — unchanged sources NOOP, which is the idempotence)`
+                : ""
+            }. Review them on a MUON surface: nothing becomes institutional until you confirm it.\n`
+          );
+        } catch (error) {
+          failCommand(error, "Memory seed failed.");
+        }
+      }
+    );
 
   memory
     .command("add")
@@ -483,24 +651,35 @@ export function registerMemoryCommands(
   ) => {
     try {
       const client = createClient();
-      const notes = await client.searchMemory(query.join(" "), {
+      const envelope = await client.searchMemoryDisclosed(query.join(" "), {
         ...workspaceArgs(options),
         showExpired: options.showExpired,
         filter: parseFilterOption(options.filter),
       });
+      const notes = envelope.notes;
       if (options.json) {
-        printJson({ notes });
+        printJson({
+          notes,
+          ...(envelope.suppressedCount !== undefined
+            ? { suppressed_count: envelope.suppressedCount }
+            : {}),
+          ...(envelope.withheld ? { withheld: envelope.withheld } : {}),
+        });
         return;
       }
       process.stdout.write(workspaceBanner(options));
-      if (notes.length === 0) {
+      if (notes.length === 0 && !envelope.withheld) {
         process.stdout.write("no matching notes\n");
+        printWithheldDisclosure(envelope);
         return;
       }
       // Never `forEach(printNote)`: forEach's index would land in the
       // autoConfirmAgentMemory parameter.
       const crewVisible = await crewFraming(client);
       notes.forEach((note) => printNote(note, crewVisible));
+      // ADR-0061: "the brain said nothing" and "the brain withheld N" are
+      // different answers — say which one this was.
+      printWithheldDisclosure(envelope);
     } catch (error) {
       failCommand(error, "Memory search failed.");
     }
@@ -753,7 +932,7 @@ export function registerMemoryCommands(
       } & WorkspaceOptions) => {
         try {
           const client = createClient();
-          const notes = await client.recallMemory({
+          const envelope = await client.recallMemoryDisclosed({
             ...workspaceArgs(options),
             taskId: options.taskId,
             laneId: options.laneId,
@@ -762,17 +941,26 @@ export function registerMemoryCommands(
             showExpired: options.showExpired,
             filter: parseFilterOption(options.filter),
           });
+          const notes = envelope.notes;
           if (options.json) {
-            printJson({ notes });
+            printJson({
+              notes,
+              ...(envelope.suppressedCount !== undefined
+                ? { suppressed_count: envelope.suppressedCount }
+                : {}),
+              ...(envelope.withheld ? { withheld: envelope.withheld } : {}),
+            });
             return;
           }
           process.stdout.write(workspaceBanner(options));
-          if (notes.length === 0) {
+          if (notes.length === 0 && !envelope.withheld) {
             process.stdout.write("no notes for this filter\n");
+            printWithheldDisclosure(envelope);
             return;
           }
           const crewVisible = await crewFraming(client);
           notes.forEach((note) => printNote(note, crewVisible));
+          printWithheldDisclosure(envelope);
         } catch (error) {
           failCommand(error, "Memory recall failed.");
         }
@@ -886,6 +1074,43 @@ export function registerMemoryCommands(
               `contradictions (${explanation.contradictions.length}):\n`
             );
             explanation.contradictions.forEach(printGraphNode);
+          }
+          // ADR-0060 D4 — the decision-history section of the dossier:
+          // coordinates only, bounded lists with disclosed totals. Absent
+          // for a note outside the caller's fence — render nothing rather
+          // than a manufactured "no history".
+          const history = explanation.history;
+          if (history) {
+            process.stdout.write(
+              `history: written by ${history.written.by ?? "unknown"} at ${
+                history.written.at
+              }${history.written.job ? ` (job ${history.written.job})` : ""}\n`
+            );
+            if (history.derivedFrom.status === "ok") {
+              process.stdout.write(
+                `  derived from ${history.derivedFrom.total} offered note(s)${
+                  history.derivedFrom.truncated
+                    ? ` (showing first ${history.derivedFrom.offers.length})`
+                    : ""
+                }:\n`
+              );
+              for (const offer of history.derivedFrom.offers) {
+                process.stdout.write(
+                  `    ${offer.noteId} · first via ${offer.surface} · ${offer.firstAt}\n`
+                );
+              }
+            } else if (history.derivedFrom.status === "predates-offer-ledger") {
+              process.stdout.write(
+                "  derived-from: predates the offer ledger — not the same fact as \"read nothing\"\n"
+              );
+            } else {
+              process.stdout.write(
+                "  derived-from: unpartitioned (operator write; no session context attributable)\n"
+              );
+            }
+            process.stdout.write(
+              `  offered to ${history.offeredTo.jobs} job(s) across ${history.offeredTo.partitions} partition(s), ${history.offeredTo.total} offer(s) total\n`
+            );
           }
         } catch (error) {
           failCommand(error, "Memory explanation failed.");

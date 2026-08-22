@@ -1,10 +1,13 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { VENDOR_IDS } from "@muon/protocol";
+import { afterEach, describe, expect, it } from "vitest";
+import { VENDOR_IDS, VENDOR_REGISTRY } from "@muon/protocol";
 import { MUON_MCP_SERVER_NAME } from "@muon/core";
 import {
   INSTALLABLE_VENDORS,
   MUON_MCP_ENTRY_NAME,
+  defaultVendorIo,
   installableRemainder,
   resolveInstallableVendor,
   resolveMuonMcpCommand,
@@ -13,6 +16,13 @@ import {
   vendorHoldsCoordinatorSeat,
   type McpVendorIo,
 } from "@muon/client/mcp-vendor-config";
+
+const tempDirs: string[] = [];
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 function io(overrides: Partial<McpVendorIo> = {}): McpVendorIo {
   return {
@@ -50,15 +60,28 @@ describe("the installable-vendor table is positive, never a remainder", () => {
 
   it("keeps 'installable' and 'holds the coordinator seat' as SEPARATE booleans", () => {
     // §2.2: conflating them is the documentation failure ADR-0022 warns about.
-    // Two vendors are installable AND seat-holders; two are installable and not.
+    // Since ADR-0057 all four installable vendors also hold the seat, so the
+    // two lists COINCIDE — which is exactly when a conflation stops being
+    // visible. Two things keep this test meaningful anyway:
     const seats = INSTALLABLE_VENDORS.filter((spec) =>
       vendorHoldsCoordinatorSeat(spec.id)
     ).map((spec) => spec.id);
-    expect(seats).toEqual(["claude-code", "codex"]);
-    const noSeat = INSTALLABLE_VENDORS.filter(
-      (spec) => !vendorHoldsCoordinatorSeat(spec.id)
-    ).map((spec) => spec.id);
-    expect(noSeat).toEqual(["cursor", "opencode"]);
+    expect(seats).toEqual(["claude-code", "codex", "cursor", "opencode"]);
+
+    // 1. The seat answer is read from the vendor REGISTRY, not from membership
+    //    of the installable table. `fake` is the standing witness: it is a
+    //    registered vendor that is deliberately not installable, and it holds
+    //    no seat either — so a `vendorHoldsCoordinatorSeat` that had quietly
+    //    become "is this id installable?" would still be wrong about it.
+    expect(vendorHoldsCoordinatorSeat("fake")).toBe(false);
+    expect(INSTALLABLE_VENDORS.map((spec) => spec.id)).not.toContain("fake");
+
+    // 2. Every id answers from the registry's own field, not a derived set.
+    for (const id of VENDOR_IDS) {
+      expect(vendorHoldsCoordinatorSeat(id)).toBe(
+        VENDOR_REGISTRY[id].authority.coordinatorSeat
+      );
+    }
   });
 
   it("never exposes 'local' as a scope, and defaults claude to user", () => {
@@ -186,6 +209,52 @@ describe("D-cmd: resolveMuonMcpCommand resolves, verifies, and records", () => {
       command: "/tmp/fake-home/.local/bin/muon-mcp",
       source: "/tmp/fake-home/.local/bin",
     });
+  });
+
+  it("finds the tarball's muon-mcp beside muon, on a REAL filesystem", () => {
+    // THE INSTALLED LAYOUT, not a stubbed predicate. `npm i -g muon-cli` links
+    // every bin in the manifest into one directory, so the sibling candidate
+    // is the whole reason a tarball user gets a `muon-mcp` at all — and until
+    // `bundle-release.mjs` grew a third entry there was no `muon-mcp` in that
+    // directory to find, while `muonMcpUnresolvedRefusal` told the user to
+    // install the package that "ships both bins".
+    //
+    // What this proves and what it does NOT: it drives the REAL executable
+    // probe against a real two-bin directory, so the RESOLVER half of that
+    // promise is covered. The directory is built by hand here, so this says
+    // nothing about whether the tarball actually contains `muon-mcp.mjs` —
+    // that shape is pinned by `bundle-release-bins.test.ts`, and that the
+    // bundle boots is proved only by the manifest's own import check.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "muon-installed-"));
+    tempDirs.push(dir);
+    for (const bin of ["muon", "muon-mcp"]) {
+      fs.writeFileSync(path.join(dir, bin), "#!/usr/bin/env node\n", {
+        mode: 0o755,
+      });
+    }
+    const argv1 = process.argv[1];
+    process.argv[1] = path.join(dir, "muon");
+    try {
+      const resolved = resolveMuonMcpCommand({
+        ...defaultVendorIo(),
+        // Nothing on PATH and no well-known dir: the sibling is the only way
+        // this can pass, so a pass means the sibling candidate found it.
+        which: () => null,
+        roots: {
+          home: dir,
+          configHome: path.join(dir, ".config"),
+          cwd: dir,
+          redirectVendorConfigDirs: true,
+        },
+      });
+      expect(resolved).toEqual({
+        ok: true,
+        command: path.join(dir, "muon-mcp"),
+        source: "sibling of the running muon binary",
+      });
+    } finally {
+      process.argv[1] = argv1;
+    }
   });
 
   it("fails CLOSED, listing what it searched, when nothing resolves", () => {

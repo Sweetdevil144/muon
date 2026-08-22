@@ -51,7 +51,7 @@ jobs:
             packages/*/node_modules
             backend/node_modules
             apps/*/node_modules
-          key: nm-${{ runner.os }}-node24-${{ hashFiles('package-lock.json', 'packages/*/package-lock.json', 'backend/package-lock.json', 'apps/*/package-lock.json', 'scripts/ci-install.sh') }}
+          key: nm-${{ runner.os }}-node24-${{ hashFiles('package.json', 'packages/*/package.json', 'backend/package.json', 'apps/*/package.json', 'package-lock.json', 'packages/*/package-lock.json', 'backend/package-lock.json', 'apps/*/package-lock.json', 'scripts/ci-install.sh') }}
 
       # Fail closed if a second lockfile reappears. Vercel (and some detectors)
       # prefer pnpm-lock.yaml over package-lock.json; Dependabot only refreshes

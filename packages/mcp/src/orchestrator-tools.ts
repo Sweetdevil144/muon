@@ -1,7 +1,10 @@
 import { heuristicWorkflowProposal } from "@muon/core";
 import { refusalOf } from "@muon/client";
+import { buildRefusal } from "@muon/protocol/refusal";
+import { isDispatchableRole } from "@muon/protocol";
 import {
   assignCrewRoles,
+  classifyHandoffPacket,
   VENDOR_DISPATCH_ROLES,
   type DispatchJobRecord,
   type DispatchKind,
@@ -28,6 +31,10 @@ import {
   taskHeadingList,
   vendorRoutingBrief,
   vendorsWhere,
+  MAX_AMENDMENT_STEPS,
+  WORKFLOW_AMENDMENT_ON_FAIL,
+  sessionSlug,
+  workflowAmendmentSchema,
   type AgentRole,
 } from "@muon/protocol";
 import {
@@ -40,6 +47,12 @@ import {
   type ToolDefinition,
   type ToolPrincipal,
 } from "./agent-ui.js";
+import { resolveCodeGraph } from "./gitnexus-tools.js";
+import {
+  blindRecoveryActions,
+  reviewDiffKey,
+  type ReviewDiffLedger,
+} from "./review-session.js";
 
 /**
  * Orchestrator toolset (v2): what the conversational super-agent uses to run
@@ -62,6 +75,14 @@ export type OrchestratorScope = {
   workspacePath?: string;
   apiBase: string;
   apiToken?: string;
+  /**
+   * A4 — what this session's `review_diff` calls proved, shared BY REFERENCE
+   * with the base tools that write it. `ship` reads it as a PREFLIGHT: it can
+   * refuse early and by name, and it never certifies anything (the server-side
+   * certification at approval time remains the authority). Absent → the
+   * preflight finds no evidence and refuses, which is the safe direction.
+   */
+  reviewLedger?: ReviewDiffLedger;
 };
 
 /**
@@ -127,7 +148,17 @@ function capabilitySummary(readiness: VendorReadiness[]) {
     // `?? [...AGENT_ROLES]`, so an unrecognized vendor was described to the
     // SUPERAGENT as dispatch-ready for every role — the fail-open with the
     // longest reach, because the coordinator plans against this row.
-    const dispatchRoles = VENDOR_DISPATCH_ROLES[entry.vendor] ?? [];
+    // DISPATCHABLE roles, which is not the whole ceiling. ADR-0057 put
+    // `orchestrator` into two more ceilings, and `POST /api/dispatch` refuses
+    // it as a task role outright ("belongs to a chat's root coordinator job").
+    // This is the row the crew planner actually routes on, so listing a role
+    // it will be refused turns a plan into a hard 400 after it is built. The
+    // seat is not omitted-as-a-secret either: it is simply not something this
+    // reader can dispatch, and it cannot delegate one downward.
+    const ceiling = VENDOR_DISPATCH_ROLES[entry.vendor] ?? [];
+    const dispatchRoles = ceiling.filter(
+      (role) => isDispatchableRole(role)
+    );
     const roleScoped = !dispatchRoles.includes("implementer");
     const connected = entry.installed && entry.authenticated;
     const dispatchReady = connected && !roleScoped;
@@ -228,13 +259,90 @@ async function assertJobInScope(
 const DISPATCH_LIST_RESULT_CHARS = 1_200;
 const DISPATCH_DETAIL_RESULT_CHARS = HANDOFF_FINAL_MESSAGE_CHARS;
 
+/**
+ * A13 — open blocking questions for this coordinator's crew, grouped by task.
+ *
+ * Fetched ONCE PER TOOL CALL and joined by taskId, never per job row: a status
+ * read over twenty jobs must not become twenty question reads.
+ *
+ * DEGRADES, never fails: `dispatch_status` answering nothing because the
+ * question spine was unreadable would be strictly worse than answering without
+ * the question field. But the degradation is REPORTED — an omitted field that
+ * looks like "no open questions" is the failure this whole item exists to
+ * remove, so the caller is told which of the two it is.
+ */
+type CrewQuestionIndex = {
+  byTask: Map<string, { id: string; ageMs: number }[]>;
+  unavailable?: string;
+  truncated: boolean;
+};
+
+async function readCrewOpenQuestions(
+  client: MuonApiClient
+): Promise<CrewQuestionIndex> {
+  const byTask = new Map<string, { id: string; ageMs: number }[]>();
+  if (typeof client.listCrewOpenQuestions !== "function") {
+    return {
+      byTask,
+      truncated: false,
+      unavailable:
+        "open blocking questions are unavailable from this backend/client version",
+    };
+  }
+  try {
+    const { questions, truncated } = await client.listCrewOpenQuestions();
+    const now = Date.now();
+    for (const question of questions) {
+      const rows = byTask.get(question.taskId) ?? [];
+      rows.push({
+        id: question.id,
+        ageMs: Math.max(0, now - Date.parse(question.askedAt)),
+      });
+      byTask.set(question.taskId, rows);
+    }
+    return { byTask, truncated };
+  } catch (error) {
+    return {
+      byTask,
+      truncated: false,
+      unavailable: `open blocking questions unavailable: ${
+        error instanceof Error ? error.message : String(error)
+      }`.slice(0, 300),
+    };
+  }
+}
+
 /** Compact view of a dispatch job for the super-agent's status tools. */
 function dispatchSummary(
   job: DispatchJobRecord,
-  resultChars: number = DISPATCH_LIST_RESULT_CHARS
+  resultChars: number = DISPATCH_LIST_RESULT_CHARS,
+  // A13: the questions for THIS job's task, already read once by the caller.
+  // Undefined (the read was unavailable) omits the field entirely rather than
+  // asserting an empty list — "I could not look" is not "nothing is waiting".
+  openQuestions?: { id: string; ageMs: number }[]
 ) {
+  const blocking = openQuestions ?? [];
   return {
+    ...(openQuestions
+      ? {
+          openQuestions,
+          // ADR-0043: a filed question stops no clock — the job may still be
+          // running. What it does mean is that this worker asked a HUMAN
+          // something and is proceeding without the answer, which is exactly
+          // the thing a coordinator must not silently miss.
+          ...(blocking.length > 0
+            ? {
+                blockedReason: `waiting on a human answer to question ${blocking
+                  .map((question) => question.id)
+                  .join(", ")}`,
+              }
+            : {}),
+        }
+      : {}),
     jobId: job.id,
+    // H10: the speakable name beside the coordinate, computed — never stored —
+    // so every surface names the same job the same way.
+    slug: sessionSlug(job.id),
     kind: job.kind,
     vendor: job.vendor,
     // What this worker RUNS AS (VISION §2). Resolved server-side at dispatch, so
@@ -242,6 +350,24 @@ function dispatchSummary(
     role: job.role ?? null,
     taskId: job.taskId,
     status: job.status,
+    // H2 — the status string carries the DEGRADE KIND: a terminal job whose
+    // packet is typed_degraded (or unparseable) must never read as a plain
+    // "done". The contract rides every terminal summary; the loud note rides
+    // only the yellow ones.
+    ...(job.packetJson != null
+      ? (() => {
+          const contract = classifyHandoffPacket(job.packetJson).contract;
+          return {
+            packetContract: contract,
+            ...(contract === "typed_degraded" ||
+            contract === "packet_parse_failed"
+              ? {
+                  statusNote: `${job.status}, but its packet is ${contract} — NOT ship-ready. Lawful next actions: handoff_read({taskId: \"${job.taskId}\"}) to get the packet's id (the newest row), then dispatch({..., repairOf: \"<that id>\"}) — the typed repair verb; the server stamps the packet's contract + reason count into the repair brief — or question_ask; never accept a degraded packet as done.`,
+                }
+              : {}),
+          };
+        })()
+      : {}),
     agentId: job.agentId ?? null,
     exitCode: job.exitCode ?? null,
     interruptRequested: job.interruptRequested,
@@ -276,6 +402,14 @@ function dispatchSummary(
  */
 function gateRouteError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+  // NOT EVERY 403 IS A GATE VERDICT. The auth hook now answers 403 for a token
+  // MUON issued whose job is over — a SCOPE refusal — and matching on the bare
+  // status code turned that into "the gate was rejected… ask the human to
+  // approve", sending a super-agent to a human about an approval that was
+  // never the problem. The capability refusal is passed through as itself.
+  if (/exact active job capability/i.test(message)) {
+    return message;
+  }
   if (/\b403\b/.test(message)) {
     return "the gate was rejected, it may have been already used (gates are single-use), not yet approved, or filed for a different action/payload. Ask the human to approve, or file a fresh gate and retry.";
   }
@@ -553,6 +687,18 @@ export function createOrchestratorToolDefinitions(
           ...(typeof args.model === "string" && args.model.trim().length > 0
             ? { model: args.model.trim() }
             : {}),
+          // A5/A12: the packet citation rides to the route's own guard
+          // (exists + same mission), which is where the refusal lives.
+          ...(typeof args.sourcePacketId === "string" &&
+          args.sourcePacketId.trim().length > 0
+            ? { sourcePacketId: args.sourcePacketId.trim() }
+            : {}),
+          // ADR-0083: the typed repair/continue verb rides to the route's
+          // own derivation + composition.
+          ...(typeof args.repairOf === "string" &&
+          args.repairOf.trim().length > 0
+            ? { repairOf: args.repairOf.trim() }
+            : {}),
         },
         scope.delegationToken
       );
@@ -609,7 +755,18 @@ export function createOrchestratorToolDefinitions(
             declared: declaredHeadings(brief),
             verifiedBy:
               "the chat-turn dispatch contract; this child is admitted and running, but MUON will not COUNT it as crew proof until its brief declares every required heading",
-            skeleton: childBriefSkeleton(),
+            // The skeleton MUON hands back must be one the WORKER can obey. The
+            // worker's code tools come from a `muon-mcp` the runner injects —
+            // the same install and the same bundled-CLI resolution this process
+            // performed — so this session's resolution is the honest source for
+            // the GRAPH DISCIPLINE wording. On a graphless install the quoted
+            // remedy becomes a named TOOL GAP instead of an order into seven
+            // refusals.
+            skeleton: childBriefSkeleton({
+              codeGraph: resolveCodeGraph().available
+                ? "available"
+                : "unavailable",
+            }),
           };
     const briefContractHints =
       missingHeadings.length === 0
@@ -884,11 +1041,30 @@ export function createOrchestratorToolDefinitions(
         "The whole crew at a glance: fleet counts per vendor and every agent instance with status (idle/working), current task, and session id. `parallelCapacity` is how many of a vendor's agents can run AT THE SAME TIME (its seats) and how many are free right now — a fan-out wider than that queues instead of running in parallel.",
       inputSchema: { type: "object", properties: {} },
       handler: async () => {
-        const [fleet, capabilities] = await Promise.all([
+        const [fleet, capabilities, questions] = await Promise.all([
           client.getFleet(),
           readFleetCapabilities(client),
+          // A13: one read for the whole fleet, joined to LIVE seats by task.
+          readCrewOpenQuestions(client),
         ]);
         const agents = fleet.agents.slice(0, FLEET_AGENT_LIMIT);
+        // A13 — which SEATS are sitting on a question only a human can answer.
+        // Live seats only (a finished job's question is history, not a block),
+        // and the line names the job id because that is what the coordinator
+        // steers, interrupts and reports with.
+        const blockedSeats = questions.unavailable
+          ? []
+          : agents.flatMap((agent) => {
+              const open = agent.currentTaskId
+                ? (questions.byTask.get(agent.currentTaskId) ?? [])
+                : [];
+              if (open.length === 0 || !agent.currentJobId) return [];
+              return [
+                `Job '${agent.currentJobId}' (${agent.vendor}) is waiting on a human answer to question ${open
+                  .map((question) => question.id)
+                  .join(", ")}. Only a human can clear it — \`muon questions answer\` or the Desktop inbox.`,
+              ];
+            });
         // Stated, not implied. `counts` already carries the per-vendor total,
         // but the coordinator's question is "how many of these can run at
         // once", and it planned a 3-way parallel crew against a one-seat lane
@@ -913,6 +1089,16 @@ export function createOrchestratorToolDefinitions(
             agents,
             parallelCapacity,
             capabilities,
+            ...(questions.unavailable
+              ? {
+                  questionEvidence: {
+                    status: "unavailable",
+                    reason: questions.unavailable,
+                    action:
+                      "Check `muon questions list` or the Desktop inbox before concluding no seat is blocked on a human.",
+                  },
+                }
+              : { questionEvidence: { status: "available" } }),
           },
           {
             evidence: {
@@ -929,8 +1115,17 @@ export function createOrchestratorToolDefinitions(
                     reason: capabilities.reason,
                     action: capabilities.action,
                   }
-                : { active: false },
+                : questions.unavailable
+                  ? {
+                      active: true,
+                      reason: questions.unavailable,
+                      action:
+                        "Read the question inbox on a MUON surface; do not report the crew as unblocked from this call.",
+                    }
+                  : { active: false },
             nextActions: [
+              // A13 FIRST: a seat blocked on a person outranks a lane hint.
+              ...blockedSeats,
               ...(capabilities.status === "unavailable"
                 ? [capabilities.action]
                 : capabilities.vendors
@@ -1102,7 +1297,15 @@ export function createOrchestratorToolDefinitions(
             // coordinator never spends a corrective round guessing the shape.
             description:
               `${briefHeadingMandate()}. A heading may carry its content on the same line or in the block beneath it; an empty one counts as missing. ROLE and OWNED SCOPE must repeat the filed task's declarations verbatim. One compliant brief:\n` +
-              childBriefSkeleton(),
+              // Resolved here, at tool-description build time, from the ONE
+              // process-wide code-graph resolution — so the brief a coordinator
+              // is taught to write on a graphless install names the gap instead
+              // of ordering its worker into tools that refuse.
+              childBriefSkeleton({
+                codeGraph: resolveCodeGraph().available
+                  ? "available"
+                  : "unavailable",
+              }),
           },
           role: {
             type: "string",
@@ -1125,6 +1328,16 @@ export function createOrchestratorToolDefinitions(
             type: "string",
             description:
               "Optional model override for this worker (e.g. 'opus' for an architect, 'haiku' for a sweeper). Prefer a known id; MUON validates it against the vendor and refuses an invalid/unsupported id, an unknown-but-allowed id passes.",
+          },
+          sourcePacketId: {
+            type: "string",
+            description:
+              "A5/A12 — the typed handoff packet this child is seeded from. Prefer `repairOf` for a repair/continue child (it derives this AND composes the degradation block into the brief). MUON refuses an id that names no packet or another mission's packet. Lineage only — it grants nothing and widens nothing.",
+          },
+          repairOf: {
+            type: "string",
+            description:
+              "ADR-0083 — THE typed repair/continue verb: name the packet this child repairs (degraded) or continues (clean). MUON derives the citation and prepends ONE server-composed block naming the packet's contract and reason count, pointing the worker at handoff_read for the recorded reasons (packet prose never rides a prompt). The repairs-vs-continues label comes from the packet's classification, never from you.",
           },
         },
         required: ["vendor", "taskId", "brief"],
@@ -1194,15 +1407,37 @@ export function createOrchestratorToolDefinitions(
           if (!job) {
             return fail(`no dispatch job '${String(args.jobId)}'`);
           }
-          const loopStatus = await readLoopStatus(client, job.taskId);
+          const [loopStatus, questions] = await Promise.all([
+            readLoopStatus(client, job.taskId),
+            readCrewOpenQuestions(client),
+          ]);
           const loops = loopStatus.loops;
           const unavailable = loopStatus.unavailable;
           const degraded = firstLoopDegradation(loops);
+          const jobQuestions = questions.unavailable
+            ? undefined
+            : (questions.byTask.get(job.taskId) ?? []);
           return ok(
             {
               // ONE job by id = "what did this worker say", so it carries the
               // report-sized tail, not the roster-sized one.
-              job: dispatchSummary(job, DISPATCH_DETAIL_RESULT_CHARS),
+              job: dispatchSummary(
+                job,
+                DISPATCH_DETAIL_RESULT_CHARS,
+                jobQuestions
+              ),
+              // A13: stated when it could not be read, so an absent
+              // `openQuestions` field is never mistaken for "none open".
+              ...(questions.unavailable
+                ? {
+                    questionEvidence: {
+                      status: "unavailable",
+                      reason: questions.unavailable,
+                      action:
+                        "Check `muon questions list` or the Desktop inbox before concluding nothing is blocking this job.",
+                    },
+                  }
+                : { questionEvidence: { status: "available" } }),
               loops,
               loopEvidence: unavailable
                 ? {
@@ -1235,27 +1470,99 @@ export function createOrchestratorToolDefinitions(
                       action:
                         "Shell checks remain authoritative; run `muon doctor` before relying on evaluator coverage.",
                     }
-                  : { active: false },
-              nextActions:
-                loops.length > 0
+                  : // A13 last, because the loop degradations above are more
+                    // urgent — but still LOUD: an unread question inbox must
+                    // not let this job read as "nothing is waiting on anyone".
+                    questions.unavailable
+                    ? {
+                        active: true,
+                        reason: questions.unavailable,
+                        action:
+                          "Read the question inbox on a MUON surface; do not report this job as unblocked from this call.",
+                      }
+                    : { active: false },
+              nextActions: [
+                // A13 FIRST: a job whose task is waiting on a person is not
+                // going to be unblocked by tailing its stream, and the loop's
+                // own advice would otherwise be the only thing shown.
+                ...(jobQuestions && jobQuestions.length > 0
+                  ? [
+                      `Job '${job.id}' is waiting on a human answer to question ${jobQuestions
+                        .map((question) => question.id)
+                        .join(", ")} — a human answers on a MUON surface (\`muon questions answer\`, or the Desktop inbox). Answering confers no authority and unblocks nothing else.`,
+                    ]
+                  : []),
+                ...(loops.length > 0
                   ? loops.map((loop) => loop.nextAction).slice(0, 3)
-                  : [`Tail read_stream for job '${job.id}'.`],
+                  : [`Tail read_stream for job '${job.id}'.`]),
+              ],
             }
           );
         }
-        const jobs = await client.listDispatchJobs({
-          status: args.status ? String(args.status) : undefined,
-          taskId: args.taskId ? String(args.taskId) : undefined,
-          // A task filter narrows inside the chat partition; it never removes
-          // the chat boundary.
-          chatId: scope.chatId,
-        });
+        const [jobs, questions] = await Promise.all([
+          client.listDispatchJobs({
+            status: args.status ? String(args.status) : undefined,
+            taskId: args.taskId ? String(args.taskId) : undefined,
+            // A task filter narrows inside the chat partition; it never removes
+            // the chat boundary.
+            chatId: scope.chatId,
+          }),
+          // A13: ONE question read for the whole roster, joined by taskId below
+          // — never one read per job row.
+          readCrewOpenQuestions(client),
+        ]);
+        const rows = jobs.slice(-20);
         // Arity matters: a bare `.map(dispatchSummary)` would hand the ARRAY
         // INDEX to the new `resultChars` parameter, so job 0 would carry a
         // zero-length result and job 3 three characters.
-        return ok({
-          jobs: jobs.slice(-20).map((job) => dispatchSummary(job)),
-        });
+        const summaries = rows.map((job) =>
+          dispatchSummary(
+            job,
+            DISPATCH_LIST_RESULT_CHARS,
+            questions.unavailable
+              ? undefined
+              : (questions.byTask.get(job.taskId) ?? [])
+          )
+        );
+        const blocked = summaries.filter(
+          (summary) => summary.blockedReason !== undefined
+        );
+        return ok(
+          {
+            jobs: summaries,
+            ...(questions.unavailable
+              ? {
+                  questionEvidence: {
+                    status: "unavailable",
+                    reason: questions.unavailable,
+                    action:
+                      "Check `muon questions list` or the Desktop inbox before concluding nothing is blocking this crew.",
+                  },
+                }
+              : { questionEvidence: { status: "available" } }),
+          },
+          {
+            degradation: questions.unavailable
+              ? {
+                  active: true,
+                  reason: questions.unavailable,
+                  action:
+                    "Read the question inbox on a MUON surface; do not report the crew as unblocked from this call.",
+                }
+              : questions.truncated
+                ? {
+                    active: true,
+                    reason:
+                      "The open-question read hit its own bound, so an older still-open question may be missing from these rows.",
+                    action:
+                      "Confirm with `muon questions list` before concluding a job is unblocked.",
+                  }
+                : { active: false },
+            nextActions: blocked.map(
+              (summary) => `${summary.jobId}: ${summary.blockedReason}`
+            ),
+          }
+        );
       },
     },
     {
@@ -1558,6 +1865,147 @@ export function createOrchestratorToolDefinitions(
       },
     },
     {
+      // A14 / ADR-0045 — a running plan may GAIN a step, never change one.
+      //
+      // The backend has shipped this since ADR-0045; nothing reached it from
+      // MCP, so a coordinator that discovered mid-run that the plan was one
+      // step short could only abandon the run or ask a human to hand-edit it.
+      //
+      // This is the PROPOSE half and only that half. There is deliberately no
+      // apply verb here and none on the client: appending to a live plan is
+      // gated exactly as hard as applying one, and the human decides the gate
+      // this returns. For an attached seat that is doubly true — `apply_workflow`
+      // is remainder, and this must not become the way around it.
+      name: "propose_amendment",
+      description:
+        "Propose EXTRA STEPS for a workflow run that is already running or paused (ADR-0045). APPEND-ONLY and enforced server-side: there is no field here that names, reorders, or edits an existing step, and a run in any other status is refused by rule. Nothing changes when this succeeds — it records an inert draft and returns the gate tag a HUMAN approves to actually append. Applying is a separate, gated act you do not hold: do not describe a proposed amendment as added.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          runId: { type: "string", minLength: 1 },
+          steps: {
+            type: "array",
+            minItems: 1,
+            // RENDERED from the protocol bound, never restated: a cap this
+            // description disagreed with would send a coordinator into a 400.
+            maxItems: MAX_AMENDMENT_STEPS,
+            description: `The new steps to append, at most ${MAX_AMENDMENT_STEPS}. More work than that is a new plan, and a new plan is a new proposal (propose_workflow).`,
+            items: {
+              type: "object",
+              properties: {
+                stepKey: {
+                  type: "string",
+                  description:
+                    "Unique key for this step within the run. It must not collide with a step the run already has.",
+                },
+                title: {
+                  type: "string",
+                  description:
+                    "One line of plain text; it is quoted into the approval row the human reads, so control and bidi characters are refused.",
+                },
+                brief: {
+                  type: "string",
+                  description: "The instructions for the agent that runs it.",
+                },
+                role: { type: "string" },
+                laneKey: { type: "string" },
+                priority: { type: "string", enum: ["low", "medium", "high"] },
+                harnessKey: { type: "string" },
+                gate: { type: "string", enum: ["gate", "merge"] },
+                handoffTo: { type: "string" },
+                onFail: {
+                  type: "string",
+                  enum: [...WORKFLOW_AMENDMENT_ON_FAIL],
+                  description:
+                    "The only failure policy MUON implements: a failed step escalates to a human gate and pauses.",
+                },
+              },
+              required: ["stepKey", "title", "brief"],
+              // The closed field list is the ADR-0045 D4 boundary; anything
+              // else is a 400 at the route rather than a silently-dropped key.
+              additionalProperties: false,
+            },
+          },
+          amendedBy: {
+            type: "string",
+            description:
+              "Optional label. It is NOT your identity: the server derives the amending principal from your capability and ignores this.",
+          },
+        },
+        required: ["runId", "steps"],
+        additionalProperties: false,
+      },
+      handler: async (args) => {
+        const runId = String(args.runId ?? "").trim();
+        if (!runId) {
+          return fail("runId is required");
+        }
+        // Validated against the PROTOCOL schema, not a restatement of it: the
+        // closed step-field list, the title's dangerous-character rule and the
+        // appended-loop budget ceiling all live there and are re-checked at the
+        // route anyway. A local copy would be a second definition that drifts.
+        const parsed = workflowAmendmentSchema.safeParse({ steps: args.steps });
+        if (!parsed.success) {
+          const issue = parsed.error.issues[0];
+          return fail(
+            `amendment refused before sending: ${
+              issue ? `${issue.path.join(".") || "steps"}: ${issue.message}` : "invalid steps"
+            }`
+          );
+        }
+        try {
+          const { amendment, gateTag } = await client.proposeWorkflowAmendment(
+            runId,
+            {
+              amendment: parsed.data,
+              amendedBy:
+                (args.amendedBy as string | undefined)?.trim() ||
+                "muon-orchestrator",
+            },
+            workflowControl
+          );
+          return ok(
+            {
+              amendmentId: amendment?.id ?? null,
+              status: "proposed",
+              gateTag,
+              runId,
+              steps: parsed.data.steps.map((step) => step.stepKey),
+              note: "PROPOSED ONLY — the run is unchanged. A human approves this gate tag to append these steps; applying is a separate act you do not hold. Report it as proposed, never as added.",
+            },
+            {
+              humanDecisionRequired: true,
+              evidence: {
+                bounded: true,
+                limit: MAX_AMENDMENT_STEPS,
+                included: parsed.data.steps.length,
+                omitted: 0,
+                kind: "proposed appended steps",
+              },
+              nextActions: [
+                `Tell the human an amendment gate is waiting: ${gateTag}.`,
+                "Keep working the plan as it stands; the appended steps do not exist until the human approves.",
+              ],
+            }
+          );
+        } catch (error) {
+          // ADR-0045's own typed refusals (workflow.not_amendable and friends)
+          // reach here on the wire. Forwarded as the refusal they are — a
+          // coordinator told "this run's status cannot gain a step, and here is
+          // its actual status" stops; one told "400 Bad Request" retries.
+          const refusal = refusalOf(error);
+          if (refusal) {
+            return failWithRefusal(refusal, "amendment refused");
+          }
+          return fail(
+            `amendment refused: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+      },
+    },
+    {
       name: "workflow_status",
       description: "A workflow run's steps with each step task's status.",
       inputSchema: {
@@ -1594,7 +2042,7 @@ export function createOrchestratorToolDefinitions(
     {
       name: "ship",
       description:
-        "File the merge gate for a task (the final human checkpoint). The task cannot reach done until the human approves it, this tool never ships by itself.",
+        "File the merge gate for a task (the final human checkpoint). The task cannot reach done until the human approves it, this tool never ships by itself. PREFLIGHT: this session must have run review_diff for THIS taskId, and that review must not have come back review-blind — otherwise ship refuses and names the exact call to make. The preflight is NOT the gate: MUON's server-side review certification at approval time remains the authority, and passing here proves only that you looked, not that the change is certified. A fresh MCP session must re-run review_diff before it may ship; 'someone reviewed it once' is not evidence that you did.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1604,17 +2052,191 @@ export function createOrchestratorToolDefinitions(
         required: ["taskId", "summary"],
       },
       handler: async (args) => {
+        const taskId = String(args.taskId ?? "").trim();
+        if (!taskId) {
+          return fail("taskId is required");
+        }
+        // A4 — LOOK BEFORE YOU FILE. Keyed by task and nothing else: a review
+        // of this session's own tree must never satisfy a ship of a sibling
+        // task, so there is deliberately no fallback key here.
+        const review = scope.reviewLedger?.get(reviewDiffKey({ taskId }));
+        if (!review) {
+          // THE GATE DOES NOT MOVE. What moves is what the refusal SAYS.
+          //
+          // On an install whose `muon-mcp` has no reachable `gitnexus` CLI,
+          // `review_diff` itself refuses, so no review can ever be recorded and
+          // this branch is the ONLY one reachable — permanently. Naming
+          // `review_diff` as the next action there is an order the agent cannot
+          // carry out, so it retries, refuses, retries: the loop `whoami`'s
+          // code-graph note was added to prevent, reproduced inside the one
+          // refusal that hands out a command.
+          //
+          // Same rule, same closed gate, an honest next action — and it is a
+          // HUMAN's, not this session's. MUON's operator surfaces resolve the
+          // code graph SEPARATELY from this MCP process (the desktop has its own
+          // resolver and its own candidate paths), so a merge this session can
+          // never certify may still be reviewable and decidable there.
+          const codeGraph = resolveCodeGraph();
+          if (!codeGraph.available) {
+            return failWithRefusal(
+              buildRefusal({
+                rule: "ship.review_unavailable",
+                summary:
+                  "Can't file the merge gate — review_diff cannot run on this install, so no review evidence for that task can exist. There is no call you can make from here that fixes this.",
+                surface: "mcp ship preflight",
+                evidence: [
+                  {
+                    label: "reason",
+                    value: `no gitnexus CLI is reachable, so review_diff refuses (${codeGraph.reason})`,
+                  },
+                ],
+                // `operator`, not `command`: nothing in this session's tier
+                // resolves this, and a command it cannot run is worse than an
+                // honest hand-off.
+                nextAction: {
+                  kind: "operator",
+                  action:
+                    "take this merge on a MUON operator surface (the Desktop approvals inbox, the TUI, or `muon approve`), where MUON's own server-side review certification runs and states its own remedy — or restore the code graph for this session (install GitNexus, or point MUON at one with MUON_GITNEXUS_BIN) and restart it, then review_diff and ship",
+                },
+              }),
+              "ship refused"
+            );
+          }
+          return failWithRefusal(
+            buildRefusal({
+              rule: "ship.review_unavailable",
+              summary:
+                "Can't file the merge gate — this session has no review evidence for that task.",
+              surface: "mcp ship preflight",
+              evidence: [
+                {
+                  label: "reason",
+                  value: "no review_diff has been run for this taskId in this MCP session",
+                },
+              ],
+              nextAction: {
+                kind: "command",
+                command: `review_diff({ taskId: "${taskId}" })`,
+                action: "run the review for this exact task, then ship again",
+              },
+            }),
+            "ship refused"
+          );
+        }
+        if (review.verdict === "no-op") {
+          // A vacuous review satisfies nothing: an empty-diff verdict recorded
+          // BEFORE the worker wrote anything is the easiest way to wear a
+          // review this session never performed. Work that later appeared must
+          // be reviewed as it now exists.
+          return failWithRefusal(
+            buildRefusal({
+              // Same rule as "never reviewed": an empty-diff verdict recorded
+              // before the work existed leaves the ACTUAL work unreviewed, so
+              // review evidence for it is unavailable — not a new rule class.
+              rule: "ship.review_unavailable",
+              summary:
+                "Can't file the merge gate — the recorded review for that task saw an EMPTY diff (verdict no-op). If work exists now, it has never been reviewed.",
+              surface: "mcp ship preflight",
+              evidence: [
+                { label: "verdict", value: review.verdict },
+                {
+                  label: "reviewedAt",
+                  value: new Date(review.at).toISOString(),
+                },
+              ],
+              nextAction: {
+                kind: "command",
+                command: `review_diff({ taskId: "${taskId}" })`,
+                action:
+                  "re-run the review now that the tree has content, then ship again",
+              },
+            }),
+            "ship refused"
+          );
+        }
+        if (review.verdict === "review-blind") {
+          return failWithRefusal(
+            buildRefusal({
+              rule: "ship.review_blind",
+              summary:
+                "Can't file the merge gate — the review for that task came back REVIEW BLIND, so '0 affected flows' is not a pass.",
+              surface: "mcp ship preflight",
+              // COUNTS, not paths. `ship.review_blind` publishes the file LIST
+              // to the operator only, on purpose — a blind-file list is a
+              // workspace path set. The agent already holds its own list in
+              // review_diff's own `recovery` payload; this refusal does not
+              // widen that.
+              evidence: [
+                { label: "verdict", value: review.verdict },
+                { label: "blindFiles", value: review.blindFiles.length },
+              ],
+              nextAction: {
+                kind: "command",
+                command: "gitnexus analyze --index-only",
+                action:
+                  "re-index so the blind files enter the graph, then re-run review_diff for this task",
+              },
+            }),
+            "ship refused",
+            // A6: the SAME three lawful ways out review_diff already printed,
+            // from one source, so the two surfaces cannot advise differently
+            // about one state. None of them is "file the merge anyway".
+            blindRecoveryActions(taskId)
+          );
+        }
         const approval = await client.requestApproval({
-          taskId: String(args.taskId ?? ""),
+          taskId,
           requestedBy: "muon-orchestrator",
           kind: "merge",
           reason: `ship review requested by the super-agent: ${String(args.summary ?? "").slice(0, 300)}`,
+          // The review this ship is standing on, recorded WITH the gate so a
+          // human (and the server-side certification) can compare it against a
+          // fresh run rather than take the summary's word for it.
+          evidence: {
+            action: "merge",
+            scope: `task ${taskId}`,
+            riskLevel: "unknown",
+            impactIfApproved:
+              "Merges this task's worktree into the primary checkout after the human's decision.",
+            details: {
+              reviewDiffId: review.id,
+              reviewVerdict: review.verdict,
+              reviewedAt: new Date(review.at).toISOString(),
+              // ADR-0065: the reviewer's structured citations ride the gate
+              // evidence, so the human (and the server-side certification)
+              // sees what the review leaned on. Provenance, never authority.
+              ...((review.citedNoteIds?.length ?? 0) > 0
+                ? // JSON-encoded, not comma-joined (review finding: an id
+                  // may itself contain a comma, making ["a,b"] and ["a","b"]
+                  // indistinguishable downstream). details is
+                  // Record<string,string>, so the array travels as its own
+                  // unambiguous encoding.
+                  { citedNoteIds: JSON.stringify(review.citedNoteIds) }
+                : {}),
+              preflight:
+                "mcp ship preflight only; server-side review certification at approval time is the authority",
+            },
+          },
         });
-        return ok({
-          filed: true,
-          approvalId: approval.id,
-          note: "waiting on the human's ship review",
-        });
+        return ok(
+          {
+            filed: true,
+            approvalId: approval.id,
+            reviewDiffId: review.id,
+            reviewVerdict: review.verdict,
+            note: "waiting on the human's ship review",
+          },
+          {
+            humanDecisionRequired: true,
+            nextActions: [
+              "Tell the human a merge gate is waiting in the MUON inbox; poll check_approval.",
+              // Said out loud so a passed preflight is never reported as a
+              // certification. MUON re-derives coverage at decision time and
+              // can still refuse the merge there.
+              "Report this as 'reviewed, gate filed' — not as 'certified'. MUON re-checks review coverage when the human decides, and can still block.",
+            ],
+          }
+        );
       },
     },
     {

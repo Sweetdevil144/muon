@@ -647,7 +647,13 @@ describe("Changes panel — each 'cannot land' state gets its own sentence", () 
       gateBlockReason:
         "Can't ship — REVIEW BLIND: 1/2 changed file(s) are not in the graph. Re-index or review the blind files, then approve.",
     });
-    noButton();
+    // H2 changed this ONE refusal's shape on purpose. Every other case in this
+    // suite means there is nothing to land, so no control belongs on screen.
+    // This case means there IS landable work and MUON is WITHHOLDING it, which
+    // an absent button states badly — the operator reads it as "wrong tab" and
+    // goes looking. The control stays, disabled, wearing its reason.
+    const button = screen.getByRole("button", { name: "Land this work" });
+    expect(button.hasAttribute("disabled")).toBe(true);
     expect(screen.getByText(/REVIEW BLIND/)).toBeTruthy();
     expect(screen.getByText(/Re-index or review the blind files/i)).toBeTruthy();
   });

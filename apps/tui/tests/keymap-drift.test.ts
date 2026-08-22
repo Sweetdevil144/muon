@@ -284,6 +284,9 @@ describe("THE HARDER DRIFT-LOCK: an advertised key must CHANGE something", () =>
     ["|", "split-pane"],
     ["o", "focus-other-pane"],
     ["a", "open-composer"],
+    ["k", "open-tasks"],
+    ["r", "open-workflows"],
+    ["e", "open-context"],
   ])("ctrl+b %s (%s) changes the frame", (key, _action) => {
     const desk = makeDesk();
     desk.render();
@@ -331,6 +334,9 @@ describe("THE HARDER DRIFT-LOCK: an advertised key must CHANGE something", () =>
       "focus-right-pane",
       "open-composer",
       "answer-gate",
+      "open-tasks",
+      "open-workflows",
+      "open-context",
     ]);
     for (const entry of KEYMAP.filter((row) => row.scope === "prefix")) {
       expect(

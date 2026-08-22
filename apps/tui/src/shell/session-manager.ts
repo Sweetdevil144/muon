@@ -79,6 +79,116 @@ export class SessionManager {
     this.onChange = listener;
   }
 
+  /**
+   * ADR-0087 M15 — spawn an EXPLICIT command (the take-over path: the
+   * vendor's own resume argv, in the JOB'S worktree). Same refusal
+   * contract, same cap, same env sanitization as `open`; the pane is
+   * ungoverned exactly like every human-opened terminal (D5) — taking a
+   * session over is precisely the human assuming the keyboard.
+   */
+  openCustom(spec: {
+    /** Narrow by TYPE (review finding: an arbitrary-command escape hatch
+     *  bypasses the vendor allowlist) — take-over is this door's ONLY
+     *  lawful caller, and a new launch source widens this union in review. */
+    kind: "take-over";
+    file: string;
+    args: string[];
+    cwd: string;
+    labelBase: string;
+  }): ManagedTab | SpawnRefusal {
+    // ONE lifecycle (review finding: a copied cap/spawn/subscribe path
+    // diverges silently): this method only names the spec; `spawnTab` is
+    // the same code `open` runs.
+    return this.spawnTab({
+      kind: spec.kind,
+      file: spec.file,
+      args: spec.args,
+      cwd: spec.cwd,
+      envKind: "vendor",
+      labelBase: spec.labelBase,
+    });
+  }
+
+  /**
+   * THE one spawn lifecycle: cap, ordinal + label, PTY construction with a
+   * readable refusal, tab registration, focus rule, and the F8 exit
+   * subscription. `open` (kind-table) and `openCustom` (explicit command)
+   * both end here, so lifecycle changes cannot diverge between them.
+   */
+  private spawnTab(input: {
+    kind: string;
+    file: string;
+    args: readonly string[];
+    cwd: string;
+    envKind: "shell" | "vendor";
+    /** Present → `<base> <ordinal>` labels; absent → the kind table's label. */
+    labelBase?: string;
+    parentId?: string;
+  }): ManagedTab | SpawnRefusal {
+    if (this.tabs.length >= MAX_LIVE_SESSIONS) {
+      return {
+        reason: `${MAX_LIVE_SESSIONS} terminals are already open — close one first`,
+      };
+    }
+    const ordinal = nextTerminalOrdinal(this.tabs, input.kind);
+    const label =
+      input.labelBase !== undefined
+        ? `${input.labelBase}${ordinal > 1 ? ` ${ordinal}` : ""}`
+        : terminalTabLabel(input.kind, ordinal);
+    const { cols, rows } = this.geometry();
+    const id = `${input.kind}-${ordinal}`;
+    let session: PtySession;
+    try {
+      session = new PtySession({
+        id,
+        title: label,
+        command: input.file,
+        args: [...input.args],
+        cwd: input.cwd,
+        envKind: input.envKind,
+        // D5: every pane a HUMAN opens here is ungoverned — MUON did not
+        // dispatch it and does not observe it.
+        ungoverned: true,
+        cols,
+        rows,
+      });
+    } catch (error) {
+      // node-pty throws SYNCHRONOUSLY when a binary cannot be spawned. The
+      // contract of this method is a readable refusal, never a throw.
+      return {
+        reason: `could not start '${input.file}': ${
+          error instanceof Error ? error.message.split("\n")[0] : String(error)
+        }`,
+      };
+    }
+    const tab: ManagedTab = {
+      id,
+      kind: input.kind,
+      ordinal,
+      label,
+      session,
+      ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
+    };
+    this.tabs = [...this.tabs, tab];
+    // A SPLIT does not steal the tab focus: the human asked for a second
+    // pane beside what they were doing, not to be moved somewhere else.
+    if (input.parentId === undefined) this.activeId = id;
+    session.subscribe(() => {
+      const exit = session.exit;
+      if (exit) {
+        // F8 through the SHARED rule: a fast failure keeps the tab
+        // readable, a real session's end closes it.
+        const close = shouldCloseTerminalTabOnExit({
+          lifetimeMs: exit.runtimeMs,
+        });
+        if (close) this.close(id);
+      }
+      this.onChange?.();
+    });
+    this.onChange?.();
+    return tab;
+  }
+
   /** Spawn a kind, or refuse with a reason a human can read. Never throws. */
   open(kind: string, options?: { parentId?: string }): ManagedTab | SpawnRefusal {
     const command = commandForKind(kind);
@@ -100,71 +210,17 @@ export class SessionManager {
     ) {
       return { reason: "the pane this split belonged to is gone" };
     }
-    if (this.tabs.length >= MAX_LIVE_SESSIONS) {
-      return {
-        reason: `${MAX_LIVE_SESSIONS} terminals are already open — close one first`,
-      };
-    }
-    const ordinal = nextTerminalOrdinal(this.tabs, kind);
-    const label = terminalTabLabel(kind, ordinal);
-    const { cols, rows } = this.geometry();
-    const id = `${kind}-${ordinal}`;
-    let session: PtySession;
-    try {
-      session = new PtySession({
-        id,
-        title: label,
-        command: command.file,
-        args: command.args,
-        cwd: process.cwd(),
-        // A login shell keeps the user's ambient GitHub authority; a vendor
-        // CLI does not. MUON's own tokens are stripped for BOTH inside the
-        // session (the shared sanitizer).
-        envKind: kind === SHELL_TERMINAL_KIND ? "shell" : "vendor",
-        // D5: every pane a HUMAN opens here is ungoverned — MUON did not
-        // dispatch it and does not observe it. Governed lane panes arrive as a
-        // separate feature with a separate constructor path, not a flag flip.
-        ungoverned: true,
-        cols,
-        rows,
-      });
-    } catch (error) {
-      // node-pty throws SYNCHRONOUSLY when a binary cannot be spawned. The
-      // contract of this method is a readable refusal, never a throw that
-      // rides up into the input dispatcher and kills the whole preview.
-      return {
-        reason: `could not start '${command.file}': ${
-          error instanceof Error ? error.message.split("\n")[0] : String(error)
-        }`,
-      };
-    }
-    const tab: ManagedTab = {
-      id,
+    // A login shell keeps the user's ambient GitHub authority; a vendor
+    // CLI does not. MUON's own tokens are stripped for BOTH inside the
+    // session (the shared sanitizer).
+    return this.spawnTab({
       kind,
-      ordinal,
-      label,
-      session,
+      file: command.file,
+      args: command.args,
+      cwd: process.cwd(),
+      envKind: kind === SHELL_TERMINAL_KIND ? "shell" : "vendor",
       ...(options?.parentId === undefined ? {} : { parentId: options.parentId }),
-    };
-    this.tabs = [...this.tabs, tab];
-    // A SPLIT does not steal the tab focus: the human asked for a second pane
-    // beside what they were doing, not to be moved somewhere else.
-    if (options?.parentId === undefined) this.activeId = id;
-
-    session.subscribe(() => {
-      const exit = session.exit;
-      if (exit) {
-        // F8 through the SHARED rule: a fast failure keeps the tab readable,
-        // a real session's end closes it.
-        const close = shouldCloseTerminalTabOnExit({
-          lifetimeMs: exit.runtimeMs,
-        });
-        if (close) this.close(id);
-      }
-      this.onChange?.();
     });
-    this.onChange?.();
-    return tab;
   }
 
   close(id: string): void {

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -132,26 +132,42 @@ describe.skipIf(!hasGit)("GitNexus HEAD watching against real git", () => {
     expect(supervisor.getWatchedPathCount()).toBe(0);
   }, 60_000);
 
-  it("watches a LINKED WORKTREE (`.git` is a FILE) and sees its commits", async () => {
+  it("a LINKED WORKTREE (`.git` is a FILE) indexes the PRIMARY checkout, and its commits still wake us", async () => {
+    // ADR-0054 — this used to assert `analyzed[0] === tree`, i.e. MUON built a
+    // SECOND `.gitnexus/` store inside a full copy of the repository. No brain
+    // tool ever queries that store (they resolve the indexed repo, which is the
+    // primary), so the cost of a real index run bought nothing while the store
+    // every tool DOES query stayed stale. Every governed run happens in such a
+    // worktree, so this was not an edge case.
     const repo = makeRepo();
     const tree = mkdtempSync(join(tmpdir(), "gnx-worktree-"));
     rmSync(tree, { recursive: true, force: true }); // `worktree add` wants it gone
     trash.push(tree);
     git(repo, "worktree", "add", "-b", "wt", tree);
+    // git answers with realpaths (`/private/var/…` on macOS), and the fence
+    // derives the primary from git's own `--git-common-dir`.
+    const primary = realpathSync(repo);
 
     const { supervisor, analyzed, finish } = watchedSupervisor();
     supervisor.bind(tree);
     try {
       expect(await waitFor(() => analyzed.length >= 1)).toBe(true);
-      expect(analyzed[0]).toBe(tree); // indexed at the worktree root
+      expect(analyzed[0]).toBe(primary);
+      expect(analyzed[0]).not.toBe(tree);
+      // Watching still works for the `.git`-is-a-FILE layout: this is the
+      // pointer-file + commondir path, which is how MUON's own agents commit.
       expect(supervisor.getWatchedPathCount()).toBeGreaterThan(0);
       finish();
 
+      // A commit made INSIDE the worktree still wakes the supervisor: the branch
+      // ref it moves (`refs/heads/wt`) lives in the shared common dir, which the
+      // primary's watch plan covers.
       const before = analyzed.length;
       writeFileSync(join(tree, "w.txt"), "from the worktree");
       git(tree, "add", ".");
       git(tree, "commit", "-m", "worktree commit");
       expect(await waitFor(() => analyzed.length > before)).toBe(true);
+      expect(analyzed.every((target) => target === primary)).toBe(true);
     } finally {
       supervisor.stop();
     }

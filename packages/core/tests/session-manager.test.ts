@@ -1216,6 +1216,190 @@ describe("startManagedSession policy seam (P0.4)", () => {
     });
   });
 
+  // ── ADR-0056: the durable grade rides BEHIND the run-scoped one ────────────
+
+  it("grant hit: allow with a visible approval.auto(source: grant), no approval row", async () => {
+    const redeemGrant = vi.fn(async () => ({
+      grantId: "grant-1",
+      expiresAt: new Date(Date.now() + 7 * 24 * 3_600_000).toISOString(),
+    }));
+    const { events, ledger, decision, statuses } = await runSeam({
+      policy: false,
+      workspacePath: "/ws",
+      jobId: "job-1",
+      toolName: "Read",
+      toolInput: { file_path: "src/a.ts" },
+      ledgerOverrides: { redeemGrant },
+    });
+
+    expect(decision.behavior).toBe("allow");
+    expect(ledger.calls.requestApproval).toEqual([]);
+    expect(statuses).not.toContain("waiting_approval");
+    expect(redeemGrant).toHaveBeenCalledTimes(1);
+    expect(redeemGrant.mock.calls[0]![0]).toMatchObject({
+      taskId: "task-1",
+      jobId: "job-1",
+      sessionId: "session-1",
+      workspacePath: "/ws",
+      toolName: "Read",
+      resolvedTarget: "src/a.ts",
+    });
+    const auto = events.find((event) => event.kind === "approval.auto");
+    expect(auto!.metadata).toMatchObject({
+      source: "grant",
+      grantId: "grant-1",
+    });
+  });
+
+  it("the narrower receipt is spent FIRST — a hit never burns the durable grant", async () => {
+    const redeemReceipt = vi.fn(async () => ({
+      receiptId: "rcpt-1",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+    const redeemGrant = vi.fn(async () => ({
+      grantId: "grant-1",
+      expiresAt: new Date(Date.now() + 7 * 24 * 3_600_000).toISOString(),
+    }));
+    const { events } = await runSeam({
+      policy: false,
+      workspacePath: "/ws",
+      jobId: "job-1",
+      toolName: "Read",
+      toolInput: { file_path: "src/a.ts" },
+      ledgerOverrides: { redeemReceipt, redeemGrant },
+    });
+
+    expect(redeemReceipt).toHaveBeenCalledTimes(1);
+    expect(redeemGrant).not.toHaveBeenCalled();
+    const auto = events.find((event) => event.kind === "approval.auto");
+    expect(auto!.metadata.source).toBe("receipt");
+  });
+
+  it("a receipt miss falls through to the grant", async () => {
+    const redeemReceipt = vi.fn(async () => null);
+    const redeemGrant = vi.fn(async () => ({
+      grantId: "grant-1",
+      expiresAt: new Date(Date.now() + 7 * 24 * 3_600_000).toISOString(),
+    }));
+    const { ledger, decision } = await runSeam({
+      policy: false,
+      workspacePath: "/ws",
+      jobId: "job-1",
+      toolName: "Read",
+      toolInput: { file_path: "src/a.ts" },
+      ledgerOverrides: { redeemReceipt, redeemGrant },
+    });
+
+    expect(redeemReceipt).toHaveBeenCalledTimes(1);
+    expect(redeemGrant).toHaveBeenCalledTimes(1);
+    expect(decision.behavior).toBe("allow");
+    expect(ledger.calls.requestApproval).toEqual([]);
+  });
+
+  it("a grant miss gates exactly as today", async () => {
+    const redeemGrant = vi.fn(async () => null);
+    const { ledger, decision, events } = await runSeam({
+      policy: false,
+      workspacePath: "/ws",
+      jobId: "job-1",
+      toolName: "Read",
+      toolInput: { file_path: "src/a.ts" },
+      ledgerOverrides: { redeemGrant },
+    });
+
+    expect(redeemGrant).toHaveBeenCalledTimes(1);
+    expect(decision.behavior).toBe("allow"); // via the human approval path
+    expect(ledger.calls.requestApproval.length).toBe(1);
+    expect(events.some((event) => event.kind === "approval.auto")).toBe(false);
+  });
+
+  it("a throwing grant transport degrades to the gate, never to allow", async () => {
+    const redeemGrant = vi.fn(async () => {
+      throw new Error("brain unreachable");
+    });
+    const { ledger, decision, events } = await runSeam({
+      policy: false,
+      workspacePath: "/ws",
+      jobId: "job-1",
+      toolName: "Read",
+      toolInput: { file_path: "src/a.ts" },
+      ledgerOverrides: { redeemGrant },
+    });
+
+    expect(ledger.calls.requestApproval.length).toBe(1);
+    expect(events.some((event) => event.kind === "approval.auto")).toBe(false);
+    expect(decision.behavior).toBe("allow"); // via the human approval path
+  });
+
+  it("no workspacePath ⇒ grants are never consulted", async () => {
+    const redeemGrant = vi.fn(async () => ({
+      grantId: "grant-1",
+      expiresAt: new Date(Date.now() + 7 * 24 * 3_600_000).toISOString(),
+    }));
+    const { ledger } = await runSeam({
+      policy: false,
+      workspacePath: undefined,
+      jobId: "job-1",
+      toolName: "Read",
+      toolInput: { file_path: "src/a.ts" },
+      ledgerOverrides: { redeemGrant },
+    });
+
+    expect(redeemGrant).not.toHaveBeenCalled();
+    expect(ledger.calls.requestApproval.length).toBe(1);
+  });
+
+  it("an unclassifiable Bash never reaches the grant path", async () => {
+    const redeemGrant = vi.fn(async () => ({
+      grantId: "grant-1",
+      expiresAt: new Date(Date.now() + 7 * 24 * 3_600_000).toISOString(),
+    }));
+    const { ledger } = await runSeam({
+      policy: false,
+      workspacePath: "/ws",
+      jobId: "job-1",
+      checkCommands: ["npm test"],
+      toolName: "Bash",
+      toolInput: { command: "git push --force origin main" },
+      ledgerOverrides: { redeemGrant },
+    });
+
+    expect(redeemGrant).not.toHaveBeenCalled();
+    expect(ledger.calls.requestApproval.length).toBe(1);
+  });
+
+  it("a network tool never reaches the grant path", async () => {
+    const redeemGrant = vi.fn(async () => ({
+      grantId: "grant-1",
+      expiresAt: new Date(Date.now() + 7 * 24 * 3_600_000).toISOString(),
+    }));
+    const { ledger } = await runSeam({
+      policy: false,
+      workspacePath: "/ws",
+      jobId: "job-1",
+      toolName: "WebFetch",
+      toolInput: { url: "https://example.com" },
+      ledgerOverrides: { redeemGrant },
+    });
+
+    expect(redeemGrant).not.toHaveBeenCalled();
+    expect(ledger.calls.requestApproval.length).toBe(1);
+  });
+
+  it("a ledger with no redeemGrant is byte-identical to today", async () => {
+    const { ledger, decision, events } = await runSeam({
+      policy: false,
+      workspacePath: "/ws",
+      jobId: "job-1",
+      toolName: "Read",
+      toolInput: { file_path: "src/a.ts" },
+    });
+
+    expect(ledger.calls.requestApproval.length).toBe(1);
+    expect(events.some((event) => event.kind === "approval.auto")).toBe(false);
+    expect(decision.behavior).toBe("allow"); // via the human approval path
+  });
+
   it("a broken profile at simulation time degrades to the gate, never to deny", async () => {
     const { ledger, decision, events } = await runSeam({
       breakProfile: true,

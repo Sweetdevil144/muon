@@ -236,6 +236,29 @@ describe("formatCoordinationLines (pure)", () => {
     expect(text).toContain("refs: src/pay/refund.ts");
   });
 
+  it("ADR-0086 D2: cited ids render the shared classifier's provenance sentences; a verdict-less page renders plain citations", () => {
+    const cited = {
+      ...message,
+      refs: { ...message.refs, noteIds: ["mem-off", "mem-rel"] },
+    };
+    const audited = formatCoordinationLines(snapshot, [cited], [
+      {
+        messageId: cited.id,
+        citations: [
+          { noteId: "mem-off", offered: true },
+          { noteId: "mem-rel", offered: false },
+        ],
+      },
+    ]).join("\n");
+    expect(audited).toContain("mem-off — cited, offered to this job");
+    expect(audited).toContain("mem-rel — cited, never offered — relay");
+
+    const quiet = formatCoordinationLines(snapshot, [cited]).join("\n");
+    expect(quiet).toContain("mem-off — cited");
+    expect(quiet).not.toContain("offered to this job");
+    expect(quiet).not.toContain("relay");
+  });
+
   it("strips ANSI, CR and control characters out of untrusted peer text", () => {
     // The protocol only LENGTH-bounds a body, a subject, a ref and a claim
     // path, so all four can carry terminal control sequences — enough to

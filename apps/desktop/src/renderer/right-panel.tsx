@@ -1,5 +1,14 @@
-import { useState, type ReactNode } from "react";
-import type { GitHubPullRequestAction, GitHubReview } from "@muon/client";
+import {
+  ForkMissionSection,
+  type ForkMissionProps,
+} from "./fork-mission-section.js";
+import { useEffect, useState, type ReactNode } from "react";
+import type {
+  ApprovalRequest,
+  GitHubPullRequestAction,
+  GitHubReview,
+  ReviewCoverageCertification,
+} from "@muon/client";
 import type { WorkspaceReview } from "../shared/ipc.js";
 import {
   FileChangeBadge,
@@ -202,6 +211,17 @@ export type ShipReadiness =
       action?: string;
       /** The block is transient — evidence is still arriving, not missing. */
       awaiting?: boolean;
+      /**
+       * H2 — the block is on the EVIDENCE, not on the shape of the target.
+       *
+       * Every other refusal here means there is nothing to land (no tree, no
+       * task, still running), so no button belongs on screen. This one means
+       * there IS landable work and MUON is refusing it, which is a different
+       * sentence: the control stays visible and DISABLED, so the operator sees
+       * the thing they came for being withheld and reads why, instead of
+       * hunting for a button that silently vanished.
+       */
+      gated?: boolean;
     };
 
 const REASON_MAX = 300;
@@ -302,7 +322,7 @@ export function shipReadiness(input: {
     };
   }
   if (typeof target.gateBlockReason === "string") {
-    return { can: false, sentence: target.gateBlockReason };
+    return { can: false, gated: true, sentence: target.gateBlockReason };
   }
 
   const totals = review.fileStats.reduce(
@@ -443,12 +463,27 @@ function ShipSection(props: {
         </>
       ) : readiness.can ? null : (
         <>
+          {/* H2: an evidence block keeps the control on screen, disabled, so
+              the refusal is attached to the thing being refused. */}
+          {readiness.gated ? (
+            <button
+              type="button"
+              className="settings-save"
+              disabled
+              title={readiness.sentence}
+            >
+              Land this work
+            </button>
+          ) : null}
           <p
             className={
-              readiness.awaiting
-                ? "right-panel-empty loading-line"
-                : "right-panel-empty"
+              readiness.gated
+                ? "right-panel-callout degraded ship-gate-block"
+                : readiness.awaiting
+                  ? "right-panel-empty loading-line"
+                  : "right-panel-empty"
             }
+            role={readiness.gated ? "alert" : undefined}
           >
             {readiness.sentence}
           </p>
@@ -489,10 +524,454 @@ function ShipSection(props: {
   );
 }
 
+// ─── DECIDE THE GATE WHERE THE DIFF IS (ROADMAP H3) ─────────────────────────
+//
+// Filing the merge gate already lives here ("Land this work", above). Deciding
+// it did not: the operator had to leave the diff, find the approval card in the
+// Control rail, and open a modal — on the same screen where they had just read
+// every changed line. So a certified merge sat pending because the decision
+// surface was somewhere else.
+//
+// This section moves UI OWNERSHIP, not authority. It loads the certification
+// through the SAME `reviewApproval` leg the dialog uses, and decides through
+// the SAME `onResolveApproval` every other surface calls — which still runs the
+// fail-closed desktop ship gate before it sends, and whose PATCH the backend
+// still re-derives certification for. Nothing here can approve a merge the
+// dialog would have refused.
+//
+// ONE THING STAYS MODAL ON PURPOSE: the REVIEW BLIND manual attestation. That
+// flow makes the human personally assert they read files the graph could not
+// see, and a second implementation of it is a second place for that assertion
+// to drift. The dock shows the block and routes to the dialog that owns it.
+
+export type DockMergeProps = {
+  /**
+   * The PENDING `kind:"merge"` approval bound to the task whose tree is shown,
+   * or null when this task has no open merge gate (the section then renders
+   * nothing — "Land this work" above is the affordance at that point).
+   */
+  approval: ApprovalRequest | null;
+  /**
+   * The same certification read the modal performs. `undefined` = a preload
+   * older than the review surface; the section then says exactly that and
+   * offers no approval, matching the dialog rather than failing open.
+   */
+  loadCertification?: (
+    approvalId: string
+  ) => Promise<ReviewCoverageCertification>;
+  /** The ONE governed decision path, shared with the rail, dialog and TUI. */
+  onResolve: (
+    approvalId: string,
+    status: "approved" | "rejected"
+  ) => void | Promise<void>;
+  /** Opens the existing ApprovalReviewDialog — the only attestation surface. */
+  onOpenEvidence: (approvalId: string) => void;
+  /** Standing consent is deciding this gate: evidence only, no click site. */
+  autoApproving?: boolean;
+};
+
+function MergeSection(props: { merge: DockMergeProps }) {
+  const approval = props.merge.approval;
+  const approvalId = approval?.id ?? null;
+  const load = props.merge.loadCertification;
+  const [certification, setCertification] =
+    useState<ReviewCoverageCertification | null>(null);
+  const [loading, setLoading] = useState(Boolean(approvalId && load));
+  const [loadError, setLoadError] = useState<string | null>(
+    approvalId && !load
+      ? "Merge review is unavailable. Restart MUON and retry; if it persists, update the app before approving."
+      : null
+  );
+  const [reload, setReload] = useState(0);
+  const [deciding, setDeciding] = useState<"approved" | "rejected" | null>(
+    null
+  );
+  const [refusal, setRefusal] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!approvalId || !load) return;
+    let active = true;
+    setLoading(true);
+    setLoadError(null);
+    void load(approvalId)
+      .then((result) => {
+        if (active) setCertification(result);
+      })
+      .catch((error) => {
+        if (!active) return;
+        // A certification that could not be READ is not a certification that
+        // passed. No Approve is offered on this path.
+        setLoadError(
+          error instanceof Error && error.message.trim().length > 0
+            ? error.message
+            : "Could not load merge review evidence."
+        );
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [approvalId, load, reload]);
+
+  if (!approval || !approvalId) return null;
+
+  const reviewBlind =
+    certification?.status === "blocked" &&
+    certification.blockCode === "review-blind";
+  // Fail closed on every unknown: only a POSITIVE `certified` earns Approve.
+  const approvable =
+    !loading && loadError === null && certification?.status === "certified";
+  const blockSentence = loading
+    ? "Checking this exact worktree against GitNexus before a merge can be approved."
+    : (loadError ??
+      (reviewBlind
+        ? "REVIEW BLIND: changed files are unindexed or the index is stale, so 0 affected flows is not a pass. Review every blind file and attest in the evidence dialog."
+        : certification?.status === "blocked"
+          ? certification.reason
+          : certification
+            ? null
+            : "Merge review evidence is not available yet."));
+
+  const decide = (status: "approved" | "rejected") => {
+    if (deciding) return;
+    setDeciding(status);
+    setRefusal(null);
+    void (async () => {
+      try {
+        await props.merge.onResolve(approvalId, status);
+      } catch (error) {
+        // The desktop ship gate's own refusal sentence arrives here (app.tsx
+        // throws `mergeShipBlockReason`), as does a server-side refusal. Both
+        // are the operator's words for WHY, and both belong on this screen
+        // rather than in a console.
+        setRefusal(
+          error instanceof Error && error.message.trim().length > 0
+            ? error.message
+            : "The decision was refused, and no reason was returned."
+        );
+      } finally {
+        setDeciding(null);
+      }
+    })();
+  };
+
+  return (
+    <section className="right-panel-section merge-section">
+      <header>
+        <strong>Decide the merge gate</strong>
+        <span>operator decision</span>
+      </header>
+      <p className="right-panel-bound">{approval.reason}</p>
+      <p className="right-panel-bound">
+        Filed by {approval.requestedBy} · gate <code>{approvalId}</code>
+      </p>
+
+      <div className="merge-certification" aria-live="polite">
+        {loading ? (
+          <p className="right-panel-empty loading-line">{blockSentence}</p>
+        ) : certification?.status === "certified" ? (
+          <p className="settings-saved">
+            Certified · {certification.verdict} ·{" "}
+            {plural(certification.changedFiles.length, "changed file")} covered
+            by the graph.
+          </p>
+        ) : blockSentence ? (
+          <div className="right-panel-callout degraded">
+            <strong>Not certified — approval is withheld</strong>
+            <p>{blockSentence}</p>
+            {certification?.status === "blocked" &&
+            (certification.blindFiles?.length ?? 0) > 0 ? (
+              <p className="right-panel-bound">
+                {plural(certification.blindFiles!.length, "blind file")}, e.g.{" "}
+                <code>{certification.blindFiles![0]}</code>
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+
+      {props.merge.autoApproving ? (
+        // Standing consent already owns this gate through the governed path. A
+        // second click site here would be a second consent path, which is
+        // exactly what this codebase must not grow.
+        <p className="right-panel-bound">
+          Full Auto is granting this gate as you, and recording it. Nothing to
+          decide here.
+        </p>
+      ) : (
+        <div className="merge-actions">
+          {approvable ? (
+            <button
+              type="button"
+              className="settings-save"
+              data-merge-action="approve"
+              disabled={deciding !== null}
+              onClick={() => decide("approved")}
+            >
+              {deciding === "approved" ? "Approving…" : "Approve merge"}
+            </button>
+          ) : null}
+          {/* Denying is NEVER blocked by missing evidence — a human who cannot
+              verify the work must always be one click from refusing it. */}
+          <button
+            type="button"
+            className="ghost-btn"
+            data-merge-action="reject"
+            disabled={deciding !== null}
+            onClick={() => decide("rejected")}
+          >
+            {deciding === "rejected" ? "Rejecting…" : "Reject merge"}
+          </button>
+          {!approvable ? (
+            <button
+              type="button"
+              className="ghost-btn"
+              data-merge-action="evidence"
+              onClick={() => props.merge.onOpenEvidence(approvalId)}
+            >
+              {reviewBlind ? "Review blind files & attest" : "Open evidence"}
+            </button>
+          ) : null}
+          {loadError ? (
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={() => setReload((count) => count + 1)}
+            >
+              Retry
+            </button>
+          ) : null}
+        </div>
+      )}
+
+      {refusal ? (
+        <div className="right-panel-callout" role="alert">
+          <strong>Not decided</strong>
+          <p>{refusal}</p>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+// ─── CONTINUE THE MISSION ON ANOTHER LANE (ROADMAP H12) ─────────────────────
+//
+// Handing a live mission from one lane to another was a five-step manual
+// ritual: read the wrap packet, copy its goal and its next-lane request into a
+// new brief, remember the packet id, pick the other vendor, dispatch. Every
+// step was a chance to lose the thread — and the step people actually dropped
+// was the citation, which is the one that makes the successor's report
+// checkable.
+//
+// This is that ritual as ONE button per ready lane. What it is NOT:
+//
+//   * not a new authority — it files an ORDINARY dispatch through the same
+//     route as any other, so role ceilings, budgets, claims and the chat
+//     partition are exactly what they were before the click;
+//   * not a new approval — nothing is gated here that was not gated before,
+//     and nothing that was gated becomes ungated;
+//   * not a new brief format — `buildContinuationDispatch` (@muon/client) is
+//     the ONE composer, and it lives in the shared client so a second surface
+//     adopts it rather than writing a second brief. Measured 2026-08-17: this
+//     desk is its only caller today (no TUI palette; A12's MCP shape is the
+//     `dispatch` tool + `sourcePacketId`, fenced by the backend's citation
+//     guard). Say "shared by construction", not "shared by every surface".
+//
+// The refusals are the honest half. This panel does not pre-judge: it asks on
+// the press and renders the composer's OWN sentence, so "there is no typed wrap
+// packet to seed from" and "that lane is not dispatch-ready" reach the operator
+// in the same words the CLI would use.
+
+export type ContinueOnLaneOutcome =
+  | { ok: true; jobId: string; packetId: string; vendor: string }
+  | { ok: false; reason: string };
+
+export type ContinueOnLaneProps = {
+  /** The mission task the dock is reviewing; null → nothing to continue. */
+  taskId: string | null;
+  /**
+   * Lane that produced the work. Excluded from the buttons: continuing on the
+   * same lane is a re-run, not a hand-off, and the desk already has re-run.
+   */
+  currentVendor: string | null;
+  /**
+   * Dispatch-ready EXECUTION lanes, derived by the caller from the state
+   * snapshot's capability preflight — never a hard-coded pair here.
+   */
+  vendors: ReadonlyArray<string>;
+  /** Human label for a lane key (the registry's, passed in by the caller). */
+  laneLabel: (vendor: string) => string;
+  /** Human-speakable slug for a job id (the ONE projection, `sessionSlug`). */
+  slugOf: (jobId: string) => string;
+  /**
+   * True when the readiness probe could not answer. The lanes are still
+   * offered — MUON re-checks on the press and the dispatch route is the real
+   * authority — but the strip says so rather than implying a green check.
+   */
+  readinessUnknown?: boolean;
+  onContinue: (vendor: string) => Promise<ContinueOnLaneOutcome>;
+};
+
+type ContinueLaneState =
+  | { phase: "idle" }
+  | { phase: "dispatching" }
+  | { phase: "refused"; reason: string }
+  | { phase: "continued"; jobId: string; packetId: string };
+
+function ContinueOnLaneSection(props: { continueOnLane: ContinueOnLaneProps }) {
+  const spec = props.continueOnLane;
+  const [lanes, setLanes] = useState<Record<string, ContinueLaneState>>({});
+  const targets = spec.vendors.filter(
+    (vendor) => vendor !== spec.currentVendor
+  );
+
+  if (!spec.taskId) {
+    return null;
+  }
+
+  const stateFor = (vendor: string): ContinueLaneState =>
+    lanes[vendor] ?? { phase: "idle" };
+
+  const run = (vendor: string) => {
+    setLanes((current) => ({ ...current, [vendor]: { phase: "dispatching" } }));
+    void (async () => {
+      try {
+        const outcome = await spec.onContinue(vendor);
+        setLanes((current) => ({
+          ...current,
+          [vendor]: outcome.ok
+            ? {
+                phase: "continued",
+                jobId: outcome.jobId,
+                packetId: outcome.packetId,
+              }
+            : // VERBATIM: the composer's words, not a desk paraphrase.
+              { phase: "refused", reason: outcome.reason },
+        }));
+      } catch (error) {
+        setLanes((current) => ({
+          ...current,
+          [vendor]: {
+            phase: "refused",
+            reason:
+              error instanceof Error && error.message.trim().length > 0
+                ? error.message
+                : "The continuation was refused, and no reason was returned.",
+          },
+        }));
+      }
+    })();
+  };
+
+  return (
+    <section className="right-panel-section continue-lane-section">
+      <header>
+        <strong>Continue on another lane</strong>
+        <span>this mission&apos;s next turn</span>
+      </header>
+      {/* HONEST FRAMING, corrected in adversarial review (2026-08-17).
+          This used to read "an ordinary dispatch … no wider budget", which was
+          false: naming the chat (which the packet-citation guard REQUIRES) files
+          the successor as this mission's chat root, so it gets the standard root
+          turn budget and the mission's normal delegation allowance. That is the
+          same shape every turn here already has — not a new tier, not a raised
+          ceiling, no approval filed — and the copy now says exactly that
+          instead of implying the successor is a plain worker. */}
+      <p className="changes-honesty">
+        Files this mission&apos;s next turn on another lane, seeded from its
+        newest typed wrap packet and made to cite that packet. The successor is
+        this mission&apos;s coordinator turn, with the same standard turn budget
+        and delegation allowance every turn here already gets — no approval is
+        filed and no ceiling is raised. MUON runs one turn at a time, so a live
+        turn must finish or be interrupted first.
+      </p>
+      {targets.length === 0 ? (
+        <p className="right-panel-empty">
+          {spec.currentVendor
+            ? `No other execution lane reported as dispatch-ready, so ${spec.laneLabel(spec.currentVendor)} is the only seat MUON can see for this mission. Check the lanes in Settings — a lane MUON could not probe reads the same as one that is missing.`
+            : "No execution lane reported as dispatch-ready. Check the lanes in Settings, then continue this mission on one."}
+        </p>
+      ) : (
+        <div className="merge-actions continue-lane-actions">
+          {targets.map((vendor) => {
+            const state = stateFor(vendor);
+            if (state.phase === "continued") {
+              return null;
+            }
+            return (
+              <button
+                key={vendor}
+                type="button"
+                className="settings-save"
+                data-continue-lane={vendor}
+                disabled={
+                  state.phase === "dispatching" || state.phase === "refused"
+                }
+                title={state.phase === "refused" ? state.reason : undefined}
+                onClick={() => run(vendor)}
+              >
+                {state.phase === "dispatching"
+                  ? `Continuing on ${spec.laneLabel(vendor)}…`
+                  : `Continue on ${spec.laneLabel(vendor)}`}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {spec.readinessUnknown ? (
+        <p className="right-panel-bound">
+          Lane readiness could not be checked just now, so these lanes are
+          listed from the registry. MUON re-checks when you press.
+        </p>
+      ) : null}
+      <div aria-live="polite" className="continue-lane-outcome">
+        {targets.map((vendor) => {
+          const state = stateFor(vendor);
+          if (state.phase === "continued") {
+            return (
+              <p className="settings-saved" key={vendor}>
+                {spec.laneLabel(vendor)} continued as{" "}
+                <strong>{spec.slugOf(state.jobId)}</strong> (
+                <code>{state.jobId}</code>) citing packet{" "}
+                <code>{state.packetId}</code>.
+              </p>
+            );
+          }
+          if (state.phase === "refused") {
+            return (
+              <div className="right-panel-callout" role="alert" key={vendor}>
+                <strong>Not continued on {spec.laneLabel(vendor)}</strong>
+                <p>{state.reason}</p>
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  data-continue-lane-retry={vendor}
+                  onClick={() =>
+                    setLanes((current) => ({
+                      ...current,
+                      [vendor]: { phase: "idle" },
+                    }))
+                  }
+                >
+                  Try again
+                </button>
+              </div>
+            );
+          }
+          return null;
+        })}
+      </div>
+    </section>
+  );
+}
+
 function ChangesPanel(props: {
   loading: boolean;
   review: WorkspaceReview | null;
   ship?: ShipPanelProps;
+  merge?: DockMergeProps;
 }) {
   return (
     <div className="right-panel-scroll">
@@ -501,6 +980,15 @@ function ChangesPanel(props: {
           ship={props.ship}
           review={props.review}
           loading={props.loading}
+        />
+      ) : null}
+      {props.merge ? (
+        // Keyed by gate: a different approval is a different certification, and
+        // a remount is the only way its load/decide state can never be
+        // inherited from the gate before it.
+        <MergeSection
+          key={props.merge.approval?.id ?? "no-merge-gate"}
+          merge={props.merge}
         />
       ) : null}
       <WorkspaceReviewState loading={props.loading} review={props.review}>
@@ -815,6 +1303,30 @@ export function RightPanel(props: {
    * action, never a dead button.
    */
   ship?: ShipPanelProps;
+  /**
+   * H3 — deciding the governed merge gate from the dock that reviewed it. Omit
+   * and the Changes tab renders exactly as before: filing a gate here, deciding
+   * it in the rail's dialog.
+   */
+  merge?: DockMergeProps;
+  /**
+   * H1 — the bound review thread's digest, rendered ABOVE everything else in
+   * the Review tab. It leads because it is the only thing on this screen that
+   * answers "what do I actually have to look at this time"; the full inbox
+   * below it is the archaeology it exists to replace.
+   */
+  reviewDigest?: ReactNode;
+  /**
+   * H12 — one-gesture continue-on-lane for the mission this dock is reviewing.
+   * Omitted (or with no task) renders nothing, never a dead button.
+   */
+  continueOnLane?: ContinueOnLaneProps;
+  /**
+   * ADR-0044/0071 — fork a NEW mission from the settled step this dock is
+   * reviewing. Omitted (no settled job on screen) renders nothing, never a
+   * dead button.
+   */
+  forkMission?: ForkMissionProps;
   reviewContent: ReactNode;
   reviewLocked?: boolean;
   githubConnected?: boolean;
@@ -897,9 +1409,29 @@ export function RightPanel(props: {
             loading={Boolean(props.loading)}
             review={props.workspaceReview}
             ship={props.ship}
+            merge={props.merge}
           />
         ) : (
           <div className="right-panel-review">
+            {props.reviewDigest}
+            {props.continueOnLane ? (
+              // Keyed by MISSION: a different task is a different continuation,
+              // and a remount is the only way "continued as quiet-heron citing
+              // packet h-1" can never be inherited by the mission after it.
+              <ContinueOnLaneSection
+                key={props.continueOnLane.taskId ?? "no-mission-task"}
+                continueOnLane={props.continueOnLane}
+              />
+            ) : null}
+            {props.forkMission ? (
+              // Keyed by SOURCE STEP: a different settled job is a different
+              // fork, and a remount is the only way "forked into mission X"
+              // can never be inherited by the step after it.
+              <ForkMissionSection
+                key={props.forkMission.sourceJobId}
+                forkMission={props.forkMission}
+              />
+            ) : null}
             <GitHubReviewCard
               key={props.githubPublicationKey}
               connected={props.githubConnected}

@@ -19,6 +19,24 @@ import {
 
 export const FLEET_VENDORS = fleetVendorIds();
 
+/**
+ * The GLOBAL standing-consent predicate: true only when EVERY managed lane is
+ * selected. THE one spelling (P0-1): main-process consumers (the
+ * standing-approver lease, MUON_FULL_AUTO, schedule canClaim) and renderer
+ * chrome (the Auto-approve panel) must agree on what "machine-wide" means, and
+ * two predicates over the same list is how a subset got rendered as "every
+ * lane". Lives here rather than settings.ts because settings.ts imports
+ * node:fs and the renderer may not.
+ */
+export function isGlobalStandingConsent(
+  vendors: readonly string[]
+): boolean {
+  return (
+    FLEET_VENDORS.length > 0 &&
+    FLEET_VENDORS.every((id) => vendors.includes(id))
+  );
+}
+
 export type FleetVendor = VendorId;
 
 export const FLEET_VENDOR_LABELS: Record<string, string> = Object.fromEntries(

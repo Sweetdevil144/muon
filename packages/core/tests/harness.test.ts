@@ -8,6 +8,7 @@ import {
   applyHarnessToProfile,
   assertHarnessRequirements,
   mergeHarnessOverlay,
+  DEFAULT_HARNESSES,
 } from "../src/harness.js";
 
 describe("mergeHarnessOverlay", () => {
@@ -137,5 +138,39 @@ describe("assertHarnessRequirements", () => {
         worktree: false,
       })
     ).toThrow(/interactive/);
+  });
+});
+
+/**
+ * WAVE 1B — the `solo` posture. Everything else in the library is
+ * worker-shaped (a dispatched child in a worktree); nothing described the case
+ * measured as most common and most expensive: one operator, one module, one
+ * instruction. These pin the two properties that make it a POSTURE rather
+ * than a permission change.
+ */
+describe("the solo harness", () => {
+  const solo = DEFAULT_HARNESSES.find((h) => h.key === "solo");
+  const implement = DEFAULT_HARNESSES.find((h) => h.key === "implement");
+
+  it("is seeded, so the runner accepts the key", () => {
+    expect(solo, "solo harness is seeded").toBeTruthy();
+    expect(solo!.name).toBe("Solo");
+  });
+
+  it("does NOT loosen governance — same permission posture as implement", () => {
+    expect(solo!.config.profileOverlay).toEqual(implement!.config.profileOverlay);
+    // The preflight pair is still mandatory: a solo edit is governed no more
+    // loosely than a dispatched one.
+    expect(solo!.config.requires?.tools).toContain("preflight_edit");
+    expect(solo!.config.requires?.tools).toContain("memory_preedit");
+  });
+
+  it("changes SCOPE: no worktree, and no repo-wide check", () => {
+    expect(solo!.config.requires?.worktree).toBe(false);
+    // implement's repo-wide `npm test` is the wrong (and slowest) success
+    // signal for a one-function edit; an empty list falls through to the
+    // derived per-package checks.
+    expect(solo!.config.checks ?? []).toHaveLength(0);
+    expect(implement!.config.requires?.worktree).toBe(true);
   });
 });

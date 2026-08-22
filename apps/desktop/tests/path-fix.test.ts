@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { withDefaultPaths } from "../src/lib/path-fix.js";
+import { npmGlobalBinDir, withDefaultPaths } from "../src/lib/path-fix.js";
 
 // The Finder-launch PATH repair. Small, but it is the difference between the
 // vendor tab bar working from a dock launch and every spawn dying with
@@ -28,5 +28,48 @@ describe("withDefaultPaths", () => {
     );
     expect(merged.split(":").filter((d) => d === "/opt/homebrew/bin")).toHaveLength(1);
     expect(merged.split(":")).toContain("/Users/dev/custom");
+  });
+});
+
+/**
+ * Founder acceptance bug (2026-08-20): codex installed via `npm i -g` under a
+ * mise-managed node lives in a per-version bin dir no static default can name
+ * — the Finder-launched app reported "Codex CLI not found" for a codex every
+ * terminal could run. The fix derives npm's global bin dir from npm itself.
+ */
+describe("npmGlobalBinDir", () => {
+  it("derives <prefix>/bin from npm's documented root layout", () => {
+    expect(
+      npmGlobalBinDir(
+        "/Users/dev/.local/share/mise/installs/node/lts/lib/node_modules"
+      )
+    ).toBe("/Users/dev/.local/share/mise/installs/node/lts/bin");
+    expect(npmGlobalBinDir("/opt/homebrew/lib/node_modules/")).toBe(
+      "/opt/homebrew/bin"
+    );
+  });
+
+  it("returns null rather than guessing for any other layout", () => {
+    expect(npmGlobalBinDir(null)).toBeNull();
+    expect(npmGlobalBinDir("")).toBeNull();
+    // Windows-style prefix (no lib/) — never guessed at.
+    expect(npmGlobalBinDir("C:/npm/node_modules")).toBeNull();
+  });
+});
+
+describe("withDefaultPaths extra dirs", () => {
+  it("places extras after the defaults, deduplicated", () => {
+    const merged = withDefaultPaths("/usr/bin", "/Users/dev", [
+      "/Users/dev/.local/share/mise/installs/node/lts/bin",
+      "/opt/homebrew/bin", // duplicate of a default
+    ]).split(":");
+    expect(merged).toContain(
+      "/Users/dev/.local/share/mise/installs/node/lts/bin"
+    );
+    expect(
+      merged.filter((entry) => entry === "/opt/homebrew/bin")
+    ).toHaveLength(1);
+    // Defaults still lead.
+    expect(merged[0]).toBe("/opt/homebrew/bin");
   });
 });

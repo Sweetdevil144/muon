@@ -254,6 +254,53 @@ export function registerPolicyCommand(
       }
     });
 
+  // ADR-0056: the `always` grade lives in its own listing rather than being
+  // folded into `receipts`, because the two answer different questions — a
+  // receipt is spendable by ONE run, a grant by an entire chat until it lapses.
+  // Showing them in one list would make "single-run" a lie on half the rows.
+  policy
+    .command("grants")
+    .description(
+      "List live durable approval grants (the `always` grade: one exact action, one chat, expiring and revocable)"
+    )
+    .option("--workspace <path>", "limit to one governed workspace")
+    .option("--task-id <id>", "limit to one chat")
+    .option("--json", "print grants as JSON")
+    .action(
+      async (options: { workspace?: string; taskId?: string; json?: boolean }) => {
+        try {
+          if (!createClient) {
+            throw new Error("policy grants needs a brain connection");
+          }
+          const grants = await createClient().listApprovalGrants({
+            activeOnly: true,
+            workspacePath: options.workspace,
+            taskId: options.taskId,
+          });
+
+          if (options.json) {
+            printJson({ grants });
+            return;
+          }
+          if (grants.length === 0) {
+            process.stdout.write(
+              "No live grants. A grant exists only after you choose \"always\" on an approval.\n"
+            );
+            return;
+          }
+          const lines = grants.map(
+            (grant) =>
+              `- ${grant.id} | ${grant.toolName} (${grant.actionClass}) | ${grant.resolvedTarget ?? "no target"} | digest ${grant.payloadDigest.slice(0, 12)}… | chat ${grant.taskId} | ${grant.workspacePath} | expires ${grant.expiresAt} | used ${grant.useCount}x`
+          );
+          process.stdout.write(
+            `${grants.length} live grant${grants.length === 1 ? "" : "s"} (one exact action, one chat, expiring):\n${lines.join("\n")}\n`
+          );
+        } catch (error) {
+          failCommand(error, "Failed to list grants.");
+        }
+      }
+    );
+
   policy
     .command("set")
     .description(
@@ -338,20 +385,40 @@ export function registerPolicyCommand(
   policy
     .command("revoke")
     .description(
-      "Revoke a live approval receipt (the human's kill switch; one-way, idempotent)."
+      "Revoke a live approval receipt or durable grant (the human's kill switch; one-way, idempotent)."
     )
-    .requiredOption("--receipt-id <id>", "the receipt to revoke")
-    .action(async (options: { receiptId: string }) => {
+    .option("--receipt-id <id>", "the receipt to revoke")
+    .option("--grant-id <id>", "the durable grant to revoke (ADR-0056)")
+    .action(async (options: { receiptId?: string; grantId?: string }) => {
       try {
         if (!createClient) {
           throw new Error("policy revoke needs a brain connection");
         }
-        const receipt = await createClient().revokeReceipt(options.receiptId);
+        // Exactly one target, named explicitly. Neither is a default: guessing
+        // which authority a human meant to kill is the one thing a kill switch
+        // must never do.
+        if (Boolean(options.receiptId) === Boolean(options.grantId)) {
+          throw new Error(
+            "Name exactly one target: --receipt-id <id> (a single-run receipt) or --grant-id <id> (a durable grant)."
+          );
+        }
+        if (options.grantId) {
+          const grant = await createClient().revokeApprovalGrant(
+            options.grantId
+          );
+          process.stdout.write(
+            `✓ revoked grant ${grant.id} (${grant.toolName}); it can no longer be redeemed.\n`
+          );
+          return;
+        }
+        const receipt = await createClient().revokeReceipt(
+          options.receiptId as string
+        );
         process.stdout.write(
           `✓ revoked receipt ${receipt.id} (${receipt.toolName}); it can no longer be redeemed.\n`
         );
       } catch (error) {
-        failCommand(error, "Failed to revoke the receipt.");
+        failCommand(error, "Failed to revoke.");
       }
     });
 }

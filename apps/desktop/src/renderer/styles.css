@@ -8,12 +8,12 @@
        the ~340 existing references recolor without a selector hunt. ── */
   --bauhaus-paper:  #141414;   /* app background (the void behind panels) */
   --bauhaus-ink:    #E8E8E8;   /* high-contrast foreground: text, marks, strokes */
-  --bauhaus-blue:   #82AAFF;   /* soft Anysphere-adjacent blue for focus/selection */
+  --bauhaus-blue:   #82AAFF;   /* soft blue for focus/selection */
   --bauhaus-red:    #E5544B;   /* subtle danger */
   --bauhaus-yellow: #D8A23A;   /* subtle warn (amber) */
   --bauhaus-white:  #181818;   /* panel face over the background */
 
-  /* ── surfaces: Anysphere-dark adjacent (near-black + soft blue accent) ── */
+  /* ── surfaces: near-black ground + soft blue accent ── */
   --bg:              #141414;
   --panel:           #181818;
   --panel-2:         #222222;   /* raised surface: hover, nested, active */
@@ -42,13 +42,28 @@
   /* ── text ramp: light-on-dark ── */
   --text-primary:   #E8E8E8;
   --text-secondary: #9B9B9B;
-  --text-tertiary:  #6E6E6E;
-  --text-dim:       #565656;
+  --text-tertiary:  #828282;   /* 4.62:1 on --panel — AA for body text */
+  --text-dim:       #686868;   /* 3.19:1 — AA-large; de-emphasis, never content */
   --text-on-ink:    #E8E8E8;
   --text-on-ink-2:  rgba(232,232,232,0.72);
   --text-on-ink-3:  rgba(232,232,232,0.60);
+
+  /* ── console surfaces ─────────────────────────────────────────────────────
+     A terminal and a job log stay dark in BOTH themes — they are read as
+     consoles, not as app chrome. Their foreground therefore must NOT flip with
+     the theme: pairing --text-on-ink-* (which becomes near-black in light) with
+     a permanently black ground rendered dark text on black. Defined once, on
+     purpose, and never redefined in .desk-light. */
+  --console-bg:         #000;
+  --console-rule:       rgba(255,255,255,0.08);
+  --console-edge:       rgba(255,255,255,0.25);
+  --console-edge-lit:   rgba(255,255,255,0.45);
+  --on-console:         #E8E8E8;
+  --on-console-2:       rgba(232,232,232,0.72);
+  --on-console-3:       rgba(232,232,232,0.60);
   --ghost-numeral:  rgba(255,255,255,0.06);
   --hover:  rgba(255,255,255,0.05);
+  --text-bright: #FFFFFF;   /* hover emphasis ABOVE --text-primary */
   --active: var(--accent-weak);
 
   /* ── accent: soft blue for focus/selection/links (quiet chrome stays neutral) ── */
@@ -66,6 +81,12 @@
   --status-ready:   #3FB37F;   --status-ready-weak:  rgba(63,179,127,0.14);
   --status-warn:    #D8A23A;   --status-warn-weak:   rgba(216,162,58,0.16);
   --status-danger:  #E5544B;   --status-danger-weak: rgba(229,84,75,0.16);
+  --status-warn-border:   rgba(216,162,58,0.38);
+  --status-danger-border: rgba(229,84,75,0.35);
+  --scrim:           rgba(17,17,15,0.55);
+  --scrollbar-thumb: rgba(255,255,255,0.10);
+  --scrollbar-thumb-hover: rgba(242,239,230,0.18);
+  --ink-hover:       #FFFFFF;
   --success: var(--status-ready);  --yellow: var(--status-warn);  --red: var(--status-danger);
   --bauhaus-red-fill: #E5544B;
 
@@ -108,6 +129,22 @@
   --shadow-lg:     var(--shadow-hard-lg);
   --shadow-raised: var(--shadow-hard-sm);
   --shadow-hero:   var(--shadow-hard-md);
+
+  /* ── topology figure/ground ───────────────────────────────────────────────
+     The chart is the one surface where the card must read as a FIGURE on a
+     GROUND, and the two themes cannot get there the same way: on a dark ground
+     a card separates by its shadow, on a light one the shadow is nearly free of
+     contrast, so light has to invert the relationship (tinted stage, white
+     cards) and lean on the border instead. These tokens exist so that choice
+     lives in the theme block rather than in the topology rules. */
+  --topo-ground:      var(--bg);
+  --topo-wash:        rgba(130, 170, 255, 0.05);
+  --topo-node:        var(--panel);
+  --topo-node-hub:    var(--panel-2);
+  --topo-node-hover:  var(--panel-2);
+  --topo-node-border: var(--border);
+  --topo-line:        var(--border-strong);
+  --topo-line-soft:   var(--border);
 
   /* ── motion: Quiet UI — fade/slide/dock only, ≤220ms, no bounce ── */
   --dur-fast: 120ms;
@@ -215,12 +252,12 @@ textarea:focus-visible {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.10);
+  background: var(--scrollbar-thumb);
   border-radius: var(--radius-sm);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(242, 239, 230, 0.18);
+  background: var(--scrollbar-thumb-hover);
 }
 
 ::-webkit-scrollbar-track {
@@ -245,13 +282,17 @@ textarea:focus-visible {
 .app {
   display: grid;
   grid-template-columns: 248px minmax(0, 1fr) 320px;
-  /* Caps the single implicit row at the viewport height (the frame has no
-     other row tracks) so `.app > * { min-height: 0 }` below can actually take
-     effect — without this the row sizes to its tallest child's CONTENT height
-     instead of the viewport, and every "overflow-y: auto" panel inside (e.g.
-     `.sidebar-scroll`) silently has nothing to scroll within (#7). */
+  /* Caps the single implicit row at the FRAME height (html/body/#root are
+     height 100%) so .app children can take min-height 0 — without this the
+     row sizes to its tallest child's CONTENT height instead of the window,
+     and every overflow-y auto panel inside (e.g. .sidebar-scroll) silently
+     has nothing to scroll within (#7). 100% not 100vh: 100vh can outgrow
+     #root in Electron and then body overflow hidden clips the sidebar with
+     no inner scrollport. */
   grid-template-rows: minmax(0, 1fr);
-  height: 100vh;
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
   padding-top: var(--titlebar-h);
 }
 
@@ -373,6 +414,8 @@ textarea:focus-visible {
      animates to 0, so it must be able to shrink BELOW its content's natural
      min-content width instead of forcing the track wider than --sidebar-w. */
   min-width: 0;
+  min-height: 0;
+  height: 100%;
 }
 .app.quiet > .center {
   grid-column: 2;
@@ -390,42 +433,45 @@ textarea:focus-visible {
   min-height: 0;
 }
 
-/* The view nav, folded into the top of the single sidebar — sticky so Setup
-   / workspaces scroll never pushes Mission/Crew icons out of view. */
-.sidebar-scroll > .left-nav {
-  position: sticky;
-  top: 0;
-  z-index: 2;
+/* View nav in the sidebar chrome. Content-sized (flex: 0 0 auto) so a short
+   window cannot shrink-and-clip Timeline/Graph/Settings behind overflow:hidden
+   — the chrome is the Y-scrollport. */
+.sidebar-chrome > .left-nav {
+  flex: 0 0 auto;
+  min-height: 0;
   padding: 0 0 6px;
-  border-bottom: 1px solid var(--border-subtle);
-  margin-bottom: 8px;
+  border-right: none;
+  overflow: visible;
   background: var(--surface-panel, var(--panel));
 }
-.sidebar-scroll > .left-nav .left-nav-fleet {
-  display: none; /* the fleet summary lives in the crew modal now, not the nav */
+.sidebar-chrome > .left-nav .left-nav-spacer {
+  display: none; /* spacer only made sense in a full-height separate rail */
+}
+.sidebar-chrome > .left-nav .left-nav-fleet {
+  display: none; /* the fleet summary lives in the crew workspace now, not the nav */
 }
 
-/* Crew workspace (center tab) */
+/* Crew workspace (center tab) — same flex+scroll contract as Settings/Control,
+   so the fleet is reachable instead of clipped by the panel shell. */
 .crew-workspace {
-  padding: var(--s4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+  min-height: 0;
+  flex: 1;
   overflow: auto;
-  height: 100%;
+  padding: var(--s5) var(--s6, var(--s5));
   /* A readable measure: full-bleed config forms read as sprawl on a wide
-     window. The column caps and centres; nothing inside changes. */
-  max-width: 60rem;
-  margin: 0 auto;
+     window. Slightly wider than Settings so the two-column meter + fleet
+     rows have room without becoming a dashboard wall. */
+  max-width: 72rem;
+  margin-inline: auto;
   width: 100%;
 }
-.crew-workspace-head {
-  display: grid;
-  gap: 4px;
-  margin-bottom: var(--s4);
+.workspace-panel-shell > .crew-workspace {
+  min-height: 0;
+  flex: 1;
 }
-.crew-workspace-head > strong {
-  font: var(--text-title);
-  color: var(--text-primary);
-}
-.crew-workspace-head > span,
 .crew-section-head > span {
   font: var(--text-meta);
   color: var(--text-tertiary);
@@ -441,8 +487,8 @@ textarea:focus-visible {
 }
 .crew-orchestrator,
 .crew-lanes {
-  margin-bottom: var(--s5);
-  padding: var(--s3);
+  margin-bottom: 0;
+  padding: var(--s4);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   background: var(--surface-canvas);
@@ -537,10 +583,6 @@ textarea:focus-visible {
   gap: var(--s3);
   min-height: 24px;
 }
-.crew-workspace-title > strong {
-  font: var(--text-title);
-  color: var(--text-primary);
-}
 
 /* Readiness age. Deliberately quiet — it is context, not an alarm. */
 .crew-freshness {
@@ -584,12 +626,25 @@ textarea:focus-visible {
   flex-wrap: wrap;
   align-items: center;
   gap: var(--s5);
-  margin-bottom: var(--s4);
+  margin-bottom: 0;
   padding: 10px var(--s4);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   background: var(--surface-canvas);
   animation: fade-in var(--dur-fast) var(--ease-out);
+}
+/* Cost meter + cap sit side by side on a wide Crew page; stack on a narrow
+   one. Parent gap (not card margin) is the spacing. */
+.crew-meter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s4);
+  align-items: stretch;
+}
+.crew-meter-grid > .mission-usage,
+.crew-meter-grid > .mission-cap {
+  margin: 0;
+  height: 100%;
 }
 .crew-stat {
   display: flex;
@@ -730,9 +785,9 @@ textarea:focus-visible {
   gap: var(--s3);
   margin-bottom: var(--s2);
   padding: 10px 12px;
-  border: 1px solid rgba(214, 167, 67, 0.38);
+  border: 1px solid var(--status-warn-border);
   border-radius: var(--radius-md);
-  background: rgba(214, 167, 67, 0.08);
+  background: var(--status-warn-weak);
   color: var(--text-secondary);
 }
 .provider-readiness-notice.unverified {
@@ -1025,6 +1080,102 @@ textarea:focus-visible {
   color: var(--text-secondary);
   font: var(--text-meta);
   line-height: 1.5;
+}
+/* H2 — the ship refusal sits at fail rank beside the disabled control it
+   explains, never as grey helper text under a button that just disappeared. */
+.ship-gate-block {
+  margin-top: var(--s2);
+  color: var(--status-warn);
+  font: var(--text-meta);
+  line-height: 1.5;
+}
+/* H3 — decide the governed merge gate from the dock that reviewed the diff. */
+.merge-certification { margin: var(--s2) 0; }
+.merge-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s2);
+  margin-top: var(--s2);
+}
+/* H1 — "since you last looked": the bounded delta, ids as the evidence. */
+.review-digest-headline {
+  margin: 0;
+  color: var(--text-primary);
+  font: var(--text-meta);
+  line-height: 1.5;
+}
+.review-digest-headline.degraded {
+  color: var(--status-warn);
+}
+.review-digest-ids {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s1) var(--s2);
+  margin: var(--s2) 0 0;
+}
+.review-digest-ids > span {
+  color: var(--text-tertiary);
+  font: var(--text-micro);
+}
+.review-digest-ids code {
+  color: var(--text-secondary);
+  font: 11px/1.5 var(--mono);
+}
+/* H12 — one-gesture continue-on-lane. */
+.continue-lane-actions {
+  margin-top: 0;
+}
+.continue-lane-outcome:empty {
+  display: none;
+}
+.continue-lane-outcome > * {
+  margin-top: var(--s2);
+}
+/* ADR-0061 D3 — the Memory page's cold-start card. */
+.memory-coldstart-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  margin-top: var(--s3);
+  padding: var(--s3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  text-align: left;
+  font: var(--text-meta);
+  color: var(--text-secondary);
+}
+.memory-coldstart-card strong {
+  color: var(--text-primary);
+}
+.memory-coldstart-card ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+/* ADR-0044/0071 — fork a new mission from the reviewed settled step. */
+.fork-mission-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  margin: 0 0 var(--s2);
+  color: var(--text-secondary);
+  font: var(--text-meta);
+}
+.fork-mission-field textarea,
+.fork-mission-field input,
+.fork-mission-field select {
+  width: 100%;
+}
+.fork-mission-actions {
+  margin-top: 0;
+}
+.fork-mission-outcome:empty {
+  display: none;
+}
+.fork-mission-outcome > * {
+  margin-top: var(--s2);
 }
 .right-panel-section {
   padding: 0 0 var(--s4);
@@ -1513,7 +1664,7 @@ textarea:focus-visible {
 }
 .systems-status-btn.bad {
   color: var(--status-danger);
-  border-color: rgba(229, 84, 75, 0.35);
+  border-color: var(--status-danger-border);
 }
 .systems-status-btn.warn {
   color: var(--status-warn);
@@ -1694,8 +1845,12 @@ textarea:focus-visible {
   margin-inline: auto;
   width: 100%;
 }
-/* Shared page hero for Settings / Control / Timeline / Memory. */
+/* Shared page hero for Settings / Control / Timeline / Memory / Crew.
+   ONE pattern: every center tab opens with the same title weight and the same
+   bordered one-line subtitle, so no page can drift off the language on its
+   own (the Crew head briefly carried its own copy of these rules). */
 .workspace-page-head,
+.crew-workspace-head,
 .settings-workspace-head {
   display: grid;
   gap: 6px;
@@ -1704,6 +1859,8 @@ textarea:focus-visible {
   border-bottom: 1px solid var(--border-subtle);
 }
 .workspace-page-head > strong,
+.crew-workspace-head > strong,
+.crew-workspace-title > strong,
 .settings-workspace-head > strong {
   font: var(--text-title);
   font-size: 1.35rem;
@@ -1712,6 +1869,7 @@ textarea:focus-visible {
   color: var(--text-primary);
 }
 .workspace-page-head > span,
+.crew-workspace-head > span,
 .settings-workspace-head > span {
   font: var(--text-meta);
   font-size: 13px;
@@ -1819,7 +1977,8 @@ textarea:focus-visible {
 .settings-workspace .settings-form,
 .settings-workspace .github-connect,
 .settings-workspace .updates-panel,
-.settings-workspace .mcp-connections {
+.settings-workspace .mcp-connections,
+.settings-workspace .cli-link-panel {
   margin: 0;
   padding: var(--s3);
   border: 1px solid var(--border-subtle);
@@ -2519,6 +2678,25 @@ textarea:focus-visible {
   border-radius: 50%;
   background: var(--text-tertiary);
 }
+/* H6 — label/value pairs in the session header. The label names the RECORD the
+   value came from, so a path is never mistaken for a branch and a pool is never
+   mistaken for a wall-clock cap. The value clips (title carries the full text)
+   because a worktree path must not be allowed to push the header wide. */
+.session-entry-fact-label {
+  flex: none;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+}
+.session-entry-fact-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: ltr;
+}
+.session-entry-fact:has(.session-entry-fact-value) { max-width: 26rem; }
 .session-entry-fact-ready .session-entry-fact-dot {
   background: var(--status-ready);
 }
@@ -2946,6 +3124,7 @@ textarea:focus-visible {
 .sidebar .full-auto-section,
 .sidebar .mcp-row,
 .sidebar .mcp-connections,
+.sidebar .cli-link-panel,
 .sidebar .crew-panel,
 .app button.newbtn,
 .app .tb-btn,
@@ -3319,7 +3498,7 @@ textarea:focus-visible {
 
 .preset-chip[aria-pressed="true"] {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--ghost-numeral);
   border-color: var(--border);
 }
 
@@ -3443,20 +3622,20 @@ textarea:focus-visible {
   gap: 2px;
   min-height: 0;
   padding: 10px 12px 8px;
-  background: #1a1a1a;
-  border: 1px solid #2e2e2e;
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 14px;
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
+  box-shadow: 0 1px 0 var(--border-subtle) inset;
   transition:
     border-color var(--dur-fast) var(--ease),
     box-shadow var(--dur-fast) var(--ease);
 }
 
 .composer-box:focus-within {
-  border-color: #3d3d3d;
+  border-color: var(--border-strong);
   box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.04) inset,
-    0 0 0 1px rgba(130, 170, 255, 0.12);
+    0 1px 0 var(--border-subtle) inset,
+    0 0 0 1px var(--accent-weak);
 }
 
 .composer textarea {
@@ -3477,7 +3656,7 @@ textarea:focus-visible {
 }
 
 .composer textarea::placeholder {
-  color: #6a6a6a;
+  color: var(--text-tertiary);
 }
 
 .composer textarea:focus,
@@ -3573,8 +3752,8 @@ textarea:focus-visible {
   height: 26px;
   min-width: 26px;
   padding: 0;
-  background: #e8e8e8;
-  color: #111;
+  background: var(--ink);
+  color: var(--bg);
   border: none;
   border-radius: 999px;
   transition:
@@ -3592,14 +3771,14 @@ textarea:focus-visible {
 }
 
 .composer-send:hover:not(:disabled) {
-  background: #fff;
+  background: var(--ink-hover);
 }
 
 .composer-send:disabled {
   opacity: 0.28;
   cursor: default;
-  background: #3a3a3a;
-  color: #9a9a9a;
+  background: var(--border-strong);
+  color: var(--text-secondary);
 }
 
 /* Stop, in the send slot, while a turn runs. Same 26px round target so the
@@ -3830,18 +4009,50 @@ textarea:focus-visible {
 .sidebar {
   display: flex;
   flex-direction: column;
-  overflow: hidden; /* scroll lives on .sidebar-scroll so the aside edge stays clean */
+  min-height: 0;
+  height: 100%;
+  overflow: hidden; /* chrome + session list each own their own overflow */
   position: relative;
   padding: var(--s4) var(--s3);
 }
 
-.sidebar-scroll {
-  flex: 1;
+/* Nav + New chat + auto-approve. Caps so a short window still leaves a
+   session list; chrome is the Y-scrollport for destinations that do not fit. */
+.sidebar-chrome {
+  flex: 0 1 auto;
   min-height: 0;
+  max-height: 62%;
+  overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding-bottom: var(--s2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+@media (max-height: 700px) {
+  .sidebar-chrome {
+    max-height: 75%;
+  }
+  .nav-item {
+    min-height: 28px;
+    padding: 5px var(--s3);
+  }
+}
+
+.sidebar-scroll {
+  flex: 1 1 0%;
+  min-height: 8rem;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: var(--s4);
+  padding-top: var(--s3);
 }
 
 .side-section {
@@ -4164,7 +4375,7 @@ summary.side-heading:hover {
    `vendorRoleScope`). Still a dispatch lane — the tint just marks that its role
    note under the row is load-bearing. */
 .vendor-block.role-scoped {
-  background: rgba(255, 255, 255, 0.018);
+  background: var(--border-subtle);
 }
 .vendor-role-note {
   margin: 2px 0 4px;
@@ -4537,13 +4748,32 @@ summary.side-heading:hover {
 
 /* P0-2 — the GitHub identity gate screen (full-window, pre-app). The card
    reuses the Settings GitHubConnectPanel; enforcement is main-side. */
-.github-gate-screen {
-  display: grid;
+/* The gate screen carries `.app quiet` for the base surface, which also brings
+   `.app.quiet`'s THREE-TRACK grid (`var(--sidebar-w) minmax(0,1fr) var(--dock-w)`).
+   `--sidebar-w` has a 248px default in :root, so that resolved to a real
+   248px first column and `place-items: center` then centred this 30rem card
+   INSIDE it — overflowing ~116px off each side and clipping the card against
+   the window edge. The first screen a new user ever sees was cut in half.
+   Collapsing the frame to one full-width track is the fix; it must out-specify
+   `.app.quiet`, hence the compound selector. */
+.app.github-gate-screen,
+.app.quiet.github-gate-screen {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   place-items: center;
-  min-height: 100vh;
+  /* A short window (or a long card) must scroll rather than crop — the same
+     failure in the other axis. */
+  overflow: auto;
+  padding: var(--s5);
+  padding-top: calc(var(--titlebar-h) + var(--s5));
+  height: 100vh;
 }
 .github-gate-card {
+  width: 100%;
   max-width: 30rem;
+  /* `place-items: center` stretches nothing, but a grid item can still be
+     forced wider than its track by content; this keeps it inside. */
+  justify-self: center;
   padding: var(--s5);
   background: var(--bauhaus-white);
   border: var(--border-hard);
@@ -4560,7 +4790,7 @@ summary.side-heading:hover {
   line-height: 1.45;
 }
 .github-gate-note {
-  color: var(--ink-dim, #666);
+  color: var(--text-tertiary);
   font-size: 0.85rem;
 }
 
@@ -4793,6 +5023,23 @@ summary.side-heading:hover {
   letter-spacing: 0.12em;
 }
 
+/* The one sentence under the code — a claim ("on your clipboard"), not a
+   control. Same quiet meta voice as the note below the panel. */
+.github-device-code-hint {
+  margin: 0;
+  color: var(--text-secondary);
+  font: var(--text-meta);
+  line-height: 1.45;
+}
+
+/* Ghost buttons in the code card sit in one quiet row, never a column of
+   competing actions (founder, 2026-08-19). */
+.github-device-code-actions {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+}
+
 /* A field label is metadata for the control under it, not a heading — same
    idiom as `.crew-field` on the Crew tab. */
 .settings-form label {
@@ -4936,13 +5183,11 @@ summary.side-heading:hover {
    and tints the label/rail --status-danger — unmistakable, but never a solid
    filled block (docs/design/quiet-design-system.md §5 "Status"). */
 
-/* Hoisted out of the collapsed Setup drawer to the top of the sidebar (under
-   NEW CHAT, above the chat list) so a long chat list can never push the
-   auto-approve control off-screen. The bottom rule fences it off from the
-   "Chats" section below. */
+/* Lives in the sidebar chrome (under NEW CHAT, above the session scroller)
+   so a long chat list can never push the auto-approve control off-screen. */
 .full-auto-section {
-  padding-bottom: var(--s3);
-  border-bottom: 1px solid var(--border);
+  padding-bottom: var(--s2);
+  border-bottom: none;
 }
 
 .full-auto-panel {
@@ -4958,73 +5203,47 @@ summary.side-heading:hover {
   transition: background var(--dur-fast) var(--ease),
     border-color var(--dur-fast) var(--ease);
 }
-/* One vendor per row — wrap put Codex+Cursor on one line and looked broken. */
-.full-auto-panel .full-auto-vendor {
-  display: flex;
-  margin: 0;
-  font-weight: 500;
-}
-.full-auto-lanes {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding-left: 2px;
-}
 
 .full-auto-panel.armed {
   background: color-mix(in srgb, var(--status-danger) 8%, var(--panel));
   border-color: color-mix(in srgb, var(--status-danger) 55%, var(--border));
 }
 
-.full-auto-toggle {
+.full-auto-btn {
   display: flex;
   align-items: center;
-  gap: var(--s3);
+  justify-content: center;
+  width: 100%;
+  min-height: 32px;
+  margin: 0;
+  padding: 7px var(--s3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--panel-2);
   font: var(--text-body);
   font-weight: 600;
   color: var(--text-primary);
   cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
 }
 
-.full-auto-panel.armed .full-auto-toggle {
-  color: var(--text-primary);
-}
-.full-auto-panel.armed > .full-auto-toggle:first-of-type {
-  color: var(--status-danger);
+.full-auto-btn:hover {
+  border-color: var(--border-strong);
+  background: var(--hover);
 }
 
-.full-auto-toggle input[type="checkbox"] {
-  appearance: none;
-  -webkit-appearance: none;
-  flex: none;
-  width: 16px;
-  height: 16px;
-  margin: 0;
-  padding: 0;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--panel-2);
-  display: grid;
-  place-content: center;
-  cursor: pointer;
+.full-auto-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
-.full-auto-panel.armed .full-auto-toggle input[type="checkbox"] {
+.full-auto-panel.armed .full-auto-btn {
   border-color: color-mix(in srgb, var(--status-danger) 70%, var(--border));
-}
-
-.full-auto-toggle input[type="checkbox"]:checked {
-  background: var(--status-danger);
-  border-color: var(--status-danger);
-}
-
-.full-auto-toggle input[type="checkbox"]:checked::after {
-  content: "";
-  width: 4px;
-  height: 8px;
-  border: solid #fff;
-  border-width: 0 2px 2px 0;
-  transform: translateY(-1px) rotate(45deg);
+  background: color-mix(in srgb, var(--status-danger) 12%, var(--panel-2));
+  color: var(--status-danger);
 }
 
 .full-auto-panel small,
@@ -5163,6 +5382,41 @@ summary.side-heading:hover {
   border-left: 2px solid var(--status-warn);
 }
 
+/* H15 — a blocked agent's question in the rail's inbox: one line, and a route
+   to the surface that answers it. Shaped like a card so it reads as a peer of
+   the gate above it, but it decides nothing — it is a link. */
+.rail-question-line {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  border: var(--border-hard);
+  border-left: 2px solid var(--status-warn);
+  border-radius: var(--radius-md);
+  background: var(--bauhaus-white);
+  padding: 9px 11px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+.rail-question-line:hover { background: var(--surface-2); }
+.rail-question-line > strong {
+  font: var(--text-heading);
+  color: var(--text-primary);
+}
+.rail-question-line > span:last-child {
+  font: var(--text-meta);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.rail-question-line.unavailable {
+  border-left-color: var(--status-danger);
+  color: var(--status-danger);
+  font: var(--text-meta);
+  cursor: default;
+}
+
 /* P0-1 — the same filed approval under Full Auto: MUON is granting it as the
    operator, so it is INFORMATIONAL (blue), not urgent (yellow). Deliberately
    still a card: the grant is a real governance event, it just is not a debt. */
@@ -5246,7 +5500,7 @@ summary.side-heading:hover {
 }
 
 .inbox-actions button:hover {
-  color: #fff;
+  color: var(--text-bright);
   background: var(--panel-2);
 }
 
@@ -5479,7 +5733,7 @@ summary.side-heading:hover {
 }
 
 .mission-budget-raise:hover:not(:disabled) {
-  color: #fff;
+  color: var(--text-bright);
   background: var(--panel-2);
   border-color: var(--bauhaus-ink);
 }
@@ -5731,7 +5985,7 @@ summary.side-heading:hover {
   align-items: start;
   justify-items: center;
   padding-top: 12vh;
-  background: rgba(17, 17, 15, 0.55);
+  background: var(--scrim);
   backdrop-filter: blur(var(--blur-glass));
   /* entrance keyframes live in the motion budget block below */
 }
@@ -5810,7 +6064,7 @@ summary.side-heading:hover {
   display: grid;
   place-items: center;
   padding: var(--s4);
-  background: rgba(17, 17, 15, 0.55);
+  background: var(--scrim);
   backdrop-filter: blur(var(--blur-glass));
 }
 
@@ -6086,6 +6340,16 @@ summary.side-heading:hover {
    one-shot approve — deliberate, never a default */
 .gate-action.approve-remember {
   background: transparent;
+}
+
+/* ADR-0056 `always`: the heaviest promise on the row (this chat, 7 days), so
+   it reads quietest of the three approves. It also carries the longest label,
+   so it gets room to sit on its own line rather than squeezing the others —
+   .gate-actions already wraps. */
+.gate-action.approve-always {
+  background: transparent;
+  flex: 1 1 180px;
+  min-width: 180px;
 }
 
 .gate-action.reject:hover:not(:disabled) {
@@ -6441,7 +6705,7 @@ summary.side-heading:hover {
   min-height: 0;
   flex: 1;
   overflow: hidden;
-  background: #000;
+  background: var(--console-bg);
   /* NO padding here — it belongs on `.xterm` below. Measured in Chromium:
      with `* { box-sizing: border-box }`, getComputedStyle(parent).width is
      the BORDER-box width, padding included, and the fit addon subtracts only
@@ -6455,7 +6719,7 @@ summary.side-heading:hover {
 .workspace-panel-shell:has(> .terminal-tab) {
   position: relative;
   overflow: hidden;
-  background: #000;
+  background: var(--console-bg);
 }
 .workspace-panel-shell > .terminal-tab {
   position: absolute;
@@ -6537,8 +6801,8 @@ summary.side-heading:hover {
   padding: var(--s2);
   border: var(--border-hard);
   border-radius: var(--radius-sm);
-  background: #000;
-  color: var(--text-on-ink-2);
+  background: var(--console-bg);
+  color: var(--on-console-2);
   font: 400 12px/1.55 var(--mono);
   overflow: auto;
   white-space: pre-wrap;
@@ -6556,8 +6820,8 @@ summary.side-heading:hover {
   padding: var(--s2);
   border: var(--border-hard);
   border-radius: var(--radius-sm);
-  background: #000;
-  color: var(--text-on-ink-2);
+  background: var(--console-bg);
+  color: var(--on-console-2);
   font: 400 12px/1.55 var(--mono);
   overflow: auto;
   display: flex;
@@ -6572,7 +6836,7 @@ summary.side-heading:hover {
 .job-feed-activity,
 .job-feed-activity-line {
   margin: 0;
-  color: var(--text-on-ink-3, rgba(255, 255, 255, 0.62));
+  color: var(--on-console-3);
   overflow-wrap: anywhere;
 }
 .job-feed-activity summary {
@@ -6589,8 +6853,8 @@ summary.side-heading:hover {
 .job-feed-detail {
   margin: 4px 0 4px 14px;
   padding: 6px 8px;
-  border-left: 2px solid rgba(255, 255, 255, 0.25);
-  color: var(--text-on-ink-3, rgba(255, 255, 255, 0.62));
+  border-left: 2px solid var(--console-edge);
+  color: var(--on-console-3);
   font: 400 11px/1.5 var(--mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -6598,11 +6862,11 @@ summary.side-heading:hover {
   overflow: auto;
 }
 .job-feed-detail-result {
-  border-left-color: rgba(255, 255, 255, 0.45);
+  border-left-color: var(--console-edge-lit);
 }
 .job-feed-meta {
   margin: 0;
-  color: var(--text-on-ink-3, rgba(255, 255, 255, 0.5));
+  color: var(--on-console-3);
   font-size: 11px;
   overflow-wrap: anywhere;
 }
@@ -6640,7 +6904,7 @@ summary.side-heading:hover {
 .job-terminal-live-view {
   flex: 1;
   min-height: 0;
-  background: #000;
+  background: var(--console-bg);
   /* U3 — this pane renders a governed child's console at the geometry that
      console was actually produced at (agent-console-grid.ts), which can be
      wider than the panel. Wider must SCROLL, never re-wrap: re-wrapping is
@@ -6687,7 +6951,7 @@ summary.side-heading:hover {
 }
 .agent-config-trigger:hover:not(:disabled) {
   color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--hover);
   border-color: var(--border);
 }
 .agent-config-trigger:disabled {
@@ -6732,8 +6996,8 @@ summary.side-heading:hover {
   width: 248px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: #1c1c1c;
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-hard-xl);
   padding: 6px;
 }
 .agent-config-list {
@@ -7033,7 +7297,7 @@ summary.side-heading:hover {
   align-items: center;
   justify-content: center;
   padding: var(--s4);
-  background: rgba(17, 17, 15, 0.55);
+  background: var(--scrim);
   backdrop-filter: blur(var(--blur-glass));
 }
 
@@ -7805,12 +8069,20 @@ summary.side-heading:hover {
 /* memory workspace */
 
 .memory-workspace {
+  /* Same shell contract as Settings/Control/Crew: the page scrolls inside its
+     own inset instead of clipping, and the content holds a readable measure.
+     72rem like Crew — the library table and graph want the width; full-bleed
+     read as sprawl (the founder's exact complaint about these tabs). */
   display: flex;
   flex-direction: column;
   gap: var(--s4);
   flex: 1;
   min-height: 0;
-  max-width: 100%;
+  overflow: auto;
+  padding: var(--s5) var(--s6, var(--s5));
+  max-width: 72rem;
+  margin-inline: auto;
+  width: 100%;
 }
 
 .memory-library-search {
@@ -8490,6 +8762,7 @@ summary {
 }
 
 /* (f) sidebar/dock reflow: grid track settle + inner content fade on open */
+.app.quiet:not(.sidebar-hidden) > .sidebar > .sidebar-chrome,
 .app.quiet:not(.sidebar-hidden) > .sidebar > .sidebar-scroll {
   animation: fade-in var(--dur-med) var(--ease);
 }
@@ -8602,10 +8875,14 @@ summary {
     transform: translateX(0);
     opacity: 1;
     visibility: visible;
+    overflow: hidden;
     transition:
       transform var(--dur-slow) var(--ease),
       opacity var(--dur-med) var(--ease),
       visibility var(--dur-slow) var(--ease);
+  }
+  .app.has-crumb.quiet > .sidebar {
+    top: calc(var(--titlebar-h) + var(--crumb-h, 44px));
   }
   /* FIX 1: App toggles `.sidebar-hidden` on `.app`. Slide+fade the drawer
      closed instead of display:none so open/close reads as a drawer, not a pop. */
@@ -8707,6 +8984,10 @@ summary {
   .terminal-tab {
     min-width: 0;
     max-width: 100%;
+  }
+
+  .crew-meter-grid {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -9374,6 +9655,7 @@ summary {
 .topology-masthead {
   flex: 0 0 auto;
   min-height: 52px;
+  border-bottom: 1px solid var(--border-subtle);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -9428,8 +9710,8 @@ summary {
      a narrow window. */
   padding: var(--s5);
   background:
-    radial-gradient(circle at 50% 45%, rgba(130, 170, 255, 0.05), transparent 62%),
-    var(--bg);
+    radial-gradient(circle at 50% 45%, var(--topo-wash), transparent 62%),
+    var(--topo-ground);
 }
 .topology-empty {
   display: flex;
@@ -9444,10 +9726,10 @@ summary {
 .topology-edges { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
 
 .topo-edge path { fill: none; stroke-linecap: round; }
-.topo-edge-dispatch path { stroke: var(--border-strong); stroke-width: 1.4; }
-.topo-edge-delegation path { stroke: var(--border); stroke-width: 1.1; stroke-dasharray: 3 4; }
+.topo-edge-dispatch path { stroke: var(--topo-line); stroke-width: 1.4; }
+.topo-edge-delegation path { stroke: var(--topo-line-soft); stroke-width: 1.1; stroke-dasharray: 3 4; }
 /* A seat nobody has dispatched into: attached to the chart, claiming nothing. */
-.topo-edge-seat path { stroke: var(--border); stroke-width: 1; stroke-dasharray: 1 5; opacity: 0.7; }
+.topo-edge-seat path { stroke: var(--topo-line-soft); stroke-width: 1; stroke-dasharray: 1 5; opacity: 0.7; }
 .topo-edge-a2a path { stroke: var(--accent); stroke-width: 1.3; stroke-dasharray: 6 5; opacity: 0.75; }
 .topo-edge-count {
   fill: var(--accent-text);
@@ -9456,7 +9738,7 @@ summary {
   text-anchor: middle;
   dominant-baseline: middle;
   paint-order: stroke;
-  stroke: var(--bg);
+  stroke: var(--topo-ground);
   stroke-width: 3px;
 }
 
@@ -9470,8 +9752,8 @@ summary {
   gap: 3px;
   padding: var(--s2) var(--s3);
   text-align: left;
-  background: var(--panel);
-  border: var(--border-hard);
+  background: var(--topo-node);
+  border: 1px solid var(--topo-node-border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
   color: var(--text-primary);
@@ -9485,12 +9767,12 @@ summary {
   animation: fade-in var(--dur-med) var(--ease-out);
 }
 button.topo-node { cursor: pointer; }
-button.topo-node:hover { background: var(--panel-2); border-color: var(--border-strong); }
+button.topo-node:hover { background: var(--topo-node-hover); border-color: var(--topo-line); }
 button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .topo-node-hub {
   width: 190px;
-  background: var(--panel-2);
+  background: var(--topo-node-hub);
   border-color: var(--accent-border);
   box-shadow: var(--shadow-md);
 }
@@ -9608,9 +9890,9 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
 
 .topology-legend { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
 .topology-legend li { display: flex; align-items: center; gap: var(--s2); font: var(--text-micro); color: var(--text-secondary); }
-.topo-legend-line { width: 22px; height: 0; border-top: 1.5px solid var(--border-strong); flex: none; }
-.topo-legend-line.delegation { border-top-style: dashed; border-top-color: var(--border); }
-.topo-legend-line.seat { border-top-style: dotted; border-top-color: var(--border); opacity: 0.7; }
+.topo-legend-line { width: 22px; height: 0; border-top: 1.5px solid var(--topo-line); flex: none; }
+.topo-legend-line.delegation { border-top-style: dashed; border-top-color: var(--topo-line-soft); }
+.topo-legend-line.seat { border-top-style: dotted; border-top-color: var(--topo-line-soft); opacity: 0.7; }
 .topo-legend-line.a2a { border-top-style: dashed; border-top-color: var(--accent); }
 .topo-legend-swatch.conflict {
   width: 12px; height: 12px; flex: none; border-radius: 3px;
@@ -9763,8 +10045,8 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   padding: 6px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: #1c1c1c;
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-hard-xl);
 }
 
 .workspace-terminal-spawn-item {
@@ -9818,8 +10100,8 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
-  color: var(--muted, #6b7280);
-  border: 1px solid var(--border, #d1d5db);
+  color: var(--text-tertiary);
+  border: 1px solid var(--border);
   border-radius: 2px;
   vertical-align: middle;
 }
@@ -9837,7 +10119,7 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   gap: 0.5rem;
   min-width: 0;
   font-size: 0.85rem;
-  color: var(--muted, #6b7280);
+  color: var(--text-tertiary);
 }
 
 .composer-queue-text {
@@ -9851,7 +10133,7 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
 .composer-queue-send-now,
 .composer-queue-dismiss {
   flex-shrink: 0;
-  border: 1px solid var(--border, #d1d5db);
+  border: 1px solid var(--border);
   background: transparent;
   color: inherit;
   border-radius: 2px;
@@ -9862,7 +10144,7 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
 
 .composer-queue-send-now:hover,
 .composer-queue-dismiss:hover {
-  border-color: var(--fg, #111);
+  border-color: var(--text-primary);
 }
 
 .workspace-tab-open-terminal:disabled:hover {
@@ -9878,7 +10160,7 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   flex-direction: column;
   position: relative;
   overflow: hidden;
-  background: #000;
+  background: var(--console-bg);
 }
 .workspace-terminal-shell > .terminal-tab {
   position: static;
@@ -9974,9 +10256,9 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   margin: 0;
   padding: var(--s1) var(--s3);
   font: var(--text-meta);
-  color: var(--text-on-ink-2);
-  background: #000;
-  border-bottom: 1px solid rgb(255 255 255 / 8%);
+  color: var(--on-console-2);
+  background: var(--console-bg);
+  border-bottom: 1px solid var(--console-rule);
   flex-shrink: 0;
 }
 
@@ -10010,7 +10292,8 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
    call to action: hairline card, no accent fill, no primary button. The only
    colour is a 6px status dot and a single desaturated red for a path that
    stopped resolving (quiet-design-system §2, §5). */
-.mcp-connections {
+.mcp-connections,
+.cli-link-panel {
   display: flex;
   flex-direction: column;
   gap: var(--s2);
@@ -10183,10 +10466,10 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   max-width: 68ch;
   margin: 8vh auto;
   padding: 24px;
-  border: 1px solid var(--danger, #ff6b6b);
+  border: 1px solid var(--status-danger);
   border-radius: 8px;
-  background: var(--surface, #16181d);
-  color: var(--text, #e6e8ee);
+  background: var(--surface-panel);
+  color: var(--text-primary);
   font-size: 14px;
   line-height: 1.55;
 }
@@ -10202,7 +10485,7 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   overflow: auto;
   padding: 12px;
   border-radius: 6px;
-  background: rgba(0, 0, 0, 0.35);
+  background: var(--scrim);
   font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 12px;
   white-space: pre-wrap;
@@ -10219,7 +10502,7 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
    context for "Working", never a second status. */
 .session-loop-progress {
   font-size: 11px;
-  color: var(--muted, #98a0b3);
+  color: var(--text-tertiary);
   white-space: nowrap;
 }
 
@@ -10266,12 +10549,12 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   --grid-line:     rgba(15,23,42,0.04);
 
   --text-primary:   #14161A;
-  --text-secondary: #5C6370;
-  --text-tertiary:  #8B929E;
-  --text-dim:       #A8AFB8;
+  --text-secondary: #545B66;
+  --text-tertiary:  #6B7179;   /* 4.59:1 on --panel */
+  --text-dim:       #868B93;   /* 3.19:1 */
   --text-on-ink:    #14161A;
   --text-on-ink-2:  rgba(20,22,26,0.72);
-  --text-on-ink-3:  rgba(20,22,26,0.55);
+  --text-on-ink-3:  rgba(20,22,26,0.60);
   --ghost-numeral:  rgba(15,23,42,0.05);
   --hover:  rgba(15,23,42,0.04);
   --active: var(--accent-weak);
@@ -10289,6 +10572,22 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   --status-ready:   #1F8A57;   --status-ready-weak:  rgba(31,138,87,0.12);
   --status-warn:    #A16207;   --status-warn-weak:   rgba(161,98,7,0.12);
   --status-danger:  #C23B2A;   --status-danger-weak: rgba(194,59,42,0.08);
+  --status-warn-border:   rgba(161,98,7,0.38);
+  --status-danger-border: rgba(194,59,42,0.35);
+  --scrim:           rgba(15,23,42,0.32);
+  --scrollbar-thumb: rgba(15,23,42,0.18);
+  --scrollbar-thumb-hover: rgba(15,23,42,0.30);
+  --ink-hover:       #000000;
+  --text-bright:     #000000;
+
+  /* The bauhaus hues are tuned for a near-black ground; on white they sit at
+     roughly 2:1 and read as pastel. Re-pointed at the light desk's own
+     semantics rather than given second, parallel values to keep in sync. */
+  --bauhaus-blue:     var(--accent);
+  --bauhaus-red:      var(--status-danger);
+  --bauhaus-red-fill: var(--status-danger);
+  --bauhaus-yellow:   var(--status-warn);
+  --glass-ink:        rgba(255,255,255,0.92);
 
   /* Stop / live glyph only — NOT a card fill (peach fills made the rail look dirty). */
   --desk-live:        #C23B2A;
@@ -10300,7 +10599,141 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   --shadow-lg: 0 10px 28px rgba(15,23,42,0.09);
   --shadow-raised: var(--shadow-sm);
   --shadow-hero:   var(--shadow-md);
+
+  /* Modals, dropdowns and popovers reference these DIRECTLY rather than through
+     the --shadow-* aliases above, so they need their own light values or they
+     drop 35-50% black onto white and read as smudges. Kept heavier than the
+     ambient shadows: an overlay still has to lift off the page. */
+  --shadow-hard-sm:     0 1px 2px rgba(15,23,42,0.10);
+  --shadow-hard-md:     0 3px 8px rgba(15,23,42,0.12);
+  --shadow-hard-lg:     0 8px 24px rgba(15,23,42,0.14);
+  --shadow-hard-xl:     0 12px 32px rgba(15,23,42,0.18);
+  --shadow-hard-yellow: 0 3px 8px rgba(15,23,42,0.12);
+
+  /* Topology, inverted: the stage is tinted and the cards are white, because a
+     5%-black shadow cannot separate a card from white the way a 35%-black one
+     separates it from near-black. Measured against the dark theme, this puts
+     every structural edge at or above its dark counterpart. */
+  --topo-ground:      var(--panel-2);
+  --topo-wash:        rgba(61,111,224,0.05);
+  --topo-node:        #FFFFFF;
+  --topo-node-hub:    #F5F8FF;
+  --topo-node-hover:  var(--panel);
+  --topo-node-border: #C3C9D2;
+  --topo-line:        #98A2B0;
+  --topo-line-soft:   #BCC3CD;
 }
+
+/* ── Durable approval grants (ADR-0056 D8.1) ─────────────────────────────────
+   Tokens only, so the panel follows both desks. The status word carries the
+   state as a WORD as well as a hue — a revoked and a live grant must not be
+   distinguishable by colour alone. */
+.grants-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s3);
+}
+.grants-head h3 {
+  margin: 0;
+  font: 600 11px/1.5 var(--sans);
+  letter-spacing: var(--eyebrow-spacing);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+.grants-head-actions { display: flex; gap: var(--s2); }
+.grants-note {
+  margin: var(--s2) 0 0;
+  font: var(--text-meta);
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+.grants-error {
+  margin: var(--s2) 0 0;
+  padding: var(--s2) var(--s3);
+  font: var(--text-meta);
+  color: var(--status-danger);
+  background: var(--status-danger-weak);
+  border-left: 2px solid var(--status-danger);
+  border-radius: var(--radius-sm);
+}
+.grants-empty {
+  margin: var(--s3) 0 0;
+  font: var(--text-meta);
+  color: var(--text-tertiary);
+}
+.grants-list {
+  list-style: none;
+  margin: var(--s3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.grants-row {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: var(--s2) var(--s3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+}
+.grants-row.inert { opacity: 0.6; }
+.grants-row-head { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.grants-tool {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-primary);
+}
+.grants-status {
+  font: 600 10px/1.5 var(--sans);
+  letter-spacing: var(--eyebrow-spacing);
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  color: var(--text-secondary);
+}
+.grants-status.live { background: var(--status-ready-weak); color: var(--status-ready); }
+.grants-status.revoked { background: var(--status-danger-weak); color: var(--status-danger); }
+.grants-status.expired { background: var(--surface-3); color: var(--text-tertiary); }
+.grants-class {
+  font: var(--text-micro);
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--eyebrow-spacing);
+}
+.grants-target {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+.grants-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s3);
+  font: var(--text-micro);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.grants-revoke {
+  align-self: flex-start;
+  margin-top: var(--s1);
+  font: var(--text-micro);
+  letter-spacing: var(--eyebrow-spacing);
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border: 1px solid var(--status-danger-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--status-danger);
+  cursor: pointer;
+}
+.grants-revoke:hover:not(:disabled) { background: var(--status-danger-weak); }
+.grants-revoke:disabled { opacity: 0.5; cursor: default; }
 
 /* ── Breadcrumb bar: a second fixed chrome row under the titlebar (spec B) ── */
 .app.has-crumb {
@@ -10516,6 +10949,37 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
 .rail-group-toggle .rail-caret { display: grid; transition: transform var(--dur-fast) var(--ease); }
 .rail-group.collapsed .rail-caret { transform: rotate(-90deg); }
 .rail-group-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* H8: how much is inside a project, without opening it. One glyph-weight
+   number — a group header is a label, not a dashboard tile. */
+.rail-group-count {
+  flex: 0 0 auto;
+  font: 500 10px/1 var(--mono);
+  letter-spacing: 0;
+  color: var(--text-tertiary);
+}
+.rail-group-toggle:hover .rail-group-count { color: var(--text-secondary); }
+/* H9: a gate waiting inside a CLOSED project still says so, in the one tone
+   MUON reserves for "this cannot proceed without you". A CHIP, not a bare
+   number: it sits beside the session count, and two loose digits on one line
+   read as one number. */
+.rail-group-blocked {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 5px;
+  border-radius: 999px;
+  font: 600 10px/1 var(--mono);
+  letter-spacing: 0;
+  color: var(--status-warn);
+  background: var(--status-warn-weak);
+}
+.rail-group-blocked .status-glyph {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: currentColor;
+}
 .rail-group-add {
   margin-left: auto;
   width: 22px;
@@ -10581,6 +11045,13 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   color: var(--text-tertiary);
   overflow: hidden;
 }
+/* H10: the speakable name holds its width; the coordinate gives way first. */
+.session-card-name {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.session-card-name + .slug-text { flex: 1 1 auto; min-width: 0; }
 .session-card-slug .slug-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-card-status {
   display: flex;
@@ -10607,6 +11078,24 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   gap: 8px;
   margin-top: 6px;
 }
+/* H9: WHICH TREE this session's work is in. An isolated worktree is a real
+   fact about where changes live, so it reads; "workspace" is the absence of
+   one and stays quiet. Neither is ever a branch name. */
+.session-tree-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 55%;
+  font: 400 11px/1 var(--mono);
+  color: var(--text-tertiary);
+}
+.session-tree-badge.worktree { color: var(--text-secondary); }
+.session-tree-badge .tree-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-tree-badge.workspace { opacity: 0.7; }
 /* The archive ✕ stays but goes quiet until the card is hovered. */
 .desk-light .chat-delete {
   position: absolute;
@@ -10736,11 +11225,10 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   border-color: var(--status-danger);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--status-danger) 18%, transparent);
 }
-.desk-light .full-auto-panel.armed .full-auto-toggle {
-  color: var(--text-primary);
-}
-.desk-light .full-auto-panel.armed > .full-auto-toggle:first-of-type {
+.desk-light .full-auto-panel.armed .full-auto-btn {
   color: var(--status-danger);
+  background: var(--bg);
+  border-color: var(--status-danger);
 }
 .desk-light .full-auto-panel small,
 .desk-light .full-auto-panel .full-auto-copy,
@@ -10928,6 +11416,12 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
   color: var(--text-secondary);
   font: 600 11px/1.4 var(--sans);
 }
+/* H2 — a degraded packet is visible on the CLOSED disclosure, at fail rank. */
+.handoff-count.degraded {
+  background: color-mix(in srgb, var(--status-warn) 18%, transparent);
+  border: 1px solid var(--status-warn);
+  color: var(--status-warn);
+}
 .handoff-empty, .handoff-error { padding: 8px 0; font: var(--text-meta); }
 .handoff-empty { color: var(--text-tertiary); }
 .handoff-error { color: var(--status-danger); }
@@ -10958,7 +11452,25 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
 .handoff-check.failed, .handoff-check.error { color: var(--status-danger); border-color: var(--status-danger); }
 .handoff-check.skipped { color: var(--text-tertiary); }
 .handoff-check.passed-but-uncovering { color: var(--status-warn); border-color: var(--status-warn); }
-.handoff-degraded { margin-top: 6px; font: var(--text-micro); color: var(--status-warn); }
+/* H2 — the missing-evidence line, at the same attention rank as a failed
+   check: a filled warn band, not a grey footnote under the checks. */
+.handoff-degraded {
+  margin-top: 6px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--status-warn);
+  background: color-mix(in srgb, var(--status-warn) 12%, transparent);
+  font: 600 11px/1.5 var(--sans);
+  color: var(--status-warn);
+  overflow-wrap: anywhere;
+}
+/* The bound's own omission note is NOT a degradation — it must not borrow the
+   alarm above, or the alarm stops meaning anything. */
+.handoff-omitted { margin-top: 6px; font: var(--text-micro); color: var(--text-tertiary); }
+.handoff-warn { margin-right: 5px; }
+/* The whole card carries the rank, so a degraded packet reads as suspect at a
+   glance rather than only on the line a reader might skip. */
+.handoff-card.degraded { border-color: var(--status-warn); }
 .handoff-files { margin-top: 6px; font: 400 11px/1.5 var(--mono); color: var(--text-tertiary); overflow-wrap: anywhere; }
 .handoff-body {
   margin-top: 8px;
@@ -11003,6 +11515,17 @@ button.topo-node:focus-visible { outline: 2px solid var(--accent); outline-offse
 .mcp-probe-chip.unevaluated {
   color: var(--status-warn);
   border-color: var(--status-warn);
+}
+/* ADR-0052: a LOCKED server's verdict may be `ok`. The word stays; the green
+   does not — the chip must never read as a pass. */
+.mcp-probe-chip.locked {
+  color: var(--status-danger);
+  border-color: var(--status-danger);
+}
+/* The shared refusal is three sentences on three lines, as every other surface
+   prints it. */
+.mcp-probe-refusal {
+  white-space: pre-wrap;
 }
 
 /* Memory governance (surface-parity item 6). */

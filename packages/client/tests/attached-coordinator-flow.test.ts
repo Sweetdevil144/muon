@@ -321,7 +321,12 @@ describe("attachCoordinatorFlow", () => {
 
   it("refuses a vendor with no coordinator seat", async () => {
     const h = harness();
-    const spec = resolveInstallableVendor("cursor")!;
+    // ADR-0057 seated all four PUBLIC vendors, so `cursor` no longer exercises
+    // this guard. `fake` is the only remaining seatless id — and the guard is
+    // fail-closed machinery that must stay tested, so the spec is borrowed and
+    // re-idented rather than the test being deleted along with the last
+    // vendor that happened to fail it.
+    const spec = { ...resolveInstallableVendor("cursor")!, id: "fake" as const };
     const result = await attachCoordinatorFlow({
       client: fakeClient(),
       io: h.io,

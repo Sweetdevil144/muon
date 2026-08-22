@@ -158,6 +158,10 @@ describe("App per-chat integration lifecycle", () => {
       screen.getByRole("button", { name: "Control" }).querySelector(".nav-badge")
     ).toBeNull();
 
+    // H8: Chat B lives in another project, and projects are collapsed until
+    // opened. Reaching it is now open-the-project-then-pick-the-session, which
+    // is the point of the tree — the switch itself is unchanged.
+    fireEvent.click(screen.getByRole("button", { name: "repo-b — 1 session" }));
     const chatBTitle = screen.getByText("Chat B", { selector: ".chat-title" });
     fireEvent.click(chatBTitle.closest("button")!);
 

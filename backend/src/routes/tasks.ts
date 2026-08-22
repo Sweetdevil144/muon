@@ -1,4 +1,6 @@
 import {
+  copyForkSeed,
+  discardForkSeed,
   isOwnedLinkedWorktree,
   locateTaskWorktreePath,
   verifyDurableWorktreeArtifact,
@@ -11,6 +13,7 @@ import {
   handoffPacketSchema,
   mergeReviewRecordSchema,
 } from "@muon/protocol";
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import {
@@ -19,6 +22,10 @@ import {
   requireAgentTaskDiffAccess,
   visibleTaskIdsForCapability,
 } from "../lib/auth.js";
+import {
+  optionalMemoryCallerScope,
+  servePacketContent,
+} from "../lib/memory-offers.js";
 import { prisma } from "../lib/db.js";
 import { annotateHandoffChecks } from "../lib/check-history-read.js";
 import { mirrorToGraph } from "../lib/graph.js";
@@ -258,7 +265,86 @@ export async function registerTaskRoutes(app: FastifyInstance) {
       }
       taskData.workspacePath = capability.workspacePath;
     }
-    const task = await prisma.task.create({ data: taskData });
+    // ADR-0084: a task minted UNDER A FORK MISSION inherits the recorded
+    // state. The predicate is the creator job's own stamped provenance
+    // (derived, never caller-asserted — D3), and the inheritance is the
+    // seed-stash COPY at creation (D2: creation pins gesture-time state for
+    // every worker regardless of claim order; the coordinator's drifted
+    // tree travels by packets/merges, never by the seed). The runner then
+    // needs zero new logic: `hasForkSeed` finds the copy and
+    // `materializeForkWorktree` applies it fail-closed.
+    // One extra job read, deliberately NOT a capability-model change: the
+    // provenance column joins `AgentJobCapability` the day a second route
+    // consumes it (the 0089 promotion rule) — widening the authenticated
+    // capability shape for one consumer is how bounded surfaces drift.
+    let forkCreatorTaskId: string | null = null;
+    if (capability) {
+      const creatorJob = await prisma.dispatchJob.findUnique({
+        where: { id: capability.jobId },
+        select: { taskId: true, forkSourceTaskId: true },
+      });
+      if (creatorJob?.forkSourceTaskId && creatorJob.taskId) {
+        forkCreatorTaskId = creatorJob.taskId;
+      }
+    }
+    if (!forkCreatorTaskId) {
+      const task = await prisma.task.create({ data: taskData });
+      mirrorToGraph((graph) =>
+        graph.upsertTask({ id: task.id, title: task.title, status: task.status })
+      );
+      reply.code(201);
+      return { task };
+    }
+    // Copy FIRST, create second (the fork mint's own ordering): a copy
+    // failure refuses the creation with nothing minted — a crew task
+    // without the recorded state would stand on today's HEAD, the exact
+    // lie the fork exists to prevent (fail-closed, 0071's bar).
+    const taskId = randomUUID();
+    let copied;
+    try {
+      copied = await copyForkSeed({
+        fromTaskId: forkCreatorTaskId,
+        toTaskId: taskId,
+      });
+    } catch (error) {
+      throw app.httpErrors.conflict(
+        `The fork mission's recorded state could not be inherited — nothing was minted: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+    let task;
+    try {
+      task = await prisma.task.create({
+        data: {
+          ...taskData,
+          id: taskId,
+          // The ORIGINAL source task, from the copied stash itself, so the
+          // jobs dispatch later stamps agree with `meta.sourceTaskId` and
+          // `applyForkSeed`'s stash/column check keeps holding.
+          forkSourceTaskId: copied.sourceTaskId,
+        },
+      });
+    } catch (error) {
+      // LOUD on the double failure (review finding): a discard that also
+      // fails leaves copied worktree content under a task id with no row —
+      // log the exact stash coordinate so it is reclaimable by hand.
+      await discardForkSeed(taskId).catch((discardError) => {
+        app.log.error(
+          { taskId, err: discardError },
+          "fork-seed inheritance compensation failed; the copied stash is stranded under this task id in the data dir's fork-seeds directory"
+        );
+      });
+      throw error;
+    }
+    app.log.info(
+      {
+        taskId,
+        fromTaskId: forkCreatorTaskId,
+        sourceTaskId: copied.sourceTaskId,
+      },
+      "fork-mission task inherited the recorded-state seed at creation"
+    );
     mirrorToGraph((graph) =>
       graph.upsertTask({ id: task.id, title: task.title, status: task.status })
     );
@@ -307,7 +393,57 @@ export async function registerTaskRoutes(app: FastifyInstance) {
       task.workspacePath
     );
 
-    return { task: { ...task, handoffs: annotatedHandoffs } };
+    // ADR-0080 through the 0088 boundary: this is THE packet serve — the
+    // read `handoff_read` and every agent task-detail consumer lands on.
+    // A capability-bearing serve records "packet P delivered to job J"; an
+    // operator read records nothing (0060 D10's rationale verbatim), and
+    // the shared runner token's bookkeeping reads carry no capability and
+    // record nothing either (the SOFT scope entry — this read is legal
+    // without a capability, unlike a memory read). Rows grant nothing: the
+    // packets return exactly as annotated.
+    const scope = await optionalMemoryCallerScope(app, request);
+    const servedHandoffs = scope
+      ? await servePacketContent(
+          scope,
+          "handoff-read",
+          annotatedHandoffs,
+          annotatedHandoffs.map((handoff) => handoff.id),
+          app.log
+        )
+      : annotatedHandoffs;
+
+    // ADR-0080 D3 — the delivery RENDERINGS, derived at read for the
+    // OPERATOR tier only: which jobs each packet reached, from the
+    // append-only offer rows. Evidence, never authority (D2): the human
+    // sees "filed, unread" vs "read by the reviewer" — nothing is granted,
+    // and agent-tier reads don't receive the ledger (their own reads are
+    // what WRITES it).
+    if (request.tier === "operator" && servedHandoffs.length > 0) {
+      const offers = await prisma.handoffOffer.findMany({
+        where: {
+          handoffId: { in: servedHandoffs.map((handoff) => handoff.id) },
+        },
+        orderBy: { firstAt: "asc" },
+        select: { handoffId: true, jobId: true, firstAt: true },
+      });
+      const byHandoff = new Map<string, { jobId: string; firstAt: string }[]>();
+      for (const offer of offers) {
+        const list = byHandoff.get(offer.handoffId) ?? [];
+        list.push({ jobId: offer.jobId, firstAt: offer.firstAt.toISOString() });
+        byHandoff.set(offer.handoffId, list);
+      }
+      return {
+        task: {
+          ...task,
+          handoffs: servedHandoffs.map((handoff) => ({
+            ...handoff,
+            deliveries: byHandoff.get(handoff.id) ?? [],
+          })),
+        },
+      };
+    }
+
+    return { task: { ...task, handoffs: servedHandoffs } };
   });
 
   // Review-lane evidence: a task's worktree diff, served by the brain (which

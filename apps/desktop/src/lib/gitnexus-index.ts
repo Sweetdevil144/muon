@@ -5,11 +5,17 @@ import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { homedir } from "node:os";
 import {
   acquireGitNexusIndexLock,
   type GitNexusIndexLockAttempt,
   type GitNexusIndexLockHandle,
 } from "@muon/client/gitnexus-index-lock";
+import {
+  globalGitNexusResolveBases,
+  rankGitNexusManifests,
+  resolveNpmGlobalRootSync,
+} from "@muon/client/gitnexus-reindex";
 import { resolveIndexTargets } from "./gitnexus-repos.js";
 
 const execFileAsync = promisify(execFile);
@@ -284,42 +290,65 @@ export function resolveNodeBinary(): string | null {
 }
 
 /**
- * Resolve the bundled `gitnexus` CLI. The desktop app does NOT depend on
- * `@muon/mcp`/`gitnexus`, so a bare `require.resolve('gitnexus/...')` fails —
- * we probe monorepo-relative `packages/mcp` locations and honor the same
- * `MUON_GITNEXUS_BIN` override gitnexus-tools.ts uses. Null ⇒ never spawn.
- * Shared by the index supervisor, the on-demand graph export (main), and the
- * review/recon/data-boundary evidence readers.
+ * Resolve this machine's `gitnexus` CLI. The desktop app does NOT depend on
+ * `@muon/mcp`/`gitnexus` (the closure is ~1GB of grammars and ONNX runtime —
+ * it cannot ride in the DMG), so a bare `require.resolve('gitnexus/...')`
+ * fails. Probed in order:
+ *
+ *  1. `MUON_GITNEXUS_BIN` — the same override gitnexus-tools.ts honors.
+ *  2. Monorepo-relative `packages/mcp` — dev checkouts.
+ *  3. The MACHINE's installed copy (founder bug, 2026-08-19: a packaged app
+ *     had NO probe that could ever succeed): the global `muon-cli` install's
+ *     own dependency, or a standalone `npm i -g gitnexus` — via the shared
+ *     base list in `@muon/client/gitnexus-reindex`, so the CLI's resolver and
+ *     this one cannot disagree about which GitNexus is this machine's.
+ *
+ * Null ⇒ never spawn. Shared by the index supervisor, the on-demand graph
+ * export (main), and the review/recon/data-boundary evidence readers.
  */
 export function resolveGitNexusCli(
   moduleDir: string = __dirname
 ): ResolvedGitNexusCli | null {
   const override = process.env.MUON_GITNEXUS_BIN?.trim();
   if (override) return { binary: override, commandPrefix: [] };
-  // apps/desktop/dist/lib → repo root is up 4; also try up 3 (dist/lib flat).
-  const candidateBases = [
-    moduleDir,
-    join(moduleDir, "..", "..", "..", "..", "packages", "mcp"),
-    join(moduleDir, "..", "..", "..", "packages", "mcp"),
-  ];
-  for (const base of candidateBases) {
+  const tryResolve = (base: string): string | null => {
     try {
-      const pkg = localRequire.resolve("gitnexus/package.json", {
-        paths: [base],
-      });
-      return {
-        // Real node first (see resolveNodeBinary): the CLI's native
-        // tree-sitter grammars are node builds, and a grammar abort under
-        // Electron-as-node surfaced a macOS app-crash dialog for a
-        // background index run.
-        binary: resolveNodeBinary() ?? process.execPath,
-        commandPrefix: [join(dirname(pkg), "dist", "cli", "index.js")],
-      };
+      return localRequire.resolve("gitnexus/package.json", { paths: [base] });
     } catch {
-      // try the next candidate
+      return null;
     }
-  }
-  return null;
+  };
+  const toCli = (manifestPath: string): ResolvedGitNexusCli => ({
+    // Real node first (see resolveNodeBinary): the CLI's native tree-sitter
+    // grammars are node builds, and a grammar abort under Electron-as-node
+    // surfaced a macOS app-crash dialog for a background index run.
+    binary: resolveNodeBinary() ?? process.execPath,
+    commandPrefix: [join(dirname(manifestPath), "dist", "cli", "index.js")],
+  });
+
+  // apps/desktop/dist/lib → repo root is up 4; also try up 3 (dist/lib flat).
+  // LOCAL FIRST, and the ordering is load-bearing for the UI thread: the
+  // global probe runs `npm root -g` (a spawnSync on Electron's main process),
+  // and a dev checkout or a packaged app that carries its own copy must never
+  // pay it. Within each tier the newest copy wins.
+  const localRanked = rankGitNexusManifests(
+    [
+      moduleDir,
+      join(moduleDir, "..", "..", "..", "..", "packages", "mcp"),
+      join(moduleDir, "..", "..", "..", "packages", "mcp"),
+    ],
+    tryResolve
+  );
+  if (localRanked.length > 0) return toCli(localRanked[0]!.manifestPath);
+
+  const globalRanked = rankGitNexusManifests(
+    globalGitNexusResolveBases({
+      npmGlobalRoot: resolveNpmGlobalRootSync,
+      home: homedir(),
+    }),
+    tryResolve
+  );
+  return globalRanked.length > 0 ? toCli(globalRanked[0]!.manifestPath) : null;
 }
 
 const defaultResolveCli = (
@@ -648,6 +677,46 @@ export class GitNexusIndexSupervisor {
       this.debounceHandle = null;
       void this.maybeSpawn().catch((error) => this.log(error));
     }, this.debounceMs);
+  }
+
+  /**
+   * ADR-0054 — a governed merge just LANDED in this workspace. Catch up NOW.
+   *
+   * The git-dir watcher already sees the merge commit (the backend runs `git
+   * merge` in this very checkout, so the reflog moves and `onGitDirEvent` fires)
+   * — but the analyze it schedules is then suppressed by the per-target
+   * `minIntervalMs` cooldown, which only `reindexNow` cleared. Measured
+   * consequence: for up to five minutes after a governed land, the graph is
+   * BEHIND the primary checkout, and that window is precisely when the next
+   * agent asks — `preflight_edit` refuses, `review_diff` goes REVIEW-BLIND, and
+   * `code_impact` answers from the pre-merge line numbers.
+   *
+   * So this clears exactly one thing: the cooldown. It deliberately does NOT
+   * call `reindexNow`, for two reasons that both matter:
+   *
+   *  1. `reindexNow` REFUSES with `already-running` under contention. An analyze
+   *     already in flight indexed the PRE-merge commit, so a refusal would drop
+   *     the catch-up entirely and re-enter the same five-minute hole. Clearing
+   *     the cooldown instead survives it: the running child's exit handler calls
+   *     `ensureIndexed()`, `rateOk` is now true, and the next target spawns
+   *     immediately.
+   *  2. `reindexNow` reports `trigger: "manual"`, and the masthead renders that
+   *     as "rebuilding the local code graph" — the copy for a button the
+   *     operator clicked. They clicked Approve, not Re-index. Going through the
+   *     ordinary loop keeps the trigger `auto` and the copy honest.
+   *
+   * Nothing is spawned here: `maybeSpawn` still owns that, so single-in-flight
+   * and the cross-process lock are untouched. Synchronous, idempotent, and it
+   * never throws — a merge must never fail because a catch-up did.
+   */
+  catchUpAfterMerge(): void {
+    if (this.stopped || !this.root) return;
+    // Not a force and not a bypass of `needsIndex`: HEAD moved, so the ordinary
+    // staleness check will say yes on its own. If it somehow says no, the graph
+    // really is current and doing nothing is correct.
+    for (const target of this.targets) this.lastAnalyzeAt.delete(target);
+    this.forceRefresh = true;
+    this.ensureIndexed();
   }
 
   /**

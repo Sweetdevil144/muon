@@ -510,9 +510,168 @@ export type RepoMapMemorySignal = {
   }[];
 };
 
+/**
+ * WHAT WAS ACTUALLY ASKED FOR — the input crew sizing was missing entirely.
+ *
+ * Sizing keyed only on the REPOSITORY (symbols, clusters, repos), so a
+ * one-function fix in a 24k-symbol tree recommended the same crew as "audit
+ * the whole codebase". That is the measured reason a one-line instruction
+ * became a three-agent mission: nothing in the recommendation had ever seen
+ * the instruction.
+ *
+ * Kept as data, not prose parsing with opinions: `solo` is an explicit
+ * declaration a caller makes, and the text heuristic below only ever fires on
+ * clear POSITIVE evidence of a single-unit ask (ADR-0022 rule 2 — never a
+ * subtraction from "everything else must be big").
+ */
+export type MissionAsk = {
+  /** The operator's or agent's own words, when there are any. */
+  readonly text?: string;
+  /**
+   * An explicit "do this yourself" — the caller has already decided. Always
+   * wins: a human or an agent saying `solo` is a fact, not a signal to weigh.
+   */
+  readonly solo?: boolean;
+};
+
+/**
+ * EVIDENCE, RANKED. Four tiers, checked in this order:
+ *
+ *   1. an explicit declaration        → single unit, unconditionally
+ *   2. an unambiguous sweep           → crew
+ *   3. a quantified target ("all the
+ *      callers", "every service")     → crew
+ *   4. a single target, named         → single unit
+ *   else                              → no signal; size off the repository
+ *
+ * WHY THE ORDER IS THE DESIGN. A human's explicit instruction is a FACT and
+ * outranks every guess — a flat "sweep always wins" rule once let the word
+ * `refactor` defeat "refactor this one function, DO NOT DISPATCH".
+ *
+ * WHY THE QUANTIFIER OUTRANKS THE SINGLE TARGET, which is the subtle one:
+ * "update all the callers of THIS FUNCTION" names a single symbol and is
+ * nonetheless repo-wide work, and dropping this tier let exactly that ask
+ * classify as one unit. The reverse mistake — "handle each edge case in this
+ * one function" sized as a crew — is real but CHEAP: it falls back to sizing
+ * off the repository, which is what happened before any of this existed. The
+ * asymmetry decides the tie. A wrong `true` silently shrinks a crew the
+ * mission needed; a wrong `false` costs a recon pass. Ambiguity therefore
+ * resolves to `false`, always.
+ */
+
+/** Tier 1 — the operator said it outright. Nothing overrides these. */
+const EXPLICIT_SOLO: readonly RegExp[] = [
+  /\bdo\s*n[o']?t\s+(?:dispatch|delegate|fan\s*out|spawn)/i,
+  /\bno\s+(?:crew|dispatch|delegation|subagents?|fan\s*out)\b/i,
+  /\b(?:solo|single[- ]handed)\b/i,
+  /\b(?:by|do\s+it)\s+yourself\b/i,
+];
+
+/** Tier 2 — unambiguous breadth: the work IS the whole surface. */
+const STRONG_SWEEP: readonly RegExp[] = [
+  /\b(?:audit|sweep|survey|inventory|catalog(?:ue)?)\b/i,
+  /\b(?:in|across|for|over|throughout)\s+(?:every|all|each)\b/i,
+  /\bacross\s+the\s+(?:codebase|repo|monorepo|workspace|stack)\b/i,
+  /\b(?:whole|entire)\s+(?:codebase|repo|repository|project|stack)\b/i,
+  /\bexamine\s+(?:the\s+)?codebase\b/i,
+];
+
+/**
+ * Words that sit BETWEEN a quantifier and its population ("all OF THE callers",
+ * "every OTHER caller", "all THAT duplicated logic"). They are CONSUMED so the
+ * population behind them is still seen, and they are ALSO excluded so the
+ * engine cannot backtrack out of the run and let the connective itself pass as
+ * the population. Both lists are built from this one array, because the
+ * both-lists rule was broken twice — once for `this`, once for `that` — and
+ * each time it silently flipped real sweeps to solo.
+ */
+const QUANTIFIER_CONNECTIVES = [
+  "the",
+  "of",
+  "other",
+  "these",
+  "those",
+  "this",
+  "that",
+] as const;
+
+/** Never a population, and never in front of one. Excluded only. */
+const QUANTIFIER_FILLER = [
+  "i",
+  "you",
+  "we",
+  "it",
+  "they",
+  "is",
+  "was",
+  "are",
+  "been",
+  "right",
+  "good",
+  "set",
+  "clear",
+  "done",
+  "fine",
+  "well",
+  "ok",
+  "okay",
+  "along",
+  "together",
+] as const;
+
+/**
+ * Tier 3 — a quantifier over some population. Ranked ABOVE the single-target
+ * tier on purpose: "all the callers of this function" contains a single target
+ * and is still repo-wide. See the asymmetry argument above.
+ */
+const QUANTIFIED_SWEEP: readonly RegExp[] = [
+  // The word after the quantifier must plausibly BE a population. Matching any
+  // word made ordinary filler a sweep — "fix the typo in this one file, that
+  // is all I need" over-dispatched, and because this tier outranks the
+  // single-target tier it overrode the target it named.
+  new RegExp(
+    `\\b(?:every|all|each)\\s+(?:(?:${QUANTIFIER_CONNECTIVES.join(
+      "|"
+    )})\\s+)*(?!(?:${[...QUANTIFIER_CONNECTIVES, ...QUANTIFIER_FILLER].join(
+      "|"
+    )})\\b)[a-z][a-z-]{1,}`,
+    "i"
+  ),
+];
+
+/** Tier 4 — a single target, named. */
+const STRONG_SINGLE: readonly RegExp[] = [
+  /\bone[- ](?:file|function|module|symbol|line|test|method|class)\b/i,
+  /\bsingle[- ](?:file|function|module|symbol|test|method|class)\b/i,
+  /\bthis\s+(?:one\s+)?(?:file|function|typo|line|symbol|method|class)\b/i,
+];
+
+/**
+ * Does this ask name ONE unit of work?
+ *
+ * `false` is the safe answer and the default: it falls back to sizing off the
+ * repository exactly as before, so an unreadable — or merely ambiguous — ask
+ * never silently shrinks a crew. Only positive evidence returns `true`
+ * (ADR-0022 rule 2).
+ */
+export function askIsSingleUnit(ask: MissionAsk | undefined): boolean {
+  if (!ask) return false;
+  if (ask.solo === true) return true;
+  const text = ask.text?.trim();
+  if (!text) return false;
+  const matches = (patterns: readonly RegExp[]) =>
+    patterns.some((pattern) => pattern.test(text));
+  if (matches(EXPLICIT_SOLO)) return true;
+  if (matches(STRONG_SWEEP)) return false;
+  if (matches(QUANTIFIED_SWEEP)) return false;
+  return matches(STRONG_SINGLE);
+}
+
 export type CrewSizeInput = {
   map: RepoMap;
   caps: DelegationCaps;
+  /** What was asked for. Absent = size off the repository, as before. */
+  ask?: MissionAsk;
   /** Load-bearing memory can make an otherwise tiny repository worth one
    * bounded specialist rather than a solo pass. */
   memory?: RepoMapMemorySignal;
@@ -548,6 +707,13 @@ function hasLoadBearingMemory(
 export function recommendCrewSize(input: CrewSizeInput): number {
   const { map, caps } = input;
   const { symbols, clusters, repos } = map.totals;
+  // THE ASK OUTRANKS THE REPOSITORY. A single-unit instruction is answered by
+  // the superagent itself however large the tree is — which is the whole point
+  // of asking: sizing a crew off `symbols` alone is what turned every
+  // one-function fix in this 24k-symbol repo into a multi-agent mission.
+  // Deliberately ABOVE the trivial-repo check, so an explicit `solo` is not
+  // quietly outvoted by load-bearing memory.
+  if (askIsSingleUnit(input.ask)) return 0;
   if (
     repos <= 1 &&
     symbols < TRIVIAL_SYMBOLS &&
@@ -712,8 +878,21 @@ export type ReconCrewUnit = {
 
 export type ReconMissionPlan = {
   mission: string;
-  /** "solo" when the repo is trivial enough to examine without fan-out. */
+  /** "solo" when this mission needs no fan-out — see `soloReason` for WHICH
+   *  of the two very different reasons applies. */
   strategy: "solo" | "fan-out";
+  /**
+   * WHY a solo plan is solo, because the two reasons license opposite claims
+   * about coverage and only one of them was ever true:
+   *
+   *  - `trivial-repo`: the whole repository is small enough to examine
+   *    directly, so a solo pass genuinely covers all of it.
+   *  - `single-unit-ask`: the ASK names one unit of work. The pass covers that
+   *    unit and says NOTHING about the rest of a possibly huge tree.
+   *
+   * Absent on a fan-out plan.
+   */
+  soloReason?: "trivial-repo" | "single-unit-ask";
   crewSize: number;
   confidence: RepoMapConfidence;
   units: ReconCrewUnit[];
@@ -750,12 +929,15 @@ function unitPrompt(mission: string, unit: WorkUnit): string {
  */
 export function planReconMission(input: PlanReconMissionInput): ReconMissionPlan {
   const { map, mission } = input;
+  // The mission text IS the ask — a plan for "rename one function" must not
+  // partition the workspace just because the workspace is large.
   const crewSize = recommendCrewSize({
     map,
     caps: input.caps,
     budgetMs: input.budgetMs,
     perAgentMs: input.perAgentMs,
     memory: input.memory,
+    ask: { text: mission },
   });
   const notes: string[] = [];
   if (
@@ -798,12 +980,22 @@ export function planReconMission(input: PlanReconMissionInput): ReconMissionPlan
   }
 
   if (crewSize <= 0) {
+    // WHICH solo this is. The note used to assert "repository is small enough",
+    // which the ask short-circuit made false on arbitrarily large trees — and
+    // it could then sit beside the load-bearing-memory note that only ever
+    // applies to a small repo, so the plan contradicted itself.
+    const soloReason = askIsSingleUnit({ text: mission })
+      ? ("single-unit-ask" as const)
+      : ("trivial-repo" as const);
     notes.unshift(
-      "Repository is small enough to examine directly — no fan-out needed."
+      soloReason === "single-unit-ask"
+        ? "The mission names a single unit of work, so it is answered directly — this plan makes no claim about the rest of the repository."
+        : "Repository is small enough to examine directly — no fan-out needed."
     );
     return {
       mission,
       strategy: "solo",
+      soloReason,
       crewSize: 0,
       confidence: map.confidence,
       units: [],
@@ -885,8 +1077,18 @@ export function completenessCritique(
   const symbolCoverage = ratio(coveredSymbols, totalSymbols);
 
   const gaps: string[] = [];
-  // A solo plan examines the repo directly — complete by construction.
-  if (plan.strategy === "solo") {
+  // A solo plan is complete BY CONSTRUCTION only when it is solo because the
+  // whole repository is trivial. Once the ASK could also produce a solo plan
+  // (Wave 1C), this branch was claiming `symbolCoverage: 1` over a 24k-symbol
+  // tree for "rename one function" — a fabricated evidence claim, which is the
+  // one thing a completeness critique must never emit.
+  // POSITIVE, not `!== "single-unit-ask"`. `soloReason` is optional on the
+  // exported type and this plan crosses an MCP boundary, so a plan that
+  // arrives without the discriminator — an older producer, a hand-built
+  // fixture — must NOT fall into the full-coverage branch. Claiming coverage
+  // is the dangerous direction; withholding it is merely cautious
+  // (ADR-0022 rule 2: a set is what it admits, never what it excludes).
+  if (plan.strategy === "solo" && plan.soloReason === "trivial-repo") {
     return {
       coveredClusters,
       totalClusters,
@@ -896,6 +1098,34 @@ export function completenessCritique(
       symbolCoverage: 1,
       recommendFollowUp: false,
       gaps: ["Solo pass examines the repository directly — full coverage."],
+    };
+  }
+  if (plan.strategy === "solo") {
+    // Scoped, not complete: honest zero coverage of the wider tree, said in
+    // words rather than implied by a number.
+    //
+    // The SENTENCE follows the discriminator, because this branch is reached
+    // two ways. `single-unit-ask` is the designed case. An ABSENT
+    // `soloReason` also lands here — an older producer, a hand-built fixture,
+    // a plan that crossed an MCP boundary — and asserting "answers a
+    // single-unit ask" about a plan that never said so would be inventing the
+    // very fact this branch exists to stop inventing. `recommendFollowUp` is
+    // therefore true for the unknown case: a plan MUON cannot characterise is
+    // exactly one a human should look at.
+    const scoped = plan.soloReason === "single-unit-ask";
+    return {
+      coveredClusters: 0,
+      totalClusters,
+      clusterCoverage: 0,
+      coveredSymbols: 0,
+      totalSymbols,
+      symbolCoverage: 0,
+      recommendFollowUp: !scoped,
+      gaps: [
+        scoped
+          ? "This plan answers a single-unit ask directly. It examines only what that ask names — the rest of the repository is UNEXAMINED, and this is not a coverage pass."
+          : "This solo plan does not say WHY it is solo, so MUON cannot claim it covered anything. Treat the repository as UNEXAMINED and re-plan if coverage matters.",
+      ],
     };
   }
   const truncated = map.repos.filter((r) => r.clustersTruncated);

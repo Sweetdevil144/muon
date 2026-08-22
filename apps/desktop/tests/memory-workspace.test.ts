@@ -95,6 +95,63 @@ const snapshot = {
 };
 
 describe("MemoryWorkspace", () => {
+  it("ADR-0061 D3: the cold-start card renders the three-class vocabulary on an empty library — and counts only for the fence class", async () => {
+    (window as unknown as { muon: unknown }).muon = {
+      memoryColdStart: vi.fn(async () => ({
+        workspacePath: "/repo/alpha",
+        held: { paused: 2, stale: 1 },
+        partitions: [
+          { workspacePath: "/repo/alpha", total: 0 },
+          { workspacePath: "/repo/beta", total: 7 },
+          { workspacePath: null, total: 2 },
+        ],
+      })),
+    };
+    render(
+      React.createElement(MemoryWorkspace, {
+        snapshot: { ...snapshot, notes: [], total: 0 },
+        loading: false,
+        error: null,
+        query: "",
+        onQueryChange: vi.fn(),
+        onRefresh: vi.fn(),
+        onDecide: vi.fn(),
+      })
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "Library" }));
+    // POLICY classes for THIS workspace, with their reasons.
+    expect(
+      await screen.findByText(/2 paused — an operator suspended them/)
+    ).toBeTruthy();
+    expect(screen.getByText(/1 stale — the repo moved under them/)).toBeTruthy();
+    // FENCE class: partition totals only — counts and paths.
+    expect(
+      screen.getByText(/holds 9 notes in 2 other workspaces/)
+    ).toBeTruthy();
+    expect(screen.getByText(/\/repo\/beta · 7/)).toBeTruthy();
+    expect(screen.getByText(/unscoped residue · 2/)).toBeTruthy();
+    // And the fence honesty line.
+    expect(
+      screen.getByText(/Counts only — memory is workspace-fenced/)
+    ).toBeTruthy();
+  });
+
+  it("ADR-0061 D3: no bridge and nothing suppressed render NO card — the page never invents machine-wide claims", () => {
+    render(
+      React.createElement(MemoryWorkspace, {
+        snapshot: { ...snapshot, notes: [], total: 0 },
+        loading: false,
+        error: null,
+        query: "",
+        onQueryChange: vi.fn(),
+        onRefresh: vi.fn(),
+        onDecide: vi.fn(),
+      })
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "Library" }));
+    expect(document.querySelector(".memory-coldstart-card")).toBeNull();
+  });
+
   it("keeps paused memory out of the crew inbox and offers one-action resume in the library", () => {
     const onDecide = vi.fn();
     render(

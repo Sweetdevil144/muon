@@ -88,7 +88,7 @@ export type HandoffArtifact = z.infer<typeof handoffArtifactSchema>;
 
 export const handoffMemoryProposalSchema = z.object({
   kind: z
-    .enum(["decision", "constraint", "convention", "attempt", "question"])
+    .enum(["decision", "constraint", "convention", "attempt", "question", "ownership"])
     .default("attempt"),
   text: z.string().min(1).max(1000),
 });
@@ -100,6 +100,11 @@ export const handoffDegradationSchema = z.object({
 });
 export type HandoffDegradation = z.infer<typeof handoffDegradationSchema>;
 
+/** The PACKET FAMILY's wire anchor (ADR-0070): dispatch pack, wrap/handoff
+ *  packet, and continuation output travel together, so they version together
+ *  — `MUON_PACKET_FAMILY_VERSION`'s major tracks this number, and a consumer
+ *  meeting a HIGHER schemaVersion refuses WHOLE (never best-effort parses a
+ *  shape from the future). Changelog: packages/protocol/PACKETS.md. */
 export const HANDOFF_PACKET_VERSION = 2;
 
 /**
@@ -144,6 +149,24 @@ export const HANDOFF_DEGRADATION = {
    * intersect a check's scope against. Verification is unproven, not false.
    */
   changedFilesUnknown: "changed_files_unknown",
+  /**
+   * ADR-0062: the run ended without answering the BRAIN RECEIPT question
+   * ("did you update the brain?"). Appended SERVER-side at the terminal
+   * transition, so an old runner or a harness that cannot carry the answer
+   * surfaces as a dirty wrap instead of silence-as-default. Completion is
+   * never refused for it — a vendor that cannot answer must not wedge a
+   * lane; it must show up dirty.
+   */
+  noBrainReceipt: "no_brain_receipt",
+  /**
+   * ADR-0062 D3: the receipt disagrees with what the server observed for
+   * this job (offer-ledger add/clone rows + the packet's own memory
+   * proposals). Carries `:claimed_update_no_observed_writes` or
+   * `:observed_writes_exist`. The agent's answer stays stored as given;
+   * the observation rides this reason — both are kept, neither silently
+   * normalized.
+   */
+  brainReceiptMismatch: "brain_receipt_mismatch",
 } as const;
 
 /**
@@ -198,6 +221,16 @@ export const handoffPacketSchema = z.object({
    * Untrusted vendor text: data on a data-only surface, never instructions.
    */
   finalMessage: z.string().max(HANDOFF_FINAL_MESSAGE_CHARS + 1).optional(),
+  /**
+   * ADR-0062: the worker's ANSWER to "did you update the brain?" — a closed
+   * two-value vocabulary, no free-text third state. Optional so every v1/v2
+   * packet parses untouched; ABSENCE is server-stamped as the
+   * `no_brain_receipt` degradation at the terminal transition, never
+   * silently equal to either answer. The server separately checks the
+   * answer against what it observed (D3) — this field is the claim, the
+   * degradation channel carries the observation.
+   */
+  brainReceipt: z.enum(["context_updated", "no_update_required"]).optional(),
   degraded: handoffDegradationSchema.default({ flag: false, reasons: [] }),
 });
 

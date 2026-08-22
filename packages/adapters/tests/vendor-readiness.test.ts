@@ -576,7 +576,10 @@ describe("readiness helpers", () => {
     expect(vendorIsReady(cursorOnly, "cursor", "reviewer")).toBe(true);
     expect(vendorIsReady(cursorOnly, "cursor", "qa")).toBe(true);
     expect(vendorIsReady(cursorOnly, "cursor", "implementer")).toBe(false);
-    expect(vendorIsReady(cursorOnly, "cursor", "orchestrator")).toBe(false);
+    // ADR-0057: Cursor holds the coordinator seat, so it IS ready to
+    // orchestrate. It still cannot implement, which is the line that matters.
+    expect(vendorIsReady(cursorOnly, "cursor", "orchestrator")).toBe(true);
+    expect(vendorIsReady(cursorOnly, "cursor", "docs")).toBe(false);
     // A reviewer with nothing to review is not a working setup.
     expect(anyVendorReady(cursorOnly)).toBe(false);
   });
@@ -592,12 +595,13 @@ describe("readiness helpers", () => {
     ];
     expect(vendorIsReady(opencodeOnly, "opencode")).toBe(true);
     expect(vendorIsReady(opencodeOnly, "opencode", "scout")).toBe(true);
-    // `scout` is the ENTIRE ceiling, so every other role is refused — including
-    // the read-only ones Cursor holds. This lane earns less than Cursor, not
-    // more, and these refusals are what pin that.
+    // `scout` is the entire WORKER ceiling, so every other worker role is
+    // refused — including the read-only ones Cursor holds. As a crew member
+    // this lane earns less than Cursor, not more, and these refusals pin that.
+    // (`orchestrator` is excluded from the list: ADR-0057 seated it, and a
+    // coordinator is not a crew member.)
     for (const role of [
       "implementer",
-      "orchestrator",
       "docs",
       "reviewer",
       "qa",

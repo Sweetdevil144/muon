@@ -37,7 +37,12 @@ export type RevealSurface =
   | "crew"
   | "timeline"
   | "settings"
-  | "inbox";
+  | "inbox"
+  | "digest"
+  | "tasks"
+  | "workflows"
+  | "crew-detail"
+  | "context";
 export type Surface = GateSurface | RevealSurface;
 
 /** Innermost first. A gate outranks every reveal, whenever it opened. */
@@ -100,6 +105,11 @@ const REVEAL_ORDER = [
   "timeline",
   "settings",
   "inbox",
+  "digest",
+  "tasks",
+  "workflows",
+  "crew-detail",
+  "context",
 ] as const satisfies readonly RevealSurface[];
 
 type UnlistedReveal = Exclude<RevealSurface, (typeof REVEAL_ORDER)[number]>;

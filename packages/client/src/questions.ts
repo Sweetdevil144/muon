@@ -1,5 +1,7 @@
 import { z } from "zod";
 import {
+  blockingQuestionWithdrawalSchema,
+  type BlockingQuestionWithdrawal,
   blockingQuestionAnswerSchema,
   blockingQuestionAskSchema,
   blockingQuestionSchema,
@@ -82,13 +84,37 @@ export async function listOwnBlockingQuestions(
 
 /** Agent tier: withdraw one of YOUR OWN open questions. */
 export async function withdrawBlockingQuestion(
-  input: QuestionsRequest & { questionId: string }
+  input: QuestionsRequest & {
+    questionId: string;
+    /** ADR-0069 D2 — the TYPED withdrawal payload (reason WITH the
+     *  citations that settled it, drawn from the question's own disclosed
+     *  pre-answer; the route refuses foreign ids). OMIT for a plain
+     *  withdrawal. Validated locally through the SAME schema the route
+     *  parses, so the invariant has one spelling. */
+    withdrawal?: BlockingQuestionWithdrawal;
+  }
 ): Promise<string> {
+  // REFUSE the pre-boundary flat shape rather than silently converting a
+  // typed withdrawal into a plain one (review finding: a JS caller still
+  // passing top-level reason/citedNoteIds would have lost its provenance
+  // without a sound).
+  if ("reason" in input || "citedNoteIds" in input) {
+    throw new Error(
+      "withdrawBlockingQuestion: pass { withdrawal: { reason, citedNoteIds } } — top-level reason/citedNoteIds are not read."
+    );
+  }
+  // Only literal ABSENCE selects the plain-withdrawal body (review
+  // finding: a falsy-but-supplied value — false, 0, "" — from a JS caller
+  // must be REJECTED by the schema, not silently sent as a plain close).
+  const body =
+    input.withdrawal === undefined
+      ? {}
+      : blockingQuestionWithdrawalSchema.parse(input.withdrawal);
   const result = await questionsJson(
     input,
     `/api/questions/${encodeURIComponent(input.questionId)}/withdraw`,
     z.object({ withdrawn: z.string() }),
-    {}
+    body
   );
   return result.withdrawn;
 }

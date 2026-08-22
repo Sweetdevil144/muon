@@ -29,7 +29,9 @@ async function buildTieredApp(options: {
     branch: string;
     pullNumber: number;
     headSha: string;
+    citedNoteIds?: string[];
   }) => Promise<void>;
+  unknownCitedNotes?: (noteIds: string[]) => Promise<string[]>;
 }) {
   const app = Fastify();
   await app.register(sensible);
@@ -54,6 +56,9 @@ async function buildTieredApp(options: {
       options.authorizePublishedJob ??
       (async () => ({ mergeCommit: LANDED_MERGE_COMMIT })),
     recordPublishAudit: options.recordPublishAudit ?? (async () => undefined),
+    ...(options.unknownCitedNotes
+      ? { unknownCitedNotes: options.unknownCitedNotes }
+      : {}),
   });
   await app.ready();
   return app;
@@ -540,6 +545,116 @@ describe("GitHub operator routes", () => {
         pullNumber: 42,
         headSha: LANDED_MERGE_COMMIT,
       });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("ADR-0065: citedNoteIds render into the PR body via ONE server renderer and ride the publish audit; unknown ids refuse", async () => {
+    const recordPublishAudit = vi.fn().mockResolvedValue(undefined);
+    let postedBody: Record<string, unknown> | undefined;
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/pulls?") && init?.method === undefined) {
+          // Empty until the POST lands — the refused attempt must also see
+          // "no existing PR" so it reaches the citation gate.
+          return postedBody === undefined
+            ? json([])
+            : json([
+                {
+                  number: 43,
+                  title: "Cited publishing",
+                  html_url: "https://github.com/muon/muon/pull/43",
+                  draft: false,
+                  updated_at: "2026-08-22T12:00:00.000Z",
+                  user: { login: "operator" },
+                  head: { sha: LANDED_MERGE_COMMIT, ref: "codex/wave-6" },
+                },
+              ]);
+        }
+        if (url.endsWith("/repos/muon/muon") && init?.method === undefined) {
+          return json({ default_branch: "main" });
+        }
+        if (url.includes("/git/ref/heads/")) {
+          return json({ object: { sha: LANDED_MERGE_COMMIT } });
+        }
+        if (url.endsWith("/repos/muon/muon/pulls") && init?.method === "POST") {
+          postedBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+          return json({
+            number: 43,
+            html_url: "https://github.com/muon/muon/pull/43",
+          });
+        }
+        if (url.endsWith("/status")) {
+          return json({ state: "success", statuses: [] });
+        }
+        if (url.includes("/check-runs?")) {
+          return json({ check_runs: [] });
+        }
+        throw new Error(`unexpected GitHub request: ${url}`);
+      }
+    ) as unknown as typeof fetch;
+    const app = await buildTieredApp({
+      fetcher,
+      recordPublishAudit,
+      unknownCitedNotes: async (ids) =>
+        ids.filter((id) => id === "mem-not-held"),
+    });
+    try {
+      await app.inject({
+        method: "PUT",
+        url: "/credential",
+        headers: auth(OPERATOR),
+        payload: { accessToken: "test-publish-access-token" },
+      });
+      // Unknown citation → BLOCKED before anything is published.
+      const refused = await app.inject({
+        method: "POST",
+        url: "/pull-request",
+        headers: auth(OPERATOR),
+        payload: {
+          jobId: "job-landed",
+          owner: "muon",
+          repo: "muon",
+          headOwner: "operator",
+          branch: "codex/wave-6",
+          title: "Cited publishing",
+          citedNoteIds: ["mem-not-held"],
+        },
+      });
+      expect(refused.statusCode).toBe(409);
+      expect(refused.json().message).toContain("does not hold");
+      expect(postedBody).toBeUndefined();
+
+      const created = await app.inject({
+        method: "POST",
+        url: "/pull-request",
+        headers: auth(OPERATOR),
+        payload: {
+          jobId: "job-landed",
+          owner: "muon",
+          repo: "muon",
+          headOwner: "operator",
+          branch: "codex/wave-6",
+          title: "Cited publishing",
+          body: "Bound to the landed dispatch.",
+          citedNoteIds: ["mem-cite-1", "mem-cite-2", "mem-cite-1"],
+        },
+      });
+      expect(created.statusCode).toBe(200);
+      // ONE server-side renderer appended the section — deduped ids, the
+      // caller's own body preserved above it.
+      expect(postedBody?.body).toBe(
+        "Bound to the landed dispatch.\n\n---\nGrounded in MUON brain notes: mem-cite-1, mem-cite-2"
+      );
+      expect(recordPublishAudit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          operation: "created",
+          pullNumber: 43,
+          citedNoteIds: ["mem-cite-1", "mem-cite-2"],
+        })
+      );
     } finally {
       await app.close();
     }

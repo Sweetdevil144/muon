@@ -1766,8 +1766,8 @@ RETURN count(*) AS c`
         25,
         `gate reads in the last ${options.days} days by empty-reason enum`,
         "n/a",
-        "The producer exists (`recordGateRead` files a `memory.gate_read` Event per pre-edit read), but this brain has served none yet, so there is nothing to count. The shipped enum is {no_anchors, no_notes_on_anchors, withheld_no_crew_chat, withheld_by_gate, withheld_agent_projection, index_unavailable} — §1.2 names `no_anchors_resolved`, which predates the landed enum and corresponds to `no_anchors` / `no_notes_on_anchors`.",
-        "`no_anchors_resolved` dominating (shipped enum: `no_anchors` / `no_notes_on_anchors`)"
+        "The producer exists (`recordGateRead` files a `memory.gate_read` Event per pre-edit read), but this brain has served none yet, so there is nothing to count. The shipped enum is {no_anchors, no_module_anchor, no_notes_on_anchors, withheld_no_crew_chat, withheld_by_gate, withheld_agent_projection, index_unavailable} — §1.2 names `no_anchors_resolved`, which predates the landed enum and corresponds to `no_anchors` / `no_notes_on_anchors`.",
+        "`no_anchors_resolved` dominating (shipped enum: `no_anchors` / `no_module_anchor` / `no_notes_on_anchors`)"
       )
     );
   } else {
@@ -1803,7 +1803,14 @@ RETURN count(*) AS c`
       inWindow += 1;
       byReason[reason] = (byReason[reason] ?? 0) + 1;
     }
-    const noAnchors = (byReason.no_anchors ?? 0) + (byReason.no_notes_on_anchors ?? 0);
+    // `no_module_anchor` belongs in this bucket: it is precisely the traffic
+    // that used to be filed as `no_notes_on_anchors` before the reason was
+    // split out, so omitting it would let the alarm silently go quiet exactly
+    // as the redirected reads grew.
+    const noAnchors =
+      (byReason.no_anchors ?? 0) +
+      (byReason.no_module_anchor ?? 0) +
+      (byReason.no_notes_on_anchors ?? 0);
     push(
       measured(
         25,
@@ -1821,7 +1828,7 @@ RETURN count(*) AS c`
         "n/a",
         alarmWhen(
           inWindow > 0 && noAnchors > inWindow / 2,
-          "`no_anchors_resolved` dominating (shipped enum: `no_anchors` / `no_notes_on_anchors`)",
+          "`no_anchors_resolved` dominating (shipped enum: `no_anchors` / `no_module_anchor` / `no_notes_on_anchors`)",
           inWindow > 0 && noAnchors > inWindow / 2
             ? `${noAnchors} of ${inWindow} empty gate reads are "the coordinate layer had nothing", not "the gate refused" — the §0 hole, measured on live traffic.`
             : null

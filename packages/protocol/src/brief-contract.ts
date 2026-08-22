@@ -292,21 +292,66 @@ export function briefHeadingMandate(): string {
 }
 
 /**
+ * Whether the WORKER this brief is written for will hold a working code graph.
+ *
+ * `"available"` is the default so every existing caller keeps the brief it
+ * already renders; a surface that has actually RESOLVED the question passes what
+ * it resolved.
+ *
+ * Which pathway this governs, since it is not obvious (investigated 2026-08-17):
+ * a dispatched worker's `code_query`/`code_context`/`code_impact` come from a
+ * `muon-mcp` the runner injects as a stdio MCP server
+ * (`withMuonMcpServer` → `command: "muon-mcp"`), so they resolve through THAT
+ * process's bundled-CLI resolver. They do NOT route through a brain-side
+ * GitNexus gateway — the MCP handlers spawn the CLI locally. So this flag's only
+ * honest source is the same bundled-CLI resolution the coordinator's own
+ * `muon-mcp` performed: same install, same binary name on PATH. (The desktop
+ * and the backend resolve the graph SEPARATELY, with their own candidate paths;
+ * neither is what a worker's code tools use.)
+ */
+export type BriefCodeGraphState = "available" | "unavailable";
+
+export type ChildBriefSkeletonOptions = {
+  readonly codeGraph?: BriefCodeGraphState;
+};
+
+/**
  * One compliant brief, quoted verbatim wherever a contract failure is reported.
  * A verdict that names what is missing still costs a round trip if the
  * coordinator has to guess the shape; the remedy is quoted so the repair is
  * mechanical. The drift-lock feeds this skeleton back through the verifier, so
  * the example MUON hands out is provably one MUON accepts.
  */
-export function childBriefSkeleton(): string {
+export function childBriefSkeleton(
+  options: ChildBriefSkeletonOptions = {}
+): string {
   const value: Record<string, string> = {
     ROLE: "<the filed task's ROLE, verbatim>",
     "OWNED SCOPE": "<the filed task's OWNED SCOPE paths, verbatim; everything else read-only>",
     GOAL: "<the outcome, one sentence>",
     MODE: "implement | research | review",
     CONTEXT: "<confirmed memory + graph evidence, quoted; the worker cannot see this chat>",
+    // AN ORDER A WORKER CANNOT OBEY IS NOT DISCIPLINE. On an install whose
+    // `muon-mcp` has no reachable `gitnexus` CLI, every tool this line names is
+    // registered and refuses, so the canonical wording contractually sends the
+    // worker into seven refusals and then tells it to STOP on the "unavailable
+    // evidence" it was guaranteed to get — a brief that is unsatisfiable by
+    // construction, on the very install the release tarball produces.
+    //
+    // The degraded wording is a NAMED TOOL GAP, matching A10's vocabulary
+    // (`staleIndexBlock` in @muon/core, which the runner raises for a stale
+    // index): say the gap, refuse the substitution, do the work that IS
+    // possible, and report which conclusions rest on file reads alone.
+    //
+    // Nothing is weakened by this. The enforcement is elsewhere and unchanged —
+    // `preflight_edit` composes `code_impact` and fails closed, `review_diff`
+    // goes review-blind, `ship` refuses without review evidence. This line is
+    // the brief-side echo of those gates, and an echo of a gate that cannot run
+    // has to say so rather than pretend the gate is a step in a plan.
     "GRAPH DISCIPLINE":
-      "code_query the flows, code_context every symbol named here, code_impact + preflight_edit before any edit; STOP on HIGH/CRITICAL, stale, or unavailable evidence",
+      options.codeGraph === "unavailable"
+        ? "TOOL GAP — this install has NO reachable code graph: code_query, code_context, code_impact and preflight_edit are registered and all REFUSE, so graph evidence is unavailable, which is UNKNOWN risk and never an implicit all-clear. Read and grep the files instead; do NOT report a text search as if it were a graph query; still STOP on anything you judge HIGH/CRITICAL, and name in FINAL REPORT every conclusion that rests on file reads alone. Tell the human the graph is absent rather than retrying the refusing tools"
+        : "code_query the flows, code_context every symbol named here, code_impact + preflight_edit before any edit; STOP on HIGH/CRITICAL, stale, or unavailable evidence",
     COORDINATION: "<paths to claim, who to send review_request to, when to check peer_inbox>",
     DELIVERABLES: "<the artifacts/edits that prove this unit is done>",
     CHECKS: "<exact verification commands>",

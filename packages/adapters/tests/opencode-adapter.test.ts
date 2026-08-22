@@ -469,8 +469,14 @@ describe("stripOpencodeWideningArgs (net 3 — the categorical argv net)", () =>
 });
 
 describe("OpencodeAdapter — the invocation and the ceiling", () => {
-  it("declares scout and NOTHING else", () => {
-    expect([...new OpencodeAdapter().supportedRoles]).toEqual(["scout"]);
+  it("declares scout as its only WORKER role (plus the seat's orchestrator)", () => {
+    // ADR-0057 added `orchestrator` for the coordinator seat. The worker
+    // ceiling — what MUON may dispatch INTO this lane as a crew member — is
+    // still exactly `scout`, which is what this assertion guards.
+    expect([...new OpencodeAdapter().supportedRoles]).toEqual([
+      "orchestrator",
+      "scout",
+    ]);
   });
 
   it("emits the fixed read-only invocation, carries --pure, and never names an agent", () => {
@@ -499,9 +505,13 @@ describe("OpencodeAdapter — the invocation and the ceiling", () => {
 
   it("refuses every role outside the ceiling, including read-only ones", async () => {
     const adapter = new OpencodeAdapter();
+    // `orchestrator` left this list with ADR-0057: a seated vendor gets a
+    // reserved coordinator lane, so its own adapter must not refuse the role
+    // the seat exists to hold. Everything else stays refused — including the
+    // READ-ONLY roles, which is the point: OpenCode's worker ceiling is
+    // `scout` alone, and being able to coordinate does not widen it.
     for (const role of [
       "implementer",
-      "orchestrator",
       "docs",
       "reviewer",
       "qa",

@@ -33,8 +33,11 @@ import { ATTACHED_COORDINATOR_CAPABILITY_MODE } from "@muon/protocol";
 import {
   daemonAttachState,
   hydrateAttendance,
+  hydratePreviousSessionEnd,
   noteHumanPresent,
   isAttendingSurface,
+  PRESENCE_SESSION_GAP_MS,
+  previousSessionEnd,
   resetAttendanceForTests,
   SURFACE_ATTENDED_FRESH_MS,
 } from "../src/lib/surface-attendance.js";
@@ -48,6 +51,45 @@ describe("the unattended horizon sweep", () => {
     dbMock.prisma.operatorSetting.findUnique.mockResolvedValue(null as never);
     dbMock.prisma.dispatchJob.findMany.mockResolvedValue([] as never);
     terminalize.terminalizeJobLineage.mockResolvedValue(true as never);
+  });
+
+  it("ADR-0085 D1: the return-stamp ROLLS the boundary to the ENDED session's last look, atomically", () => {
+    const start = Date.now() - 5 * HOUR;
+    // A working session: several assertions inside the gap threshold. None
+    // of them rolls — the boundary only moves on a RETURN.
+    noteHumanPresent("tui", start);
+    noteHumanPresent("tui", start + 60_000);
+    const lastLook = start + 120_000;
+    noteHumanPresent("tui", lastLook);
+    expect(previousSessionEnd()).toBeNull();
+
+    // The return, hours later: the OLD lastSeenAt — the ended session's
+    // LAST look, not its start — becomes the digest boundary, and the new
+    // stamp lands in the same synchronous body.
+    const returnAt = lastLook + PRESENCE_SESSION_GAP_MS + 60_000;
+    noteHumanPresent("tui", returnAt);
+    expect(previousSessionEnd()).toBe(lastLook);
+    expect(daemonAttachState(returnAt).lastAttachedAt).toBe(returnAt);
+
+    // A short pause inside the NEW session never re-rolls the boundary.
+    noteHumanPresent("tui", returnAt + 60_000);
+    expect(previousSessionEnd()).toBe(lastLook);
+
+    // A SECOND absence rolls again — the boundary is always the PREVIOUS
+    // session's end, never an accumulation.
+    const secondReturn = returnAt + 60_000 + PRESENCE_SESSION_GAP_MS + 1;
+    noteHumanPresent("tui", secondReturn);
+    expect(previousSessionEnd()).toBe(returnAt + 60_000);
+  });
+
+  it("ADR-0085: the boundary hydrates with the same clock distrust as the stamp", () => {
+    hydratePreviousSessionEnd(Date.now() + HOUR); // future → distrusted
+    expect(previousSessionEnd()).toBeNull();
+    const past = Date.now() - HOUR;
+    hydratePreviousSessionEnd(past);
+    expect(previousSessionEnd()).toBe(past);
+    hydratePreviousSessionEnd(past - HOUR); // older never regresses it
+    expect(previousSessionEnd()).toBe(past);
   });
 
   it("a daemon NOBODY has ever attended still ages and expires", () => {

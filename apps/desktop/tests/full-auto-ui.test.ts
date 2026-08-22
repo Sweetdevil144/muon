@@ -28,14 +28,20 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function sidebarProps(fullAuto: boolean, onSetFullAutoVendors = vi.fn()) {
+function sidebarProps(
+  fullAuto: boolean,
+  onSetFullAutoVendors = vi.fn(),
+  // P0-1: a SUBSET is representable (IPC + persisted state accept one), so
+  // the panel's honesty under it is pinned with an explicit override.
+  fullAutoVendors?: string[]
+) {
   const state = {
     chats: [],
     fleet: { counts: {}, agents: [] },
     fullAuto,
     // Vendor-scoped consent: the boolean helper keeps the legacy meaning —
     // true == every lane selected, false == none.
-    fullAutoVendors: fullAuto ? [...FLEET_VENDORS] : [],
+    fullAutoVendors: fullAutoVendors ?? (fullAuto ? [...FLEET_VENDORS] : []),
   } as unknown as DesktopState;
   return {
     state,
@@ -55,80 +61,90 @@ function sidebarProps(fullAuto: boolean, onSetFullAutoVendors = vi.fn()) {
   };
 }
 
-describe("Sidebar full-auto ('Auto-approve all') control", () => {
-  it("shows the Auto-approve toggle without opening any drawer (always visible)", () => {
+describe("Sidebar full-auto ('Auto-approve') control", () => {
+  it("shows the Auto-approve button without opening any drawer (always visible)", () => {
     const { container } = render(
       React.createElement(Sidebar, sidebarProps(false))
     );
     expect(
-      screen.getByRole("checkbox", { name: /auto-approve all/i })
+      screen.getByRole("button", { name: /^auto-approve$/i })
     ).toBeTruthy();
-    // Must stay in the always-visible Auto-approve section (not a drawer).
     expect(
       container.querySelector(".side-setup .full-auto-panel")
     ).toBeNull();
     expect(
       container.querySelector(".full-auto-section .full-auto-panel")
     ).toBeTruthy();
+    expect(container.querySelector(".full-auto-lanes")).toBeNull();
   });
 
-  it("reflects state.fullAuto === true as the checkbox's checked state", () => {
+  it("reflects state.fullAuto === true as the button's pressed state", () => {
     render(React.createElement(Sidebar, sidebarProps(true)));
-    const checkbox = screen.getByRole("checkbox", {
-      name: /auto-approve all/i,
-    }) as HTMLInputElement;
-    expect(checkbox.checked).toBe(true);
+    expect(
+      screen.getByRole("button", { name: /^auto-approve$/i }).getAttribute("aria-pressed")
+    ).toBe("true");
   });
 
-  it("reflects state.fullAuto === false as unchecked (RED until wired: no dead default-on control)", () => {
+  it("reflects state.fullAuto === false as not pressed", () => {
     render(React.createElement(Sidebar, sidebarProps(false)));
-    const checkbox = screen.getByRole("checkbox", {
-      name: /auto-approve all/i,
-    }) as HTMLInputElement;
-    expect(checkbox.checked).toBe(false);
+    expect(
+      screen.getByRole("button", { name: /^auto-approve$/i }).getAttribute("aria-pressed")
+    ).toBe("false");
   });
 
-  it("switching the all-lanes box ON selects every managed lane", () => {
+  it("switching ON selects every managed lane", () => {
     const onSetFullAutoVendors = vi.fn();
     render(
       React.createElement(Sidebar, sidebarProps(false, onSetFullAutoVendors))
     );
-    fireEvent.click(
-      screen.getByRole("checkbox", { name: /auto-approve all/i })
-    );
+    fireEvent.click(screen.getByRole("button", { name: /^auto-approve$/i }));
     expect(onSetFullAutoVendors).toHaveBeenCalledTimes(1);
     expect(onSetFullAutoVendors).toHaveBeenCalledWith([...FLEET_VENDORS]);
   });
 
-  it("switching the all-lanes box OFF clears the selection", () => {
+  it("switching OFF clears the selection", () => {
     const onSetFullAutoVendors = vi.fn();
     render(
       React.createElement(Sidebar, sidebarProps(true, onSetFullAutoVendors))
     );
-    fireEvent.click(
-      screen.getByRole("checkbox", { name: /auto-approve all/i })
-    );
+    fireEvent.click(screen.getByRole("button", { name: /^auto-approve$/i }));
     expect(onSetFullAutoVendors).toHaveBeenCalledWith([]);
   });
 
-  it("unchecking ONE lane narrows the selection to the remaining lanes", () => {
-    const onSetFullAutoVendors = vi.fn();
-    render(
-      React.createElement(Sidebar, sidebarProps(true, onSetFullAutoVendors))
+  it("P0-1: a SUBSET is pressed and dangerous but NEVER says 'every lane' — it names its lanes", () => {
+    const subset = [FLEET_VENDORS[0]!];
+    const { container } = render(
+      React.createElement(Sidebar, sidebarProps(false, vi.fn(), subset))
     );
-    const first = FLEET_VENDORS[0]!;
-    const label = FLEET_VENDOR_LABELS[first] ?? first;
-    fireEvent.click(
-      screen.getByRole("checkbox", { name: new RegExp(`^${label}$`, "i") })
-    );
-    expect(onSetFullAutoVendors).toHaveBeenCalledWith(
-      FLEET_VENDORS.filter((vendor) => vendor !== first)
-    );
+    // Armed: any lane with gates off deserves the danger rail...
+    expect(
+      screen
+        .getByRole("button", { name: /^auto-approve$/i })
+        .getAttribute("aria-pressed")
+    ).toBe("true");
+    expect(container.querySelector(".full-auto-panel.armed")).toBeTruthy();
+    // ...but the COPY tells the truth: named lanes, others still ask.
+    const copy = container.querySelector("#full-auto-copy")!.textContent!;
+    expect(copy).not.toMatch(/every lane/i);
+    expect(copy).toMatch(/only — other lanes still ask/i);
+    // The DISCLOSURE itself: the armed lane is named (cubic: without this,
+    // "On for  only —" would pass while naming nothing).
+    expect(copy).toContain(FLEET_VENDOR_LABELS[FLEET_VENDORS[0]!]);
   });
 
+  it("P0-1: clicking while a subset is armed only NARROWS (clears), never widens", () => {
+    const onSetFullAutoVendors = vi.fn();
+    render(
+      React.createElement(
+        Sidebar,
+        sidebarProps(false, onSetFullAutoVendors, [FLEET_VENDORS[0]!])
+      )
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^auto-approve$/i }));
+    expect(onSetFullAutoVendors).toHaveBeenCalledWith([]);
+  });
 
-
-  it("styles the control as dangerous (armed = solid red fill), not a quiet toggle", () => {
+  it("styles the control as dangerous when armed", () => {
     const { container: onContainer } = render(
       React.createElement(Sidebar, sidebarProps(true))
     );
@@ -210,12 +226,12 @@ describe("App full-auto: real IPC wiring + titlebar indicator", () => {
     expect(indicator.textContent).toMatch(/full auto.*safety gates off/i);
   });
 
-  it("flipping the all-lanes box calls window.muon.setFullAutoVendors with every lane (no dead control)", async () => {
+  it("flipping Auto-approve ON calls window.muon.setFullAutoVendors with every lane", async () => {
     const muon = mockMuon(baseState({ fullAuto: false }));
     render(React.createElement(App));
     await screen.findAllByText("MUON");
 
-    fireEvent.click(screen.getByRole("checkbox", { name: /auto-approve all/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^auto-approve$/i }));
 
     await waitFor(() => {
       expect(muon.setFullAutoVendors).toHaveBeenCalledWith([...FLEET_VENDORS]);
@@ -228,7 +244,7 @@ describe("App full-auto: real IPC wiring + titlebar indicator", () => {
     await screen.findAllByText("MUON");
     expect(screen.queryByRole("status")).toBeFalsy();
 
-    fireEvent.click(screen.getByRole("checkbox", { name: /auto-approve all/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^auto-approve$/i }));
 
     await waitFor(() => {
       expect(muon.setFullAutoVendors).toHaveBeenCalledWith([...FLEET_VENDORS]);

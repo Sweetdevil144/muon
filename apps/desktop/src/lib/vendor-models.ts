@@ -224,6 +224,22 @@ function parseOpencodeModels(stdout: string): VendorModelOption[] {
   return models;
 }
 
+/**
+ * Strip ANSI SGR/control sequences before parsing.
+ *
+ * `cursor-agent 2026.08.11` colours `models` output even when piped (TERM=dumb
+ * notwithstanding), so the line the parser saw was
+ * `\x1b[36mauto\x1b[39m \x1b[2m- Auto\x1b[22m…` — no literal " - " anywhere,
+ * every row skipped, and the whole live catalogue silently fell back. Applied
+ * to EVERY vendor's stdout at the one probe call site, not inside one parser:
+ * any of these CLIs can start colouring at any release, and this failure mode
+ * (fallback that looks like a working answer) is the quiet kind.
+ */
+function stripAnsi(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\u001B\[[0-9;?]*[ -\/]*[@-~]/g, "");
+}
+
 type CliCatalogProbe = {
   file: string;
   args: readonly string[];
@@ -249,6 +265,11 @@ const CLI_CATALOG_PROBES: Partial<Record<VendorId, CliCatalogProbe>> = {
   },
 };
 
+/** Test seam: the exact strip+parse pipeline the cursor probe runs. */
+export function parseCursorModelsForTest(stdout: string): VendorModelOption[] {
+  return parseCursorModels(stripAnsi(stdout));
+}
+
 export async function listVendorModels(
   vendor: VendorId
 ): Promise<VendorModelCatalog> {
@@ -266,7 +287,7 @@ export async function listVendorModels(
       maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, TERM: "dumb" },
     });
-    const models = probe.parse(String(stdout));
+    const models = probe.parse(stripAnsi(String(stdout)));
     if (models.length > 0) {
       return { vendor, source: "cli", models };
     }
@@ -655,7 +676,7 @@ const resolutionInFlight = new Map<string, Promise<VendorModelResolution>>();
  * two-answers drift this change exists to close.
  */
 function resolutionKey(vendor: VendorId, projectDir: string | null): string {
-  return `${vendor} ${projectDir ?? ""}`;
+  return `${vendor}\u0000${projectDir ?? ""}`;
 }
 
 export type VendorModelProbeDeps = {

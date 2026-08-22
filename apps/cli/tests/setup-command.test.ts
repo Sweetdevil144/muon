@@ -9,6 +9,7 @@ import {
   type McpVendorIo,
 } from "@muon/client/mcp-vendor-config";
 import { readEnrolment } from "@muon/client/enrolment";
+import { enrolledVendorIds, writeEnrolment } from "@muon/client/enrolment";
 import { fakeVendorRunner, type Spawned } from "./helpers/fake-vendor-cli.js";
 import {
   enrolmentHealth,
@@ -89,10 +90,10 @@ describe("muon setup — one step, and it remembers", () => {
     const stored = readEnrolment(h.dataDir);
     expect(stored.ok).toBe(true);
     if (stored.ok) {
-      expect(stored.enrolment.vendors).toContain("claude-code");
-      expect(stored.enrolment.vendors).toContain("codex");
+      expect(enrolledVendorIds(stored.enrolment)).toContain("claude-code");
+      expect(enrolledVendorIds(stored.enrolment)).toContain("codex");
       // The DURABLE mode: no capability file, no token, no lease.
-      expect(stored.enrolment.mode).toBe("base");
+      expect(stored.enrolment.vendors.every((vendor) => vendor.mode === "base")).toBe(true);
     }
   });
 
@@ -103,7 +104,7 @@ describe("muon setup — one step, and it remembers", () => {
     await runSetup(h, []);
     const stored = readEnrolment(h.dataDir);
     if (stored.ok) {
-      expect(stored.enrolment.vendors).toEqual(["claude-code"]);
+      expect(stored.enrolment.vendors).toEqual([{ id: "claude-code", mode: "base" }]);
     }
   });
 
@@ -241,5 +242,50 @@ describe("setup never silently downgrades a coordinator seat", () => {
       fs.readFileSync(path.join(h.io.roots.home, ".claude.json"), "utf8")
     );
     expect(after.mcpServers.muon.env.MUON_MCP_MODE).toBeUndefined();
+  });
+});
+
+describe("--repair restores each vendor in ITS recorded mode (enrolment v2)", () => {
+  it("an observer-recorded vendor repairs as observer, base as base, and the record survives", async () => {
+    const h = harness();
+    writeEnrolment(
+      {
+        vendors: [
+          { id: "claude-code", mode: "observer" },
+          { id: "codex", mode: "base" },
+        ],
+      },
+      h.dataDir
+    );
+    const argv = process.argv[1];
+    process.argv[1] = "/opt/muon/bin/muon";
+    try {
+      await runSetup(h, ["--repair"]);
+    } finally {
+      process.argv[1] = argv;
+    }
+    // The registrations carry each vendor's OWN recorded mode: claude-code's
+    // entry declares observer, codex's does not — flattening through the
+    // single CLI-level mode silently converted every observer registration to
+    // base on a plain repair.
+    const claude = JSON.parse(
+      fs.readFileSync(path.join(h.home, ".claude.json"), "utf8")
+    ) as { mcpServers: Record<string, { env?: Record<string, string> }> };
+    expect(claude.mcpServers.muon?.env?.MUON_MCP_MODE).toBe("observer");
+    const codexToml = fs.readFileSync(
+      path.join(h.home, ".codex", "config.toml"),
+      "utf8"
+    );
+    expect(codexToml).toContain("[mcp_servers.muon]");
+    expect(codexToml).not.toContain('MUON_MCP_MODE = "observer"');
+    // …and the RECORD still tells the truth about both.
+    const stored = readEnrolment(h.dataDir);
+    expect(stored.ok).toBe(true);
+    if (stored.ok) {
+      expect(stored.enrolment.vendors).toEqual([
+        { id: "claude-code", mode: "observer" },
+        { id: "codex", mode: "base" },
+      ]);
+    }
   });
 });

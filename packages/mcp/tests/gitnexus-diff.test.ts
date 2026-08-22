@@ -9,6 +9,7 @@ import {
   type GitNexusRunner,
   type SiblingTaskDiff,
 } from "../src/gitnexus-tools.js";
+import { createReviewDiffLedger } from "../src/review-session.js";
 
 const env = (markdown: string, rowCount: number) =>
   JSON.stringify({ markdown, row_count: rowCount });
@@ -229,6 +230,49 @@ describe("review_diff tool (fail-closed, injected git + cypher)", () => {
     expect(result.isError).toBe(true);
   });
 
+  // ADR-0065: the STRUCTURED citation channel on review evidence — recorded
+  // beside the verdict and echoed in the payload; a malformed list REFUSES
+  // (stated provenance intent must not be silently dropped); never a grammar.
+  it("carries cited_note_ids onto the review payload and the session ledger; malformed refuses", async () => {
+    const ledger = createReviewDiffLedger();
+    const citedTool = createGitNexusToolDefinitions({
+      workspacePath: WS,
+      binary: "/fake/node",
+      run: fakeRun,
+      reviewLedger: ledger,
+    }).find((t) => t.name === "review_diff")!;
+
+    const result = await citedTool.handler({
+      scope: "all",
+      cited_note_ids: ["mem-review-a", "mem-review-b", "mem-review-a"],
+    });
+    expect(result.isError).toBeFalsy();
+    const payload = (
+      result.structuredContent as {
+        reviewDiff: { id: string; citedNoteIds?: string[] };
+      }
+    ).reviewDiff;
+    // Deduped, order-preserving.
+    expect(payload.citedNoteIds).toEqual(["mem-review-a", "mem-review-b"]);
+    const record = [...ledger.values()].find((row) => row.id === payload.id);
+    expect(record?.citedNoteIds).toEqual(["mem-review-a", "mem-review-b"]);
+
+    const refused = await citedTool.handler({
+      scope: "all",
+      cited_note_ids: ["", "mem-x"],
+    });
+    expect(refused.isError).toBe(true);
+
+    // Without the field, the record carries an EMPTY set — absence is
+    // "cited nothing", never an invented citation.
+    const bare = await citedTool.handler({ scope: "all" });
+    expect(bare.isError).toBeFalsy();
+    const bareId = (
+      bare.structuredContent as { reviewDiff: { id: string; citedNoteIds?: string[] } }
+    ).reviewDiff;
+    expect(bareId.citedNoteIds).toBeUndefined();
+  });
+
   // The review lane's sibling arm: review_diff({taskId}) maps the diff the
   // CONTROL PLANE serves (the implementer task's worktree) instead of the
   // caller's own tree — which is empty in a reviewer's fresh worktree, the
@@ -329,6 +373,209 @@ describe("review_diff tool (fail-closed, injected git + cypher)", () => {
       const result = await tool().handler({ taskId: "task-impl" });
       expect(result.isError).toBe(true);
     });
+  });
+});
+
+// ── Index freshness is THREE states, and UNKNOWN is one of them ──────────────
+//
+// The defect this pins: `stale` fell back to `false` whenever the store's
+// indexed commit OR the diff's own commit could not be read — byte-identical to
+// a VERIFIED-CURRENT index, on the one tool whose verdict `ship`'s preflight and
+// the desktop's merge lane both stand on. So an index MUON never measured
+// reached `flows-resolved`, and "0 flows affected" became a pass. Driven through
+// the real handler with injected git + CLI, one case per readable/unreadable
+// combination, asserting the VERDICT and the emitted freshness — never source
+// text.
+
+describe("review_diff index freshness (fail-closed on UNKNOWN)", () => {
+  const WS = WORKSPACE;
+  type Freshness = {
+    graphCommit?: string;
+    headCommit?: string;
+    stale: boolean | null;
+    unmeasured?: string;
+  };
+
+  /** One indexed, resolvable changed file — so the ONLY thing that can force a
+   *  blind verdict in these cases is the index freshness itself. */
+  const freshnessRun = (input: {
+    indexedCommit?: string;
+    headCommit?: string;
+  }): GitNexusRunner => {
+    return async (binary, args) => {
+      if (binary === "git") {
+        if (args.includes("--git-common-dir")) {
+          return { stdout: `${WS}/.git\n`, stderr: "" };
+        }
+        if (args.includes("--name-only")) {
+          return { stdout: "src/gate.ts\n", stderr: "" };
+        }
+        if (args.includes("rev-parse")) {
+          // Empty stdout = git answered nothing: the diff's own commit is
+          // unreadable (detached/broken checkout, git unavailable).
+          return {
+            stdout: input.headCommit ? `${input.headCommit}\n` : "\n",
+            stderr: "",
+          };
+        }
+        return {
+          stdout:
+            "diff --git a/src/gate.ts b/src/gate.ts\n+++ b/src/gate.ts\n@@ -10,2 +10,4 @@",
+          stderr: "",
+        };
+      }
+      const command = args.find((a) => a === "list" || a === "cypher");
+      if (command === "list") {
+        // A block with NO `Commit:` line is a store whose indexed commit cannot
+        // be read — a half-written or legacy meta, indistinguishable to the
+        // caller from a current one before this fix.
+        return {
+          stdout: `\n  Indexed Repositories (1)\n\n  muon\n    Path:    ${WS}\n    Indexed: now\n${
+            input.indexedCommit ? `    Commit:  ${input.indexedCommit}\n` : ""
+          }`,
+          stderr: "",
+        };
+      }
+      if (command === "cypher") {
+        const query = args[args.length - 1] ?? "";
+        if (query.includes("f:File")) {
+          return {
+            stdout: env("| fp |\n| --- |\n| src/gate.ts |", 1),
+            stderr: "",
+          };
+        }
+        if (query.includes("STEP_IN_PROCESS")) {
+          return {
+            stdout: env(
+              "| file | symbol | startLine | endLine | process | processId | entryPointId | step |\n| --- |\n| src/gate.ts | redeemGate | 8 | 20 | RedeemGateAtRoute | proc_1 | ep_1 | 3 |",
+              1
+            ),
+            stderr: "",
+          };
+        }
+        return {
+          stdout: env(
+            "| file | name | kind | startLine | endLine |\n| --- |\n| src/gate.ts | redeemGate | Function | 8 | 20 |",
+            1
+          ),
+          stderr: "",
+        };
+      }
+      return { stdout: "", stderr: "" };
+    };
+  };
+
+  const review = async (input: {
+    indexedCommit?: string;
+    headCommit?: string;
+  }) => {
+    const tool = createGitNexusToolDefinitions({
+      workspacePath: WS,
+      binary: "/fake/node",
+      run: freshnessRun(input),
+    }).find((entry) => entry.name === "review_diff")!;
+    const result = await tool.handler({ scope: "all" });
+    expect(result.isError, JSON.stringify(result)).toBeFalsy();
+    return {
+      impact: (
+        result.structuredContent as {
+          reviewDiff: {
+            verdict: string;
+            notes: string[];
+            indexFreshness: Freshness;
+          };
+        }
+      ).reviewDiff,
+      ui: result.ui as {
+        degradation?: { active?: boolean; reason?: string; action?: string };
+      },
+    };
+  };
+
+  it("readable + current: the review resolves, and freshness says so", async () => {
+    const { impact, ui } = await review({
+      indexedCommit: "7ed0bbd",
+      headCommit: "7ed0bbdCAFE",
+    });
+    expect(impact.verdict).toBe("flows-resolved");
+    expect(impact.indexFreshness.stale).toBe(false);
+    expect(impact.indexFreshness.unmeasured).toBeUndefined();
+    expect(ui.degradation?.active).toBe(false);
+  });
+
+  it("readable + stale: review-blind, and the note names the staleness", async () => {
+    const { impact, ui } = await review({
+      indexedCommit: "deadbee",
+      headCommit: "7ed0bbdCAFE",
+    });
+    expect(impact.verdict).toBe("review-blind");
+    expect(impact.indexFreshness.stale).toBe(true);
+    expect(impact.notes.join(" ")).toMatch(/Index is STALE/);
+    expect(ui.degradation?.active).toBe(true);
+  });
+
+  it("UNREADABLE store commit: UNKNOWN, never `stale: false`, and never resolved", async () => {
+    const { impact, ui } = await review({ headCommit: "7ed0bbdCAFE" });
+    // The whole finding in one line: an unmeasurable index used to report the
+    // value a verified-current one reports.
+    expect(impact.indexFreshness.stale).not.toBe(false);
+    expect(impact.indexFreshness.stale).toBeNull();
+    expect(impact.verdict).toBe("review-blind");
+    // The copy names WHAT could not be measured…
+    expect(impact.indexFreshness.unmeasured).toMatch(/no indexed commit/);
+    expect(impact.notes.join(" ")).toMatch(/could not be MEASURED/);
+    // …and the remedy ADR-0054 shipped, not the destructive one.
+    expect(impact.notes.join(" ")).toMatch(/muon graph reindex/);
+    expect(ui.degradation?.active).toBe(true);
+    expect(ui.degradation?.action).toMatch(/muon graph reindex/);
+    // Nothing may claim a comparison MUON never made.
+    expect(impact.notes.join(" ")).not.toMatch(/Index is STALE/);
+  });
+
+  it("UNREADABLE diff commit: same UNKNOWN state, and it says which fact was missing", async () => {
+    const { impact, ui } = await review({ indexedCommit: "7ed0bbd" });
+    expect(impact.indexFreshness.stale).toBeNull();
+    expect(impact.indexFreshness.graphCommit).toBe("7ed0bbd");
+    expect(impact.verdict).toBe("review-blind");
+    expect(impact.indexFreshness.unmeasured).toMatch(
+      /commit this diff applies to/
+    );
+    expect(ui.degradation?.active).toBe(true);
+    expect(impact.notes.join(" ")).not.toMatch(/Index is STALE/);
+  });
+
+  it("an EMPTY diff stays no-op, but still reports the index it could not measure", async () => {
+    const emptyRun: GitNexusRunner = async (binary, args, options) => {
+      if (binary === "git" && args.includes("--name-only")) {
+        return { stdout: "\n", stderr: "" };
+      }
+      return freshnessRun({ headCommit: "7ed0bbdCAFE" })(binary, args, options);
+    };
+    const tool = createGitNexusToolDefinitions({
+      workspacePath: WS,
+      binary: "/fake/node",
+      run: emptyRun,
+    }).find((entry) => entry.name === "review_diff")!;
+    const result = await tool.handler({ scope: "all" });
+    expect(result.isError).toBeFalsy();
+    const impact = (
+      result.structuredContent as {
+        reviewDiff: {
+          verdict: string;
+          notes: string[];
+          indexFreshness: Freshness;
+        };
+      }
+    ).reviewDiff;
+    // Nothing changed, so there is nothing to be blind about — and `ship`
+    // refuses a no-op verdict regardless. What must NOT happen is the envelope
+    // reading as an all-clear about the index.
+    expect(impact.verdict).toBe("no-op");
+    expect(impact.indexFreshness.stale).toBeNull();
+    expect(impact.notes.join(" ")).toMatch(/could not be MEASURED/);
+    expect(
+      (result.ui as { degradation?: { active?: boolean } }).degradation?.active
+    ).toBe(true);
   });
 });
 

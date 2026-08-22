@@ -179,6 +179,10 @@ describe("App crew-click per-chat open (S8)", () => {
       expect.objectContaining({ runId: "job-old" })
     );
 
+    // H8: the rail follows the human into repo-b, so repo-a closed behind
+    // them. Re-open it to check the invariant that matters — exactly one row
+    // reads as active, and it is not chat A's.
+    fireEvent.click(screen.getByRole("button", { name: "repo-a — 1 session" }));
     expect(chatARow()?.className).not.toContain("active");
 
     // ...and the full live SessionWorkspace renders, opened straight on the

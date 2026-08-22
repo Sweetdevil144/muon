@@ -49,9 +49,13 @@ describe("the live surface is scored against this tree", () => {
       (name) =>
         name !== "publish_finding" &&
         name !== "question_ask" &&
-        name !== "question_status"
+        name !== "question_status" &&
+        name !== "question_withdraw"
     );
-    expect(stale).toHaveLength(27);
+    // base grew: ADR-0058 memory_ground; ADR-0069 adds question_withdraw
+    // (filtered above with its siblings, so this stale surface stays the
+    // same three-missing shape the incident recorded — plus the new verb).
+    expect(stale).toHaveLength(32);
 
     const verdict = compareLiveTools(stale, "base");
     expect(verdict.level).toBe("stale");
@@ -59,9 +63,12 @@ describe("the live surface is scored against this tree", () => {
       "publish_finding",
       "question_ask",
       "question_status",
+      "question_withdraw",
     ]);
-    expect(verdict.liveCount).toBe(27);
-    expect(verdict.expectedCount).toBe(30);
+    expect(verdict.liveCount).toBe(32);
+    // 36 = 35 + ADR-0069's question_withdraw (the 35 was 31 + ADR-0053's
+    // three docs-graph READS + ADR-0058's memory_ground).
+    expect(verdict.expectedCount).toBe(36);
     // The operator has to be told what to DO, not merely that something is off.
     expect(verdict.detail).toMatch(/npm run build/);
     expect(verdict.detail).toMatch(/publish_finding/);

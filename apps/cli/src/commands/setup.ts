@@ -10,8 +10,11 @@ import {
   type McpVendorIo,
 } from "@muon/client/mcp-vendor-config";
 import { readEnrolment, writeEnrolment } from "@muon/client/enrolment";
+import { resolveDataDir } from "@muon/client/paths";
 import { failCommand } from "../lib/refusal.js";
 import { printJson } from "../lib/output.js";
+import { runInteractiveSetup } from "../lib/setup-wizard-run.js";
+import type { MuonApiClient } from "../lib/api-client.js";
 
 /**
  * ONE COMMAND THAT SETS MUON UP, and one that repairs it.
@@ -35,7 +38,8 @@ import { printJson } from "../lib/output.js";
  */
 export function registerSetupCommands(
   program: Command,
-  deps?: { io?: McpVendorIo; dataDir?: string }
+  deps?: { io?: McpVendorIo; dataDir?: string },
+  createClient?: () => MuonApiClient
 ) {
   const io = () => deps?.io ?? defaultVendorIo();
 
@@ -59,6 +63,14 @@ export function registerSetupCommands(
       "replace an attached-coordinator registration with the plain durable one"
     )
     .option("--json", "print the outcome as JSON")
+    .option(
+      "--attach",
+      "in the guided flow: offer the coordinator seat step even if it was skipped before"
+    )
+    .option(
+      "--no-interactive",
+      "never prompt; behave exactly like the pre-wizard `muon setup`"
+    )
     .action(
       async (options: {
         vendors?: string;
@@ -67,11 +79,47 @@ export function registerSetupCommands(
         observer?: boolean;
         force?: boolean;
         json?: boolean;
+        attach?: boolean;
+        interactive?: boolean;
       }) => {
         try {
           const vendorIo = io();
+
+          // THE GUIDED FLOW IS THE DEFAULT — in a TTY, with no scripting flag.
+          // Every flagged invocation keeps the exact pre-wizard behavior:
+          // scripts wrote against it, and a silent change of a shipped
+          // surface is a hard stop. Non-TTY keeps it too, because a wizard
+          // that prompts a pipe hangs it.
+          const scripted =
+            Boolean(options.vendors) ||
+            Boolean(options.all) ||
+            Boolean(options.repair) ||
+            Boolean(options.json) ||
+            Boolean(options.observer) ||
+            Boolean(options.force) ||
+            options.interactive === false;
+          if (!scripted && process.stdin.isTTY && process.stdout.isTTY) {
+            await runInteractiveSetup({
+              io: vendorIo,
+              dataDir: deps?.dataDir ?? resolveDataDir(),
+              createClient,
+              // The global --api-base travels with the client AND the seat's
+              // capability file — minting against one brain while recording
+              // another is how a vendor's MCP server points at the wrong one.
+              apiBaseFlag: program.opts<{ apiBase?: string }>().apiBase,
+              offerAttachAgain: Boolean(options.attach),
+            });
+            return;
+          }
           const detected = detectVendors(vendorIo);
           const mode = options.observer ? ("observer" as const) : ("base" as const);
+          // Enrolment v2 carries the mode PER VENDOR, and a repair must restore
+          // each registration AS IT WAS MADE — flattening the record through
+          // the single CLI-level mode silently converted every observer
+          // registration to base on a plain `muon setup --repair` (review
+          // finding), which `muon doctor --fix` already got right. Absent from
+          // the map (a fresh choice) → this invocation's mode.
+          const modeOf = new Map<string, "base" | "observer">();
 
           let chosen: InstallableVendorSpec[];
           let source: string;
@@ -87,8 +135,13 @@ export function registerSetupCommands(
               );
             }
             chosen = stored.enrolment.vendors
-              .map((id) => INSTALLABLE_VENDORS.find((spec) => spec.id === id))
+              .map((vendor) =>
+                INSTALLABLE_VENDORS.find((spec) => spec.id === vendor.id)
+              )
               .filter((spec): spec is InstallableVendorSpec => Boolean(spec));
+            for (const vendor of stored.enrolment.vendors) {
+              modeOf.set(vendor.id, vendor.mode);
+            }
             source = "the setup recorded on this machine";
           } else if (options.vendors) {
             chosen = parseVendorList(options.vendors);
@@ -152,7 +205,9 @@ export function registerSetupCommands(
               scope: spec.defaultScope,
               command: resolution.command,
               dryRun: false,
-              ...(mode === "observer" ? { mode } : {}),
+              ...((modeOf.get(spec.id) ?? mode) === "observer"
+                ? { mode: "observer" as const }
+                : {}),
             });
             return { vendor: spec.id, label: spec.id, outcome };
           });
@@ -161,7 +216,12 @@ export function registerSetupCommands(
           // is still one the human chose, and `--repair` must try it again
           // rather than quietly dropping it from their setup.
           const enrolment = writeEnrolment(
-            { vendors: chosen.map((spec) => spec.id), mode },
+            {
+              vendors: chosen.map((spec) => ({
+                id: spec.id,
+                mode: modeOf.get(spec.id) ?? mode,
+              })),
+            },
             deps?.dataDir
           );
 
@@ -279,7 +339,6 @@ export function repairEnrolment(
   const health = enrolmentHealth(io, dataDir);
   if (health.drifted.length === 0) return [];
   const stored = readEnrolment(dataDir);
-  const mode = stored.ok ? stored.enrolment.mode : "base";
   const resolution = resolveMuonMcpCommand(io);
   if (!resolution.ok) {
     return health.drifted.map((vendor) => ({
@@ -293,12 +352,18 @@ export function repairEnrolment(
     if (!spec) {
       return { vendor, ok: false, reason: "unknown vendor in the record" };
     }
+    // THE MODE THIS VENDOR WAS RECORDED IN — per-vendor since v2, so repair
+    // restores each registration as it was made, not as some machine-wide
+    // average of the others.
+    const recorded = stored.ok
+      ? stored.enrolment.vendors.find((entry) => entry.id === vendor)
+      : undefined;
     const outcome = installMcpServer(io, {
       spec,
       scope: spec.defaultScope,
       command: resolution.command,
       dryRun: false,
-      ...(mode === "observer" ? { mode } : {}),
+      ...(recorded?.mode === "observer" ? { mode: "observer" as const } : {}),
     });
     return outcome.kind === "refused"
       ? { vendor, ok: false, reason: outcome.reason }
@@ -331,20 +396,22 @@ export function enrolmentHealth(
         };
   }
   const drifted: string[] = [];
-  for (const id of stored.enrolment.vendors) {
-    const spec = INSTALLABLE_VENDORS.find((candidate) => candidate.id === id);
+  for (const vendor of stored.enrolment.vendors) {
+    const spec = INSTALLABLE_VENDORS.find(
+      (candidate) => candidate.id === vendor.id
+    );
     if (!spec) continue;
     const entry = readVendorEntry(spec, spec.defaultScope, io.roots);
     // Anything other than a present, MUON-owned entry is drift: the human
     // chose this vendor and it is no longer registered.
     if (entry.kind !== "present") {
-      drifted.push(id);
+      drifted.push(vendor.id);
     }
   }
   return drifted.length === 0
     ? {
         status: "healthy",
-        detail: `MUON is registered in every agent CLI you chose (${stored.enrolment.vendors.join(", ") || "none"}).`,
+        detail: `MUON is registered in every agent CLI you chose (${stored.enrolment.vendors.map((vendor) => vendor.id).join(", ") || "none"}).`,
         drifted: [],
       }
     : {

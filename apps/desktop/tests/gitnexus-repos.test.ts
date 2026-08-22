@@ -109,7 +109,12 @@ describe("discoverGitRepos — deterministic, no recursion errors", () => {
 describe("resolveIndexTargets — the repos to index for an opened folder", () => {
   it("a git work-tree → [folder] (single-repo path; covers opened-subdir)", () => {
     expect(
-      resolveIndexTargets("/repo/src", { isGitRepo: () => true })
+      resolveIndexTargets("/repo/src", {
+        isGitRepo: () => true,
+        // A normal clone's marker is a DIRECTORY: the cheap pre-filter answers
+        // here and git is never consulted.
+        dotGitKind: () => "dir",
+      })
     ).toEqual(["/repo/src"]);
   });
 
@@ -129,5 +134,65 @@ describe("resolveIndexTargets — the repos to index for an opened folder", () =
     expect(
       resolveIndexTargets("/empty", { isGitRepo: () => false, fs })
     ).toEqual([]);
+  });
+
+  // ── ADR-0054: the worktree fence ────────────────────────────────────────
+  //
+  // `isGitRepo` says yes to a linked worktree, because a linked worktree IS a
+  // work-tree. Before the fence, binding a chat to one made the supervisor
+  // index a full COPY of the repository into a second `.gitnexus/` store that no
+  // brain tool ever queries — at the cost of a real index run — while the
+  // primary store every tool DOES query stayed stale.
+
+  it("a GOVERNED WORKTREE resolves to the PRIMARY checkout, never to itself", () => {
+    expect(
+      resolveIndexTargets("/elsewhere/muon-abc/task-7", {
+        isGitRepo: () => true,
+        dotGitKind: () => "file",
+        readGitDirs: () => ({
+          gitDir: "/src/app/.git/worktrees/task-7",
+          gitCommonDir: "/src/app/.git",
+        }),
+      })
+    ).toEqual(["/src/app"]);
+  });
+
+  it("the legacy in-repo `.muon/worktrees` layout is fenced on path shape", () => {
+    expect(
+      resolveIndexTargets("/src/app/.muon/worktrees/task-1", {
+        isGitRepo: () => true,
+        // Even with a directory marker — the shape arm still refuses.
+        dotGitKind: () => "dir",
+        readGitDirs: () => ({
+          gitDir: "/src/app/.git/worktrees/task-1",
+          gitCommonDir: "/src/app/.git",
+        }),
+      })
+    ).toEqual(["/src/app"]);
+  });
+
+  it("indexes NOTHING when it is a worktree and git named no primary", () => {
+    // A wrong repo root is a worse answer than no answer: it would build a graph
+    // for a repository the operator never opened.
+    expect(
+      resolveIndexTargets("/src/app/.muon/worktrees/task-1", {
+        isGitRepo: () => true,
+        dotGitKind: () => "file",
+        readGitDirs: () => undefined,
+      })
+    ).toEqual([]);
+  });
+
+  it("a `--separate-git-dir` clone (marker is a FILE, dirs agree) is NOT fenced", () => {
+    expect(
+      resolveIndexTargets("/src/app", {
+        isGitRepo: () => true,
+        dotGitKind: () => "file",
+        readGitDirs: () => ({
+          gitDir: "/elsewhere/app.git",
+          gitCommonDir: "/elsewhere/app.git",
+        }),
+      })
+    ).toEqual(["/src/app"]);
   });
 });

@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { ROLE_SPECS, type AgentRole } from "./agent-role.js";
+import {
+  isDispatchableRole,
+  ROLE_SPECS,
+  type AgentRole,
+} from "./agent-role.js";
 
 /**
  * THE vendor registry (ADR-0022). One vendor id enum, one entry per vendor, and
@@ -754,17 +758,43 @@ export const VENDOR_REGISTRY: { readonly [K in VendorId]: VendorEntry } = {
       // this list is the entire boundary.
       //
       // TODO 2.2 — DECIDED 2026-07-31: Cursor does NOT hold `implementer` (yet).
-      // The previous hard blocker ("no file-write gate") is STALE: on
-      // `cursor-agent 2026.07.23-e383d2b`, `preToolUse` fires for `Write` and
-      // `deny` is honoured even under `--force`, and `beforeShellExecution`
-      // closes the shell bypass (measured live). What remains is PRODUCT
-      // wiring, not mechanism absence: MUON strips `--force` as a widening
-      // flag today, an implementer seat would need a deliberate path that
-      // emits it under MUON control PLUS a maintained write-tool matcher
-      // inventory. Until that profile exists, this ceiling stays closed — a
-      // registry test pins the absence of every write-authority role.
-      supportedRoles: ["reviewer", "qa", "architect", "scout"],
-      coordinatorSeat: false,
+      // The previous hard blocker ("no file-write gate") is STALE: `preToolUse`
+      // fires for `Write` and `deny` is honoured even under `--force`, and
+      // `beforeShellExecution` closes the shell bypass. RE-MEASURED 2026-08-20
+      // on `2026.08.11-e8db854` (the earlier reading was `2026.07.23-e383d2b`,
+      // a release older) — both still hold.
+      //
+      // The same re-measurement found the version of this seat one would build
+      // first is UNSAFE, which is why the requirement list below is not
+      // optional. With ONLY a `preToolUse` write matcher in place, a prompt
+      // saying "if the write tool is blocked, use a shell command instead" got
+      // the file written: `printf 'PWNED' > target.txt`. A write ceiling is the
+      // two hooks TOGETHER; either alone is a door. See
+      // docs/research/2026-08-cursor-write-gate-proof.md for the four runs.
+      //
+      // What remains is PRODUCT wiring, not mechanism absence. An implementer
+      // seat needs: (1) a deliberate `--force`-emitting path under MUON control
+      // (it is stripped as a widening flag today), (2) a MAINTAINED write-tool
+      // matcher inventory — an unmatched write tool is an open door the way an
+      // unmatched shell was — and (3) `beforeShellExecution` denied on the same
+      // run. Only (1) is a flag; (2) is permanent upkeep. Until that profile
+      // exists this ceiling stays closed, and a registry test pins the absence
+      // of every write-authority role.
+      // `orchestrator` is here ONLY because the seat below requires it: a
+      // registry invariant holds that a seat without the role is a seat
+      // nothing can occupy, so the two are one grant expressed in two fields
+      // (ADR-0057 D4). The WORKER roles are unchanged — no `implementer`.
+      supportedRoles: ["orchestrator", "reviewer", "qa", "architect", "scout"],
+      // ADR-0057 — THE SEAT IS NOT A WORKER PERMISSION. Everything above this
+      // line argues about what a Cursor LANE may write, and that reasoning sat
+      // directly above a `coordinatorSeat: false` it never argued for. A
+      // coordinator calls MUON's OWN verbs (dispatch, steer, interrupt, ship
+      // review) through a MUON-minted lease; the vendor hosts the session and
+      // contributes no enforcement — `attachCoordinatorFlow` is vendor-agnostic
+      // past its seat check, so there was never a mechanism here to be missing.
+      // The write ceiling above is untouched and still closed: coordinating is
+      // not doing.
+      coordinatorSeat: true,
       dispatchable: true,
       delegatable: true,
       fleetSizeable: true,
@@ -973,14 +1003,35 @@ export const VENDOR_REGISTRY: { readonly [K in VendorId]: VendorEntry } = {
       //      unless `OPENCODE_DISABLE_PROJECT_CONFIG=1` is set (proven, see
       //      `opencode-adapter.ts`). The repo under test is attacker-controlled
       //      input, so that is a live re-widening vector, not a theoretical one.
-      // What MUON *can* prove is that its own config RESOLVES to a deny table.
-      // Enforcement of that table at tool-call time has NOT been observed (it
-      // needs a real model turn), so the lane is admitted only where a wrong
-      // answer is cheapest and the artifact is text, never a patch or a verdict
-      // on someone else's diff. Widening to `qa`, then `reviewer`/`architect`,
-      // is a follow-on that must first OBSERVE enforcement live.
-      supportedRoles: ["scout"],
-      coordinatorSeat: false,
+      // ENFORCEMENT IS NOW OBSERVED (2026-08-20). This comment used to say it
+      // had not been, and that sentence became false: an A/B with the same
+      // model, prompt and workspace — MUON's own `buildOpencodeGuardConfig`
+      // in one arm, nothing in the other — had the guarded run use only
+      // Glob+Read and leave the file untouched, while the control wrote it
+      // ("Wrote file successfully"). Enforcement turns out to be by TOOL
+      // REMOVAL rather than call-time refusal: the model reports having no
+      // write/edit/bash capability at all. The run also proved
+      // `OPENCODE_DISABLE_PROJECT_CONFIG=1` closes finding 3 live — the
+      // workspace config asked for `"*": "allow"` and got nothing. Full
+      // method and caveats: docs/research/2026-08-opencode-enforcement-proof.md
+      //
+      // The roles below are UNCHANGED by that observation, deliberately. It
+      // lifts the factual blocker the old comment named, and widening to `qa`,
+      // then `reviewer`/`architect`, remains an ADR-0022 amendment — a
+      // decision, not a consequence. Nothing here is widened by evidence
+      // alone, and the coordinator seat is a different question entirely
+      // (dispatch authority, which no permission observation can earn).
+      // `orchestrator` is here ONLY because the seat below requires it (see
+      // the same note on cursor, and ADR-0057 D4). The worker ceiling is still
+      // exactly `scout`.
+      supportedRoles: ["orchestrator", "scout"],
+      // ADR-0057 — THE SEAT IS NOT A WORKER PERMISSION. The deny-table
+      // reasoning above governs a dispatched OpenCode LANE; a seat dispatches
+      // other lanes rather than being one, so none of it bore on this boolean.
+      // The role ceiling stays `scout`, which means an OpenCode coordinator can
+      // coordinate a crew it could not itself join beyond scout. That reads
+      // oddly and is exactly right.
+      coordinatorSeat: true,
       dispatchable: true,
       delegatable: true,
       fleetSizeable: true,
@@ -1476,20 +1527,49 @@ export function vendorRoutingLines(): readonly string[] {
     // orchestrator a lane "may hold implementer" and then refusing the dispatch
     // is worse than not offering it, because the plan is already built by then.
     const roles = vendorRoleCeiling(id);
-    const roleText =
-      roles.length === 0
-        ? "holds NO role and cannot be dispatched work"
-        : `may hold ${[...roles].join(", ")}`;
-    const writes = roles.some(
-      (role) => ROLE_SPECS[role].authority !== "read-only"
+    // WORKER roles and the SEAT are stated separately. `orchestrator` is in
+    // two more ceilings since ADR-0057, and `POST /api/dispatch` refuses it as
+    // a task role outright ("belongs to a chat's root coordinator job") — so
+    // listing it among dispatchable roles is the same failure the TODO above
+    // describes, one step earlier: the planner builds the plan around a role
+    // it will be refused.
+    const workerRoles = roles.filter(
+      (role) => isDispatchableRole(role)
     );
+    const roleText =
+      workerRoles.length === 0
+        ? "holds NO role and cannot be dispatched work"
+        : `may hold ${[...workerRoles].join(", ")}`;
+    // ADR-0057 put `orchestrator` (authority `coordinate`) into two ceilings
+    // that still cannot write. `!== "read-only"` counted that as writing and
+    // advertised "may write" to the planner — which is the precise failure the
+    // TODO above describes, one step earlier: the plan gets built around a
+    // write it will be refused. Ask for the authority that means writing.
+    const writes = workerRoles.some(
+      (role) => ROLE_SPECS[role].authority === "write"
+    );
+    // The SEAT FIELD, not "holds a coordinate-authority role". The implication
+    // runs one way: a seat-holder must hold `orchestrator` (ADR-0057 D4), but
+    // holding it proves nothing — `fake` holds every role via ALL_ROLES with
+    // `coordinatorSeat: false`. Safe today only because this iterates public
+    // vendors; a future public vendor would have been advertised as
+    // seat-capable on an inference.
+    const coordinates =
+      entry.authority.coordinatorSeat && workerRoles.length < roles.length;
+    const seatText = coordinates
+      ? "; may hold the coordinator seat (orchestrator), which is a chat's root job and never dispatched work"
+      : "";
     const sessionText = !entry.session.canSend
       ? vendorCanBeInterruptedByMuon(id)
         ? "watch + interrupt, no mid-run steer"
         : "one-shot only, nothing to steer"
       : "steerable mid-run";
-    return `${id} (${entry.shortLabel}): ${roleText}; ${
-      writes ? "may write" : "READ-ONLY"
+    return `${id} (${entry.shortLabel}): ${roleText}${seatText}; ${
+      writes
+        ? "may write"
+        : coordinates
+          ? "READ-ONLY as a lane (it may coordinate, never write)"
+          : "READ-ONLY"
     }; ${sessionText}; cost ${entry.cost}.`;
   });
 }

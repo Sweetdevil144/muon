@@ -16,6 +16,7 @@ const packImportMock = vi.hoisted(() => ({
   importMemoryPack: vi.fn(),
 }));
 const ledgerMock = vi.hoisted(() => ({
+  mintContradictionEdge: vi.fn(),
   getMemoryNote: vi.fn(),
   updateMemoryNote: vi.fn(),
   ingestMemoryNote: vi.fn(),

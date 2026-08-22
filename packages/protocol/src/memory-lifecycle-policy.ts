@@ -7,6 +7,7 @@ export const MEMORY_LIFECYCLE_KINDS = [
   "convention",
   "attempt",
   "question",
+  "ownership",
 ] as const;
 
 export type MemoryLifecycleKind = (typeof MEMORY_LIFECYCLE_KINDS)[number];
@@ -30,6 +31,13 @@ export const memoryLifecyclePolicySchema = z
         convention: lifecycleDaysSchema,
         attempt: lifecycleDaysSchema,
         question: lifecycleDaysSchema,
+        // ADR-0091 — OPTIONAL, deliberately: a lifecycle policy is a STORED
+        // operator record, and requiring a key that did not exist when it
+        // was applied would fail-parse every existing install's policy (the
+        // records-vs-growing-constants defect class). Absent resolves
+        // through `lifecycleDaysForKind` → undefined → the write-time TTL's
+        // existing non-destructive path (never expires).
+        ownership: lifecycleDaysSchema.optional(),
       })
       .strict(),
     // An invariant represented in the table, not an accidental consequence of
@@ -42,6 +50,8 @@ export const memoryLifecyclePolicySchema = z
         convention: z.literal(true),
         attempt: z.literal(true),
         question: z.literal(true),
+        // Same stored-record tolerance as daysByKind above.
+        ownership: z.literal(true).optional(),
       })
       .strict(),
   })
@@ -66,6 +76,9 @@ export const RECOMMENDED_MEMORY_LIFECYCLE_POLICY: MemoryLifecyclePolicy = {
     convention: 90,
     attempt: 30,
     question: 7,
+    // Ownership is the slowest-moving knowledge class — same review window
+    // as decisions/constraints.
+    ownership: 90,
   },
   permanentWhenConfirmedByKind: {
     decision: true,
@@ -73,6 +86,7 @@ export const RECOMMENDED_MEMORY_LIFECYCLE_POLICY: MemoryLifecyclePolicy = {
     convention: true,
     attempt: true,
     question: true,
+    ownership: true,
   },
 };
 
@@ -97,6 +111,9 @@ export function parseMemoryLifecyclePolicy(
 export function lifecycleDaysForKind(
   policy: MemoryLifecyclePolicy,
   kind: MemoryLifecycleKind
-): number {
+): number | undefined {
+  // `undefined` for a kind a stored policy predates (ownership on a
+  // pre-0091 record): the TTL evaluator's existing guard reads that as
+  // "no configured days" and resolves non-destructively.
   return policy.daysByKind[kind];
 }

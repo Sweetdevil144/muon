@@ -1826,3 +1826,341 @@ describe("the coordination SCORE — what the layer actually did (#92)", () => {
     expect(score.truncated).toBe(false);
   }, 20_000);
 });
+
+// ── ADR-0065: citations audited against the offer ledger ─────────────────────
+//
+// A citation (`refs.noteIds`) is checked against what MUON actually put in
+// front of the CITING chat before the citation: `offered: true` rides back to
+// the sender and onto the reader's inbox as the audit; `offered: false` FLAGS
+// and never drops (a D13 relay is legitimate). publish_finding's minted note
+// records its own add-offer — closing the ADR-0060 gap where a
+// finding-publishing job's honest `context_updated` receipt would have
+// falsely mismatched.
+describe("A2A citations carry their offer-ledger audit", () => {
+  it("a send's refs come back audited, and the reader's inbox carries the audit", async () => {
+    await db.prisma.memoryOffer.create({
+      data: {
+        partition: "chat-a",
+        jobId: "job-impl-a",
+        principal: "agent:job:job-impl-a",
+        noteId: "mem-a2a-offered-1",
+        surface: "recall",
+      },
+    });
+    const res = await sendAs(IMPL_A, {
+      to: { kind: "crew" },
+      kind: "question",
+      subject: "citing two notes",
+      body: "one the brain offered me, one I merely heard about",
+      refs: {
+        files: [],
+        symbols: [],
+        noteIds: ["mem-a2a-offered-1", "mem-a2a-guessed-2"],
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().citations).toEqual([
+      { noteId: "mem-a2a-offered-1", offered: true },
+      { noteId: "mem-a2a-guessed-2", offered: false },
+    ]);
+    const messageId = res.json().message.id as string;
+
+    const inbox = await app.inject({
+      method: "GET",
+      url: "/api/a2a/inbox",
+      headers: auth(REVIEW_A),
+    });
+    expect(inbox.statusCode).toBe(200);
+    const audit = (
+      inbox.json().citationAudits as
+        | { messageId: string; citations: unknown }[]
+        | undefined
+    )?.find((entry) => entry.messageId === messageId);
+    expect(audit).toBeDefined();
+    expect(audit!.citations).toEqual([
+      { noteId: "mem-a2a-offered-1", offered: true },
+      { noteId: "mem-a2a-guessed-2", offered: false },
+    ]);
+
+    // ADR-0086 D2 — the OPERATOR transcript carries the SAME audit, from
+    // the SAME assembly (auditPeerMessageRows): the desk's crew detail and
+    // `muon crew coord` render provenance without a second derivation, and
+    // the verdict still testifies about the CITER (the sender's own offer
+    // set), whoever reads it.
+    const operator = await app.inject({
+      method: "GET",
+      url: "/api/a2a/messages?chatId=chat-a",
+      headers: auth(OPERATOR),
+    });
+    expect(operator.statusCode).toBe(200);
+    const operatorAudit = (
+      operator.json().citationAudits as
+        | { messageId: string; citations: unknown }[]
+        | undefined
+    )?.find((entry) => entry.messageId === messageId);
+    expect(operatorAudit).toBeDefined();
+    expect(operatorAudit!.citations).toEqual([
+      { noteId: "mem-a2a-offered-1", offered: true },
+      { noteId: "mem-a2a-guessed-2", offered: false },
+    ]);
+  });
+
+  it("publish_finding records its note's add-offer and reads back offered:true", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/a2a/findings",
+      headers: auth(REVIEW_A),
+      payload: {
+        text: "The retry budget is bounded by the lease horizon.",
+        kind: "constraint",
+        subject: "retry budget bound",
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.citations).toEqual([{ noteId: body.noteId, offered: true }]);
+    const offer = await db.prisma.memoryOffer.findFirst({
+      where: { noteId: body.noteId },
+    });
+    expect(offer).toMatchObject({
+      partition: "chat-a",
+      jobId: "job-review-a",
+      surface: "add",
+    });
+  });
+
+  // ── ADR-0081: a finding can be contradicted, typed ────────────────────────
+  it("a sibling DISPUTES a finding: contradicts edge filed, nothing destroyed, the echo confirms", async () => {
+    await new Promise((resolve) =>
+      setTimeout(resolve, MIN_PEER_SEND_INTERVAL_MS + 20)
+    );
+    const published = await app.inject({
+      method: "POST",
+      url: "/api/a2a/findings",
+      headers: auth(IMPL_A),
+      payload: {
+        text: "The cache is invalidated on every write.",
+        kind: "decision",
+        subject: "cache invalidation claim",
+      },
+    });
+    expect(published.statusCode).toBe(201);
+    const targetNoteId = published.json().noteId as string;
+
+    await new Promise((resolve) =>
+      setTimeout(resolve, MIN_PEER_SEND_INTERVAL_MS + 20)
+    );
+    const disputed = await app.inject({
+      method: "POST",
+      url: "/api/a2a/findings",
+      headers: auth(REVIEW_A),
+      payload: {
+        text: "Observed stale reads after writes under load — the invalidation claim does not hold on the batch path.",
+        kind: "question",
+        subject: "cache invalidation disputed",
+        contradictsNoteId: targetNoteId,
+      },
+    });
+    expect(disputed.statusCode).toBe(201);
+    const body = disputed.json();
+    expect(body.contradictsNoteId).toBe(targetNoteId);
+    // The 0058 D3 shape's third consumer: the typed edge, minted → target.
+    const edge = await db.prisma.memoryEdge.findUnique({
+      where: {
+        fromId_toId_kind: {
+          fromId: body.noteId,
+          toId: targetNoteId,
+          kind: "contradicts",
+        },
+      },
+    });
+    expect(edge).toBeTruthy();
+    // NEVER destructive: the disputed note stands, both unconfirmed —
+    // the confirm gate decides, not the crew.
+    const target = await db.prisma.memoryNote.findUnique({
+      where: { id: targetNoteId },
+    });
+    expect(target?.status).toBe("active");
+    // D3 pinned from the TARGET's side: the disputed note's own hydrated
+    // record carries the dispute — the reader sees it whichever side they
+    // fetched, not only whoever recalls the disputing note.
+    const ledger = await import("../src/lib/memory-ledger.js");
+    const targetRecord = await ledger.getMemoryNote(targetNoteId);
+    expect(targetRecord?.conflictsWith).toBe(body.noteId);
+    expect(
+      await db.prisma.confirmation.count({
+        where: { noteId: { in: [targetNoteId, body.noteId] } },
+      })
+    ).toBe(0);
+  });
+
+  it("a disputed target outside the caller's reach reads as MISSING and nothing is minted", async () => {
+    const ledger = await import("../src/lib/memory-ledger.js");
+    const foreign = await ledger.ingestMemoryNote({
+      kind: "decision",
+      text: "A note from another mission's partition entirely.",
+      createdBy: "agent:job:job-foreign",
+      proposalOnly: true,
+      chatId: "chat-foreign-0081",
+    });
+    const notesBefore = await db.prisma.memoryNote.count();
+    await new Promise((resolve) =>
+      setTimeout(resolve, MIN_PEER_SEND_INTERVAL_MS + 20)
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/a2a/findings",
+      headers: auth(REVIEW_A),
+      payload: {
+        text: "Trying to dispute across the fence.",
+        kind: "question",
+        subject: "cross-fence dispute",
+        contradictsNoteId: foreign.note.id,
+      },
+    });
+    // Forbidden reads as missing — existence is not probeable — and the
+    // fence ran BEFORE the mint: no note, no edge, no message.
+    expect(res.statusCode).toBe(404);
+    expect(await db.prisma.memoryNote.count()).toBe(notesBefore);
+  });
+
+  it("a dispute whose text dedups ONTO the disputed note refuses — no self-loop, ever", async () => {
+    await new Promise((resolve) =>
+      setTimeout(resolve, MIN_PEER_SEND_INTERVAL_MS + 20)
+    );
+    const original = await app.inject({
+      method: "POST",
+      url: "/api/a2a/findings",
+      headers: auth(REVIEW_A),
+      payload: {
+        text: "The migration runner skips empty directories.",
+        kind: "decision",
+        subject: "migration runner behavior",
+      },
+    });
+    expect(original.statusCode).toBe(201);
+    const originalNoteId = original.json().noteId as string;
+
+    await new Promise((resolve) =>
+      setTimeout(resolve, MIN_PEER_SEND_INTERVAL_MS + 20)
+    );
+    // Identical text from the same author dedups onto the SAME note (the
+    // ledger's one-text-one-note rule) — which would make the note
+    // contradict itself. The route refuses instead of minting the loop.
+    const selfLoop = await app.inject({
+      method: "POST",
+      url: "/api/a2a/findings",
+      headers: auth(REVIEW_A),
+      payload: {
+        text: "The migration runner skips empty directories.",
+        kind: "decision",
+        subject: "migration runner behavior",
+        contradictsNoteId: originalNoteId,
+      },
+    });
+    expect(selfLoop.statusCode).toBe(400);
+    expect(selfLoop.json().message).toContain("own words");
+    expect(
+      await db.prisma.memoryEdge.count({
+        where: { toId: originalNoteId, kind: "contradicts" },
+      })
+    ).toBe(0);
+  });
+
+  it("confirmed-GLOBAL canon is disputable from any chat that reads it — the fence's one chat bypass, pinned", async () => {
+    const ledger = await import("../src/lib/memory-ledger.js");
+    const { repoRootOf } = await import("../src/lib/workspace-identity.js");
+    // Canon lives in ANOTHER chat but the SAME workspace (the workspace
+    // clause is never bypassed), confirmed and promoted global — exactly
+    // the note every same-workspace chat's read view already serves.
+    const canon = await ledger.ingestMemoryNote({
+      kind: "decision",
+      text: "Canon: the retry budget is three attempts.",
+      createdBy: "human:operator",
+      chatId: "chat-elsewhere-0081",
+      workspacePath: await repoRootOf(WORKSPACE),
+    });
+    await db.prisma.memoryNote.update({
+      where: { id: canon.note.id },
+      data: { scope: "global" },
+    });
+    await db.prisma.confirmation.create({
+      data: {
+        noteId: canon.note.id,
+        principal: "human",
+        decision: "confirm",
+      },
+    });
+    await new Promise((resolve) =>
+      setTimeout(resolve, MIN_PEER_SEND_INTERVAL_MS + 20)
+    );
+    const disputed = await app.inject({
+      method: "POST",
+      url: "/api/a2a/findings",
+      headers: auth(REVIEW_A),
+      payload: {
+        text: "Measured five attempts on the live path — the canon is stale.",
+        kind: "question",
+        subject: "retry budget canon disputed",
+        contradictsNoteId: canon.note.id,
+      },
+    });
+    expect(disputed.statusCode).toBe(201);
+    expect(disputed.json().contradictsNoteId).toBe(canon.note.id);
+  });
+
+  it("the audit is per-JOB: a sibling citing a note only the brain showed someone else reads offered:false", async () => {
+    // SELF-CONTAINED (review finding: depending on the earlier test's row
+    // made the sibling case pass vacuously when run alone): seed the offer
+    // to job-impl-a INSIDE this test, prove the row exists, then have the
+    // REVIEWER cite it.
+    await db.prisma.memoryOffer.upsert({
+      where: {
+        jobId_noteId: { jobId: "job-impl-a", noteId: "mem-a2a-perjob-1" },
+      },
+      update: {},
+      create: {
+        partition: "chat-a",
+        jobId: "job-impl-a",
+        principal: "agent:job:job-impl-a",
+        noteId: "mem-a2a-perjob-1",
+        surface: "recall",
+      },
+    });
+    expect(
+      await db.prisma.memoryOffer.count({
+        where: { noteId: "mem-a2a-perjob-1", jobId: "job-impl-a" },
+      })
+    ).toBe(1);
+    // (The publish above spent REVIEW_A's send interval outside sendAs's
+    // spacing map, so wait it out rather than tripping the flood fence.)
+    await new Promise((resolve) =>
+      setTimeout(resolve, MIN_PEER_SEND_INTERVAL_MS + 20)
+    );
+    const res = await sendAs(REVIEW_A, {
+      to: { kind: "crew" },
+      kind: "question",
+      subject: "relaying a sibling's note",
+      body: "impl mentioned this id; I have not read it",
+      refs: { files: [], symbols: [], noteIds: ["mem-a2a-perjob-1"] },
+    });
+    expect(res.statusCode).toBe(201);
+    // Honest label, never a refusal: the brain did not show THE CITER this.
+    expect(res.json().citations).toEqual([
+      { noteId: "mem-a2a-perjob-1", offered: false },
+    ]);
+    // And the OWNER of the offer citing the same note reads offered:true —
+    // the per-job boundary, both directions, in one self-contained test.
+    const owner = await sendAs(IMPL_A, {
+      to: { kind: "crew" },
+      kind: "question",
+      subject: "citing my own offered note",
+      body: "the brain showed me this one",
+      refs: { files: [], symbols: [], noteIds: ["mem-a2a-perjob-1"] },
+    });
+    expect(owner.statusCode).toBe(201);
+    expect(owner.json().citations).toEqual([
+      { noteId: "mem-a2a-perjob-1", offered: true },
+    ]);
+  });
+});

@@ -1,6 +1,7 @@
 import {
   chmodSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -14,6 +15,7 @@ import {
   persistableSettings,
   saveSettings,
   toRendererSettings,
+  trySaveSettings,
 } from "../src/lib/settings.js";
 
 const dir = mkdtempSync(path.join(tmpdir(), "muon-desktop-"));
@@ -118,6 +120,65 @@ describe("settings", () => {
   });
 });
 
+/**
+ * A SETTINGS WRITE THAT FAILS MUST NOT KILL A RUNNING APP.
+ *
+ * `saveSettings` is synchronous (`writeFileSync` + `chmodSync`), and one of its
+ * callers is a background one: `applyBrainCoords`, reached from the brain
+ * supervisor's `onChange` inside a `void`ed async call. An unwritable
+ * settings.json (ENOSPC, a root-owned file) therefore left the main process with
+ * an unhandled rejection — and this app installs no `unhandledRejection`
+ * handler, so it exited, taking the window and every runner-hosted vendor
+ * session with it.
+ *
+ * The strict writer STAYS strict: its other callers are humans pressing Save in
+ * Settings, and an invoke that rejects is how the renderer tells them the save
+ * did not happen. The non-fatal projection is a second, explicitly named
+ * function, so choosing it is a decision at the call site.
+ */
+describe("a background persist reports failure instead of dying", () => {
+  /** A directory path that cannot exist: its parent is a FILE (ENOTDIR). */
+  function unwritableDir(): string {
+    const parent = freshDir();
+    const file = path.join(parent, "not-a-directory");
+    writeFileSync(file, "");
+    return path.join(file, "profile");
+  }
+
+  it("saveSettings still THROWS, so a human-initiated save can report failure", () => {
+    expect(() =>
+      saveSettings(unwritableDir(), { ...DEFAULT_SETTINGS })
+    ).toThrow();
+  });
+
+  it("trySaveSettings reports the reason and returns false, and never throws", () => {
+    const reasons: string[] = [];
+    const ok = trySaveSettings(
+      unwritableDir(),
+      { ...DEFAULT_SETTINGS },
+      (reason) => reasons.push(reason)
+    );
+    expect(ok).toBe(false);
+    // Reported, not silent: a persist nobody can see failing is how a settings
+    // file quietly stops tracking reality.
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toMatch(/ENOTDIR|ENOENT|EROFS|EACCES/);
+  });
+
+  it("trySaveSettings writes exactly what the strict writer writes on success", () => {
+    const d = freshDir();
+    const onError = (reason: string): never => {
+      throw new Error(`unexpected persist failure: ${reason}`);
+    };
+    expect(
+      trySaveSettings(d, { ...DEFAULT_SETTINGS, apiToken: "user-tok" }, onError)
+    ).toBe(true);
+    expect(loadSettings(d).apiToken).toBe("user-tok");
+    expect(statSync(path.join(d, "settings.json")).mode & 0o777).toBe(0o600);
+    rmSync(d, { recursive: true, force: true });
+  });
+});
+
 describe("token hygiene", () => {
   // The embedded flow's operator + agent tokens are re-minted each boot from
   // the 0600 lockfile; only a user-supplied token is durable.
@@ -199,6 +260,82 @@ describe("token hygiene", () => {
     expect(renderer).not.toHaveProperty("githubCredential");
     expect(serialized).not.toContain("test-private-access-token");
     expect(serialized).not.toContain("test-private-refresh-token");
+    rmSync(d, { recursive: true, force: true });
+  });
+});
+
+/**
+ * THE STALE-apiBase BUG, AT ITS SEED.
+ *
+ * The embedded brain's port is chosen at runtime and republished in the lockfile
+ * on every boot. Persisting the ADOPTED base wrote a coordinate that was already
+ * expiring, and `loadSettings` then handed it back as if it were a decision. An
+ * EXPLICIT base — the human typed it — is a decision and does persist.
+ */
+describe("base-url hygiene", () => {
+  const adopted = {
+    ...DEFAULT_SETTINGS,
+    apiBase: "http://127.0.0.1:10777",
+    apiBaseExplicit: false,
+  };
+
+  it("persistableSettings drops a runtime-adopted apiBase", () => {
+    expect(persistableSettings(adopted, undefined)).not.toHaveProperty(
+      "apiBase"
+    );
+  });
+
+  it("persistableSettings keeps an EXPLICIT apiBase", () => {
+    const durable = persistableSettings(
+      { ...adopted, apiBase: "http://brain.internal:4000", apiBaseExplicit: true },
+      undefined
+    );
+    expect(durable.apiBase).toBe("http://brain.internal:4000");
+    expect(durable.apiBaseExplicit).toBe(true);
+  });
+
+  it("an adopted base is not on disk, and boot falls back to the default", () => {
+    const d = freshDir();
+    saveSettings(d, persistableSettings(adopted, undefined));
+    expect(readFileSync(path.join(d, "settings.json"), "utf8")).not.toContain(
+      "10777"
+    );
+    // loadSettings fills the gap from DEFAULT_SETTINGS, and the boot sequence
+    // re-adopts the live port from the lockfile — which is the only place that
+    // number is ever true.
+    expect(loadSettings(d).apiBase).toBe(DEFAULT_SETTINGS.apiBase);
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("an explicit base round-trips, opt-out flag and all", () => {
+    const d = freshDir();
+    saveSettings(
+      d,
+      persistableSettings(
+        { ...adopted, apiBase: "http://brain.internal:4000", apiBaseExplicit: true },
+        undefined
+      )
+    );
+    const loaded = loadSettings(d);
+    expect(loaded.apiBase).toBe("http://brain.internal:4000");
+    expect(loaded.apiBaseExplicit).toBe(true);
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it("clearing apiBaseExplicit reaches disk, so the opt-out cannot come back", () => {
+    // applyBrainCoords sets `apiBaseExplicit: false` and now persists it: the
+    // embedded brain moving IS the newer instruction, and the old code left the
+    // stale `true` on disk for the next launch to restore.
+    const d = freshDir();
+    saveSettings(d, {
+      ...DEFAULT_SETTINGS,
+      apiBase: "http://brain.internal:4000",
+      apiBaseExplicit: true,
+    });
+    saveSettings(d, persistableSettings(adopted, undefined));
+    const loaded = loadSettings(d);
+    expect(loaded.apiBaseExplicit).toBe(false);
+    expect(loaded.apiBase).toBe(DEFAULT_SETTINGS.apiBase);
     rmSync(d, { recursive: true, force: true });
   });
 });

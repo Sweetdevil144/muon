@@ -47,8 +47,21 @@ volumes are not directly writable from your laptop):
 # 2. Serve the staging dir briefly from your laptop (any tunnel works), or
 #    push the files through `railway ssh` piping:
 tar cz -C <staging-dir> . | railway ssh "tar xz -C /data"
-# 3. Create the stable aliases inside the volume:
-railway ssh "cp /data/MUON-<v>-arm64.dmg /data/MUON-latest-arm64.dmg && cp /data/muon-cli-<v>.tgz /data/muon-cli-latest.tgz"
+# 0. FOUNDER POLICY (2026-08-20), automated in scripts/release-pipeline.mjs —
+#    prefer running the pipeline over these hand steps. Every release:
+#      snapshot live release -> /data/.rollback/<v>  (artifacts hardlinked,
+#        feeds COPIED — uploads rewrite feeds in place, a hardlinked feed
+#        would corrupt the snapshot)
+#      prune every other release from the served namespace
+#      upload + verify public URLs
+#      only then retire the old live names (bytes stay in .rollback)
+#      on ANY failure after uploads start: automatic rollback from .rollback
+#    End state per release: exactly ONE live release + ONE rollback snapshot.
+# 3. Create the stable aliases inside the volume — HARDLINK, never cp
+#    (founder rule, 2026-08-19: aliases always REPLACE; a second full copy of
+#    a ~640MB dmg is a release-sized cost on a 4.6G volume, and `ln -f`
+#    serves the identical bytes at zero extra blocks):
+railway ssh "ln -f /data/MUON-<v>-arm64.dmg /data/MUON-latest-arm64.dmg && ln -f /data/muon-cli-<v>.tgz /data/muon-cli-latest.tgz"
 ```
 
 Verify after upload: `curl -sI https://download.getmuon.com/latest-mac.yml`

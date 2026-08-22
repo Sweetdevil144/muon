@@ -41,6 +41,12 @@ import { z } from "zod";
 export const PRE_EDIT_COVERAGE_EMPTY_REASONS = [
   /** The radius resolved to no anchors at all, so no candidate query ran. */
   "no_anchors",
+  /** A target was given and a SYMBOL query ran, but it produced no module
+   *  anchor — and only modules carry notes, so nothing could have been found.
+   *  Distinct from `no_anchors` (where nothing was asked) and from
+   *  `no_notes_on_anchors` (where a real module was queried and is empty):
+   *  this one means "ask again with a file", not "there is nothing here". */
+  "no_module_anchor",
   /** Anchors were queried; nothing in scope carries any of them (the §0 hole:
    *  an empty COORDINATE layer, not a retrieval-quality problem). */
   "no_notes_on_anchors",
@@ -144,10 +150,31 @@ export function preEditCoverageEmptyReason(
   if (coverage.notes.admitted > 0) {
     return "withheld_agent_projection";
   }
-  const anchorCount =
-    coverage.anchors.modules.requested + coverage.anchors.symbols.requested;
-  if (anchorCount === 0) {
+  const moduleAnchors = coverage.anchors.modules.requested;
+  const symbolAnchors = coverage.anchors.symbols.requested;
+  if (moduleAnchors + symbolAnchors === 0) {
     return "no_anchors";
+  }
+  // ONLY MODULES CARRY NOTES. Symbol `resolved` is 0 for every symbol ever
+  // asked about on a live brain (this schema says so), so a target that is a
+  // bare symbol with no module anchor gives the gate nothing to look up — and
+  // it used to report that as `no_notes_on_anchors`, rendering as "nothing is
+  // recorded here yet, not even unconfirmed."
+  //
+  // Measured: `muon context resolveDataDir` said exactly that while TWO
+  // decision notes were anchored to its module. The gate looked up nothing and
+  // reported an empty brain — the one lie a pre-edit gate must never tell.
+  //
+  // Discriminated on module COUNT, not on `resolved`: a real but barren module
+  // is also `requested 1, resolved 0`, and that one genuinely did look and
+  // genuinely found nothing.
+  // Guarded on `considered` as well: if anything WAS looked at, the honest
+  // answer is why it was withheld, and reporting "the gate had nothing to look
+  // up" over the top of that would be a second lie in place of the first.
+  if (moduleAnchors === 0 && coverage.notes.considered === 0) {
+    return coverage.anchors.unreadable > 0
+      ? "index_unavailable"
+      : "no_module_anchor";
   }
   if (coverage.notes.considered === 0) {
     // An unreadable probe outranks "nothing is anchored": zero is unknown here.

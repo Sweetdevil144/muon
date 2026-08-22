@@ -1,4 +1,5 @@
 import {
+  isDispatchableRole,
   AGENT_ROLES,
   ROLE_SPECS,
   VENDOR_REGISTRY,
@@ -117,8 +118,18 @@ export type VendorRoleScope = {
   roles: AgentRole[];
   /** False when this lane cannot hold the role an un-planned dispatch takes. */
   takesUnplannedWork: boolean;
-  /** True when every role it may hold is read-only authority. */
+  /**
+   * True when every WORKER role it may hold is read-only authority. The
+   * coordinator seat is excluded on purpose — see `coordinates`.
+   */
   readOnly: boolean;
+  /**
+   * True when this lane may hold the coordinating role, i.e. it can be seated
+   * as the superagent (ADR-0057). This is deliberately NOT folded into
+   * `roles`-derived worker copy: coordinating is not work MUON hands a lane,
+   * and a surface that mixes the two overstates what the lane may touch.
+   */
+  coordinates: boolean;
   /** True when this lane is managed for only PART of the role taxonomy. */
   scoped: boolean;
   /**
@@ -150,17 +161,44 @@ export function vendorRoleScope(vendor: string): VendorRoleScope {
   const label = vendorLabel(vendor);
   const scoped = roles.length < AGENT_ROLES.length;
   const unmanaged = roles.length === 0;
+  // ADR-0057 opened the coordinator seat to every public vendor, which put
+  // `orchestrator` into two lanes' ceilings. It is NOT work MUON dispatches
+  // into a lane, so it is split out here rather than joining the worker list:
+  // folded in, it flipped Cursor's honest "read-only crew roles only" to "a
+  // limited set of", and pushed the roles a user actually needs off the end of
+  // a 76-column row. The seat is stated separately, in `summary`.
+  const workerRoles = roles.filter(
+    (role) => isDispatchableRole(role)
+  );
+  // Read from the SEAT, not inferred from the ceiling. The implication runs
+  // one way only: ADR-0057 D4 requires a seat-holder to hold `orchestrator`,
+  // but the reverse does not follow — `fake` holds every role via ALL_ROLES
+  // and `coordinatorSeat: false`, so a ceiling-derived answer would have had
+  // its lane claim the seat while `coordinatorEligible` denied it, two
+  // contradictory sentences on the same row.
+  const coordinates =
+    isVendorId(vendor) &&
+    VENDOR_REGISTRY[vendor].authority.coordinatorSeat &&
+    workerRoles.length < roles.length;
   const readOnly =
-    roles.length > 0 &&
-    roles.every((role) => ROLE_SPECS[role].authority === "read-only");
+    workerRoles.length > 0 &&
+    workerRoles.every((role) => ROLE_SPECS[role].authority === "read-only");
   const takesUnplannedWork = roles.includes(UNPLANNED_DISPATCH_ROLE);
   const managedFor = unmanaged
     ? "no crew role"
     : !scoped
       ? "every crew role"
-      : `${readOnly ? "read-only" : "a limited set of"} crew roles only: ${roles.join(
-          ", "
-        )}`;
+      : workerRoles.length === 0
+        ? "no crew role"
+        : `${readOnly ? "read-only" : "a limited set of"} crew roles only: ${workerRoles.join(
+            ", "
+          )}`;
+  // NOT part of `summary`. Every surface that renders the summary gates on
+  // `scoped`, so a seat sentence inside it reached only the role-scoped lanes —
+  // i.e. exactly the two that just gained a seat, and never the two that always
+  // had one, which is the inverse of the thing it was added to fix. The seat is
+  // a FIELD (`coordinates`); the surface that has room for it renders it from
+  // there, for every lane, gated on nothing.
   const summary = unmanaged
     ? `${label} is not a managed dispatch lane in MUON: it holds no crew role, so MUON never assigns it work.`
     : !scoped
@@ -173,6 +211,7 @@ export function vendorRoleScope(vendor: string): VendorRoleScope {
     label,
     roles,
     takesUnplannedWork,
+    coordinates,
     readOnly,
     scoped,
     managedFor,

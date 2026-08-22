@@ -343,3 +343,79 @@ describe("governed GitNexus tools", () => {
     });
   });
 });
+
+// ── An answer MUON could not READ is not an answer of "nothing" ──────────────
+//
+// `parsedOutput` wraps unparseable stdout as `{output: "<text>"}`, and
+// `code_impact` refused only on a JSON `error` field — so a `gitnexus` that
+// exited 0 while printing a human-readable diagnostic, or printing nothing at
+// all, arrived as `ok({result: {output: ""}})` with `degradation.active: false`.
+// An agent reads that as "no upstream callers, safe to edit", which is the same
+// defect class as an unmeasured index: UNKNOWN wearing a positive answer. The
+// distinction that makes the fix worth anything is pinned here too: a REAL
+// answer with zero callers is still a genuine ok.
+
+describe("code_impact never reports an unreadable graph read as a clean one", () => {
+  /** A fresh index, and whatever the `impact` subprocess printed. */
+  const toolOver = async (impactStdout: string, name = "code_impact") => {
+    const root = await workspace();
+    const run = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") return { stdout: `${HEAD}\n`, stderr: "" };
+      if (args[0] === "list") return { stdout: listOutput(root), stderr: "" };
+      return { stdout: impactStdout, stderr: "" };
+    });
+    return createGitNexusToolDefinitions({
+      workspacePath: root,
+      binary: "gitnexus",
+      run,
+    }).find((candidate) => candidate.name === name)!;
+  };
+
+  it("exit 0 with EMPTY stdout is a refusal that names the unknown, not an all-clear", async () => {
+    const tool = await toolOver("");
+    const result = await tool.handler({ target: "registerReviewThreadRoutes" });
+    expect(result.isError).toBe(true);
+    const error = (result.structuredContent as { error: string }).error;
+    // The one sentence an agent must not be able to read out of this.
+    expect(error).toMatch(/UNKNOWN/);
+    expect(error).toMatch(/do NOT read this as "no callers"/);
+    expect(error).toMatch(/printed nothing at all/);
+    expect(result.ui?.degradation).toMatchObject({ active: true });
+    expect(JSON.stringify(result.ui?.degradation)).toMatch(
+      /muon graph reindex/
+    );
+  });
+
+  it("exit 0 with a NON-JSON diagnostic quotes what the CLI said and still refuses", async () => {
+    const tool = await toolOver("error: symbol 'changeMe' is ambiguous\n");
+    const result = await tool.handler({ target: "changeMe" });
+    expect(result.isError).toBe(true);
+    const error = (result.structuredContent as { error: string }).error;
+    expect(error).toMatch(/is ambiguous/);
+    expect(error).toMatch(/do NOT read this as "no callers"/);
+    expect(result.ui?.degradation).toMatchObject({ active: true });
+  });
+
+  it("a REAL answer with zero callers is still a genuine ok — the whole distinction", async () => {
+    const tool = await toolOver(
+      JSON.stringify({ risk: "LOW", byDepth: {}, callers: [] })
+    );
+    const result = await tool.handler({ target: "somethingNobodyCalls" });
+    expect(result.isError).toBeFalsy();
+    expect(
+      (result.structuredContent as { result: { risk: string } }).result.risk
+    ).toBe("LOW");
+    expect(result.ui?.degradation).toEqual({ active: false });
+  });
+
+  it("code_query says the graph did not answer instead of reporting no matches", async () => {
+    const tool = await toolOver("", "code_query");
+    const result = await tool.handler({ query: "approval resolution" });
+    // The search read still returns (its own contract), but never as an empty
+    // result: the envelope says the graph did not answer.
+    expect(result.ui?.degradation).toMatchObject({ active: true });
+    expect(JSON.stringify(result.ui?.degradation)).toMatch(
+      /UNKNOWN, not an empty result/
+    );
+  });
+});

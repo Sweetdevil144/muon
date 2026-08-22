@@ -260,10 +260,14 @@ export async function loadReviewDiff(
     // a stale-but-complete file set rendered as an all-clear on the surface
     // that gates a merge. Whether the working tree differs from HEAD is the
     // diff's business; this asks only whether the GRAPH was built at HEAD.
+    // THREE-STATE, matching the shared projector. `false` here used to mean two
+    // different things — "measured, and current" and "could not measure" — and
+    // the second is the one that mattered: an unreadable commit pair scored as a
+    // verified-current graph, so the surface that gates a merge showed a
+    // completed look it never took. `null` is the honest third answer and
+    // `buildDiffImpact` refuses to call it a pass.
     const stale =
-      !!graphCommit && !!headCommit
-        ? !headCommit.startsWith(graphCommit)
-        : false;
+      graphCommit && headCommit ? !headCommit.startsWith(graphCommit) : null;
 
     const impact = buildDiffImpact({
       scope,

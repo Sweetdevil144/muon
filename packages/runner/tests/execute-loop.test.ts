@@ -174,6 +174,7 @@ describe("executeJob governed loop integration", () => {
     expect(coreMocks.ensureTaskWorktree).toHaveBeenCalledWith({
       repoRoot: "/repo",
       taskId: "task-1",
+      skipPreparation: false,
     });
     expect(coreMocks.createDiffEvaluator).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -486,6 +487,7 @@ MEMORY PROPOSALS:
       expect(coreMocks.ensureTaskWorktree).toHaveBeenCalledWith({
         repoRoot: root,
         taskId: "task-1",
+        skipPreparation: false,
       });
     } finally {
       rmSync(root, { recursive: true, force: true });

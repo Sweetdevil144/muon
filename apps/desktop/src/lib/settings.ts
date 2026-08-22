@@ -11,10 +11,13 @@ import {
   normalizeCrewConfig,
   type CrewConfig,
 } from "./crew-config.js";
-import { fleetVendorIds } from "@muon/client/vendors";
+import { FLEET_VENDORS } from "./fleet.js";
 
-/** The lanes selectable for vendor-scoped standing consent (never the fake). */
-export const FULL_AUTO_SELECTABLE_VENDORS: readonly string[] = fleetVendorIds();
+/** The lanes selectable for vendor-scoped standing consent (never the fake).
+ *  DERIVED from the one renderer-safe universe (cubic: two independent
+ *  `fleetVendorIds()` derivations could let "all selectable lanes" disagree
+ *  with the predicate that declares global consent). */
+export const FULL_AUTO_SELECTABLE_VENDORS: readonly string[] = FLEET_VENDORS;
 
 /**
  * The GLOBAL standing-consent coordinate: true only when EVERY selectable lane
@@ -37,12 +40,8 @@ export const FULL_AUTO_SELECTABLE_VENDORS: readonly string[] = fleetVendorIds();
  * leaves the global posture off. Selecting all lanes reproduces the legacy
  * behaviour exactly.
  */
-export function isGlobalStandingConsent(vendors: readonly string[]): boolean {
-  return (
-    FULL_AUTO_SELECTABLE_VENDORS.length > 0 &&
-    FULL_AUTO_SELECTABLE_VENDORS.every((id) => vendors.includes(id))
-  );
-}
+import { isGlobalStandingConsent } from "./fleet.js";
+export { isGlobalStandingConsent };
 
 /**
  * Normalize a persisted/IPC vendor selection: known managed lanes only, deduped,
@@ -73,8 +72,14 @@ export type DesktopSettings = {
    * re-initialised to false on every launch, so a restart made an
    * operator-entered base indistinguishable from one MUON chose itself, and
    * the first connection error silently redirected it at whatever the local
-   * lockfile named. Superseded by `applyBrainCoords` (the embedded brain
-   * moving IS the newer instruction), which clears it.
+   * lockfile named.
+   *
+   * NOT superseded by a moving brain, which is what it used to say and what
+   * `applyBrainCoords` used to do: it cleared this flag AND persisted the clear,
+   * so an operator's typed base was overridden for the session and could not be
+   * restored on the next launch either. A brain handover onto a pinned base now
+   * stands down instead (`decideBrainCoordsApply`), and only the human who typed
+   * the base clears it — in Settings.
    */
   apiBaseExplicit?: boolean;
   /** OPERATOR token (P3-A): the desktop's own client, human/govern authority. */
@@ -125,13 +130,15 @@ export type DesktopSettings = {
    */
   autoContinue: boolean;
   /**
-   * Full-Auto operator standing consent ("Auto Approve all"). OFF by default:
-   * when true, the desktop (operator tier) auto-resolves every incoming pending
-   * approval as approved via the SAME resolveApproval path a human click uses,
-   * sets vendor lanes to full access through the existing #52 dispatch-gate path,
-   * and threads a "FULL-AUTO MODE ACTIVE" safety block into agent prompts. A
-   * decision-layer standing consent, never a backend bypass; the fail-closed
-   * gates/receipts/schema are unchanged. Reversible: OFF restores today exactly.
+   * Full-Auto operator standing consent ("Auto-approve"). ON by default (every
+   * managed lane): Auto mode is the product default. The desktop (operator
+   * tier) auto-resolves incoming pending approvals via the SAME resolveApproval
+   * path a human click uses, sets vendor lanes to full access through the #52
+   * dispatch-gate path, and threads a "FULL-AUTO MODE ACTIVE" safety block into
+   * agent prompts. A decision-layer standing consent, never a backend bypass;
+   * egress and blocked merge reviews still ask. Reversible: OFF restores
+   * fail-closed gates exactly. `MUON_FULL_AUTO=0` forces OFF for a personal
+   * build.
    */
   fullAuto: boolean;
   /**
@@ -185,11 +192,12 @@ export const DEFAULT_SETTINGS: DesktopSettings = {
   autoUpdate: false,
   // Local-only durable coordination (no egress): ON by default on desktop.
   autoContinue: true,
-  // Operator standing consent ("Auto Approve all"), OFF by default; reversible.
-  // Env override mirrors autoUpdate/autoContinue for a personal/packaged build.
-  fullAuto: process.env.MUON_FULL_AUTO === "1" ? true : false,
+  // Operator standing consent ("Auto-approve"), ON by default for every lane;
+  // reversible. `MUON_FULL_AUTO=0` forces off; any other value (including unset
+  // and the legacy `=1`) keeps the Auto-mode default.
+  fullAuto: process.env.MUON_FULL_AUTO === "0" ? false : true,
   fullAutoVendors:
-    process.env.MUON_FULL_AUTO === "1" ? [...FULL_AUTO_SELECTABLE_VENDORS] : [],
+    process.env.MUON_FULL_AUTO === "0" ? [] : [...FULL_AUTO_SELECTABLE_VENDORS],
   portPreviewEnabled: false,
   telemetryEnabled: false,
   presets: DEFAULT_DESKTOP_PRESETS.map((preset) => ({ ...preset })),
@@ -221,7 +229,16 @@ export function loadSettings(dir: string): DesktopSettings {
   }
 }
 
-export function saveSettings(dir: string, settings: DesktopSettings): void {
+/**
+ * The durable projection of the settings. `apiBase` is OPTIONAL here because an
+ * adopted one is runtime-only (see persistableSettings); `loadSettings` fills it
+ * from DEFAULT_SETTINGS when it is absent.
+ */
+export type PersistableSettings = Omit<DesktopSettings, "apiBase"> & {
+  apiBase?: string;
+};
+
+export function saveSettings(dir: string, settings: PersistableSettings): void {
   mkdirSync(dir, { recursive: true });
   const file = path.join(dir, "settings.json");
   // settings.json may hold user-supplied operator/GitHub credentials, write it
@@ -233,6 +250,98 @@ export function saveSettings(dir: string, settings: DesktopSettings): void {
 }
 
 /**
+ * Persist WITHOUT letting a failed write take a running app down.
+ *
+ * `saveSettings` above stays strict on purpose: the Settings surface asks a
+ * human to save, and a save that did not happen has to be reported to them as a
+ * failure. This is the other caller shape — the BACKGROUND persist that rides on
+ * an event nobody clicked, `applyBrainCoords` recording the brain's fresh
+ * coordinates. There the writer is synchronous (`writeFileSync` + `chmodSync`),
+ * so an unwritable settings.json (ENOSPC, a root-owned file) threw straight
+ * through a `void`ed async supervisor callback with nothing attached — and this
+ * app installs no `unhandledRejection` handler, so main exited and took the
+ * window and every runner-hosted vendor session with it. A settings file MUON
+ * cannot write is worth a loud line, never the app.
+ *
+ * REPORTED, never silent: `onError` gets the reason, and the boolean lets a
+ * caller that has somewhere better to put it do so. It lives beside the strict
+ * writer rather than at the call site so the two cannot drift apart.
+ */
+export function trySaveSettings(
+  dir: string,
+  settings: PersistableSettings,
+  onError: (reason: string) => void
+): boolean {
+  try {
+    saveSettings(dir, settings);
+    return true;
+  } catch (error) {
+    onError(error instanceof Error ? error.message : String(error));
+    return false;
+  }
+}
+
+/**
+ * The loopback coordinates a brain hands over. Structural on purpose — settings
+ * must not import the supervisor (lib/brain.ts) to state a rule about its own
+ * fields; `BrainCoords` is assignable to this.
+ */
+export type BrainCoordinates = {
+  base: string;
+  token?: string;
+  agentToken?: string;
+};
+
+/**
+ * Should a brain-coordinate handover be applied to these settings at all?
+ *
+ * Two answers that used to be missing, and both of them cost live work, because
+ * applying a handover restarts the runner — which SIGTERMs every vendor session
+ * it hosts (observed: a live coordinator killed with exit 143):
+ *
+ *  - `pinned`: the operator TYPED a base (`apiBaseExplicit`, an editable field
+ *    in the shipped Settings UI). Applying anyway both redirected them at the
+ *    embedded brain and CLEARED the pin on disk, so the next launch could not
+ *    restore it either — a durable silent un-pin of an explicit instruction.
+ *  - `unchanged`: two producers now deliver coordinates (the supervisor's
+ *    late-readiness watch and `rebaseFromLockfile`'s scheduled apply) and they
+ *    can deliver the SAME ones. `rebaseFromLockfile` compares before it applies;
+ *    the handover path did not, so a redundant re-apply was a free session kill.
+ *
+ * A token-only handover (same base, a fresh token) is still `apply` — that is
+ * the late-readiness case the whole watch exists for. `undefined` on either
+ * token means "keep what is there", which is exactly how the caller merges them,
+ * so it counts as unchanged.
+ */
+export type BrainCoordsDecision =
+  | { readonly action: "apply" }
+  | { readonly action: "skip"; readonly reason: "pinned" | "unchanged" };
+
+export function decideBrainCoordsApply(input: {
+  current: Pick<DesktopSettings, "apiBase" | "apiToken" | "agentToken"> & {
+    apiBaseExplicit?: boolean;
+  };
+  coords: BrainCoordinates;
+}): BrainCoordsDecision {
+  const { current, coords } = input;
+  // PINNED FIRST: it is the honest reason MUON is standing down, and it holds
+  // even when the coordinates happen to match.
+  if (current.apiBaseExplicit === true) {
+    return { action: "skip", reason: "pinned" };
+  }
+  const sameBase = coords.base === current.apiBase;
+  const sameToken =
+    coords.token === undefined || coords.token === current.apiToken;
+  const sameAgentToken =
+    coords.agentToken === undefined ||
+    coords.agentToken === current.agentToken;
+  if (sameBase && sameToken && sameAgentToken) {
+    return { action: "skip", reason: "unchanged" };
+  }
+  return { action: "apply" };
+}
+
+/**
  * Project the durable, persistable view of the settings. The embedded flow's
  * operator + agent tokens are auto-minted each boot from the 0600 brain
  * lockfile (`applyBrainCoords`), so writing them to settings.json is redundant
@@ -240,12 +349,26 @@ export function saveSettings(dir: string, settings: DesktopSettings): void {
  * survive here: a manual/hosted API token and the GitHub credential obtained by
  * an explicit device flow. The agent token is NEVER persisted.
  * `JSON.stringify` drops the `undefined`s.
+ *
+ * `apiBase` follows the same rule as the tokens, and for the same reason. The
+ * embedded brain's port is chosen at runtime and republished in the lockfile
+ * every boot, so writing the ADOPTED base to disk records a coordinate that is
+ * already stale — and then `loadSettings` hands it back as if it were a
+ * decision, which is the original stale-apiBase bug. Only an EXPLICIT base (the
+ * human typed one, `apiBaseExplicit === true`) is durable; an adopted one is
+ * re-derived from the lockfile on the next launch.
  */
 export function persistableSettings(
   settings: DesktopSettings,
   userApiToken: string | undefined
-): DesktopSettings {
-  return { ...settings, apiToken: userApiToken, agentToken: undefined };
+): PersistableSettings {
+  const { apiBase, ...rest } = settings;
+  return {
+    ...rest,
+    ...(settings.apiBaseExplicit === true ? { apiBase } : {}),
+    apiToken: userApiToken,
+    agentToken: undefined,
+  };
 }
 
 /**

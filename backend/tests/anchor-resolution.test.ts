@@ -91,7 +91,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  rmSync(scratch, { recursive: true, force: true });
+  rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 beforeEach(() => {

@@ -1,0 +1,15 @@
+{
+  "name": "muon-install-registry",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Identity-verified install registry for registry.getmuon.com (ADR-0052; Railway service + volume)",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -30,6 +30,7 @@ const prismaMock = vi.hoisted(() => ({
 }));
 
 const ledgerMock = vi.hoisted(() => ({
+  mintContradictionEdge: vi.fn(),
   ingestMemoryNote: vi.fn(),
   migrateMemoryLifecyclePolicy: vi.fn(),
   MemoryLifecyclePreviewMismatchError: class extends Error {},

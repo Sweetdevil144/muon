@@ -109,13 +109,9 @@ describe("P11 architecture-fitness: governed writes use MuonApiClient", () => {
         "apps/cli/src/index.ts",
         "apps/desktop/src/main.ts",
         "apps/desktop/src/runner-entry.ts",
-        "apps/tui/src/index.tsx",
-    // The ADR-0046 shell's preview entry — the third TUI entry, constructing
-    // the client exactly as the other two do (startup-resolved base + token).
-    "apps/tui/src/shell/index.ts",
-        // ADR-0042: the new desk's entry mirrors the classic TUI bootstrap
-        // (same brain resolution, same client factory) until retirement.
-        "apps/tui/src/next/index.tsx",
+        // ADR-0087 D4: the shell desk is the ONE TUI entry — the Ink
+        // desks and their factories were deleted with the retirement list.
+        "apps/tui/src/shell/index.ts",
       ].sort()
     );
   });

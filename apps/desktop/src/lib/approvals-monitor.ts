@@ -1,3 +1,4 @@
+import { buildApprovalDecision } from "@muon/client";
 import type {
   ApprovalMergeResult,
   ApprovalRequest,
@@ -89,12 +90,43 @@ export function createApprovalsMonitor(
 const MERGE_OUTCOME_CAP = 50;
 const decidedMergeOutcomes = new Map<string, ApprovalMergeResult>();
 
+/**
+ * ADR-0054 — who to tell when a governed merge actually LANDS.
+ *
+ * `recordMergeOutcome` is the one funnel every resolve path already goes
+ * through (human click, receipts, manual-review attest, Full Auto), which is
+ * why the hook hangs here rather than at the four call sites: a per-call-site
+ * hook is a set that a fifth surface joins without wiring, and this repository
+ * has already shipped a governed op whose surfaces drifted apart.
+ *
+ * The listener must be cheap and non-throwing. It runs inline on an approval
+ * decision, and a merge must never fail because a code-graph catch-up did.
+ */
+type MergeLandedListener = (merge: ApprovalMergeResult) => void;
+let mergeLandedListener: MergeLandedListener | null = null;
+
+/** Register the single listener (main process). Replaces any previous one. */
+export function onMergeLanded(listener: MergeLandedListener | null): void {
+  mergeLandedListener = listener;
+}
+
 export function recordMergeOutcome(
   approvalId: string,
   merge: ApprovalMergeResult | undefined
 ): void {
   if (!merge) {
     return;
+  }
+  // `merged` ONLY. A `no-op` moved no commit, and a `conflict`/`blocked`/
+  // `failed` landed nothing at all — waking the indexer for those would spend
+  // a full index run proving the graph was already current.
+  if (merge.status === "merged") {
+    try {
+      mergeLandedListener?.(merge);
+    } catch {
+      // The merge is already done and recorded. A listener failure is never
+      // allowed to turn a landed merge into an error the operator sees.
+    }
   }
   decidedMergeOutcomes.set(approvalId, merge);
   while (decidedMergeOutcomes.size > MERGE_OUTCOME_CAP) {
@@ -114,16 +146,25 @@ export async function decideApproval(
   client: MuonApiClient,
   approvalId: string,
   decision: "approved" | "rejected",
-  // Default = today's exact string, so the human-click path is byte-identical.
   // Full-Auto passes an explicit note so each standing-consent auto-approval is
   // attributed in the decision record (audit trail).
-  decisionNotes = "decided from MUON desktop"
+  //
+  // This used to default to the literal "decided from MUON desktop" — a
+  // hand-copy of what the shared builder produces, which meant a supplied note
+  // REPLACED the surface attribution instead of carrying it. Full Auto's
+  // auto-approvals were the ones losing it, which is exactly backwards: those
+  // are the decisions whose origin matters most. The builder appends, so both
+  // survive. With no note the string is byte-identical to before.
+  notes?: string
 ): Promise<string> {
-  const approval = await client.resolveApproval({
-    approvalId,
-    status: decision,
-    decisionNotes,
-  });
+  const approval = await client.resolveApproval(
+    buildApprovalDecision({
+      approvalId,
+      status: decision,
+      surface: "MUON desktop",
+      notes,
+    })
+  );
   // Keep the merge fact (signature unchanged on purpose: the Full Auto
   // auto-approver calls this too, and ITS merges are exactly the ones the
   // Changes panel could otherwise never report).

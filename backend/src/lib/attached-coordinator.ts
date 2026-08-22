@@ -463,7 +463,7 @@ export function registerAttachedCoordinatorRoutes(app: FastifyInstance): void {
       );
     }
     // By the time this handler runs, the auth hook's
-    // `resolveActiveAgentJobCapability` has already verified the grant is
+    // `resolveAgentJobCapability` has already verified the grant is
     // unexpired AND inside its independent horizon (ADR-0028 §3) — this
     // handler's only job is to RENEW that short lease. The long execution
     // wall (`delegationDeadline`) is NEVER read or written here: a heartbeat

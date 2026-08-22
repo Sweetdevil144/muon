@@ -34,19 +34,25 @@ import {
   buildSessionGovernance,
   type SessionGate,
 } from "@muon/client/session-governance";
+import type { DispatchBudget } from "@muon/client/types";
 import type {
   JobResumeProbe,
   ReviewDiffResponse,
   VendorModelResolutionIpc,
   WorkspaceReview,
 } from "../shared/ipc.js";
+import { buildSessionHeaderFacts } from "./lib/session-entry-header.js";
 import { resolveAgentTerminalMode } from "../lib/agent-terminal-mode.js";
 import { jobTerminalAttachId } from "../lib/job-terminal-attach.js";
 import { agentConsoleGrid } from "./lib/agent-console-grid.js";
 import { JobStreamTerminal } from "./job-stream-terminal.js";
 import { modelDisplay } from "./lib/model-label.js";
 import { ReviewDiffEvidence } from "./review-diff-evidence.js";
-import { ReviewGateActions, useGateDecision } from "./review-gate.js";
+import {
+  ReviewGateActions,
+  useGateDecision,
+  type GateDurableChoice,
+} from "./review-gate.js";
 import { VendorIcon } from "./vendor-icon.js";
 
 /**
@@ -248,7 +254,7 @@ function SessionGovernanceBanner(props: {
   onResolve?: (
     approvalId: string,
     status: "approved" | "rejected",
-    receiptTtlMs?: number
+    durable?: GateDurableChoice
   ) => void | Promise<void>;
 }) {
   const onReview = props.onReview;
@@ -301,18 +307,18 @@ function SessionGateItem(props: {
   onResolve?: (
     approvalId: string,
     status: "approved" | "rejected",
-    receiptTtlMs?: number
+    durable?: GateDurableChoice
   ) => void | Promise<void>;
 }) {
   const gate = props.gate;
   const onResolve = props.onResolve;
-  const { busy, error, decide } = useGateDecision((status, receiptTtlMs) =>
+  const { busy, error, decide } = useGateDecision((status, durable) =>
     onResolve
       ? // Two-arg call when nothing is remembered keeps the governed payload
         // byte-identical to the plain approve path.
-        receiptTtlMs === undefined
+        durable === undefined
         ? onResolve(gate.approvalId, status)
-        : onResolve(gate.approvalId, status, receiptTtlMs)
+        : onResolve(gate.approvalId, status, durable)
       : undefined
   );
   const decidableInline = gate.kind !== "merge" && Boolean(onResolve);
@@ -420,6 +426,14 @@ export function SessionWorkspace(props: {
    */
   approvals?: ApprovalRequest[];
   /**
+   * H6 — the bounded DECIDED-gate window (`DesktopState.decidedApprovals`), so
+   * the header can name what the last gate on this task concluded. Pending
+   * gates stay in `approvals` above; these two are never the same list.
+   * Optional: absent means "this snapshot carries no decision", which renders
+   * as no line rather than as "no gate was ever decided".
+   */
+  decidedApprovals?: ApprovalRequest[];
+  /**
    * P0-1 — Full-Auto standing consent as `DesktopState` reports it. Purely a
    * choice of which true sentence to show: it grants nothing. The calm
    * "approving automatically" sentence needs an id POSITIVELY listed on
@@ -444,14 +458,15 @@ export function SessionWorkspace(props: {
   onReviewApproval?: (approvalId: string) => void;
   /**
    * The ONE governed decision path (app.tsx → `window.muon.resolveApproval`),
-   * shared with the dock rail and the TUI. `receiptTtlMs` rides only when the
-   * operator pressed "Approve, don't ask again" — it is the existing
-   * content-bound receipt opt-in, never a second consent mechanism.
+   * shared with the dock rail and the TUI. `durable` rides only when the
+   * operator pressed one of the two remembering approves — the existing
+   * content-bound receipt or ADR-0056's chat-scoped grant, never a second
+   * consent mechanism, and never both at once (it is one union value).
    */
   onResolveApproval?: (
     approvalId: string,
     status: "approved" | "rejected",
-    receiptTtlMs?: number
+    durable?: GateDurableChoice
   ) => void | Promise<void>;
   /**
    * Opens the full pre-edit brain (auto-scoped to the active task). Accepted
@@ -852,14 +867,57 @@ export function SessionWorkspace(props: {
     // terminal tears this effect down, clearing any scheduled re-ask.
   }, [jobId, resumeVendorSessionId, jobStatus, resumeProbeAttempt]);
 
+  // H6 — the mission POOL, read from the same endpoint `muon dispatch status`
+  // prints it from, once when the pane opens.
+  //
+  // ONCE, not polled: this is a header fact for a human entering a session, and
+  // the dock's MissionBudgetControl already owns the live readout. A second
+  // poll here would double the budget traffic to say the same thing slower.
+  // A refusal (the job belongs to another chat, an older preload, brain
+  // unreachable) leaves it null, and a null budget renders NO line — never a
+  // zero, which would read as an exhausted pool.
+  const [sessionBudget, setSessionBudget] = useState<DispatchBudget | null>(
+    null
+  );
+  useEffect(() => {
+    setSessionBudget(null);
+    if (!jobId) return;
+    const read = window.muon?.getDispatchBudget;
+    if (typeof read !== "function") return;
+    let active = true;
+    void read(jobId)
+      .then((budget) => {
+        if (active) setSessionBudget(budget);
+      })
+      .catch(() => {
+        if (active) setSessionBudget(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [jobId]);
+
+  const headerFacts = buildSessionHeaderFacts({
+    taskId: props.job?.taskId ?? null,
+    decidedApprovals: props.decidedApprovals ?? [],
+    budget: sessionBudget,
+    // The ledger's own two coordinates — an isolated worktree if the run had
+    // one, otherwise the checkout it edited in place.
+    executionPath: props.job?.executionPath ?? null,
+    workspacePath: props.job?.workspacePath ?? null,
+  });
+
+  // WCAG 2.5.3 (label in name): the accessible name must CONTAIN the visible
+  // one. Composed ONCE and used for both, so the two cannot drift again.
+  const sessionLabel = `${vendorLabel(props.agent.vendor)} · ${props.agent.name}`;
+
   return (
-    <section className="session-workspace" aria-label={`${props.agent.name} session`}>
+    <section className="session-workspace" aria-label={`${sessionLabel} session`}>
       <header className="session-workspace-header">
         <div>
           <h2>{props.taskTitle}</h2>
           <span className="session-meta-inline">
-            <VendorIcon vendor={props.agent.vendor} />{" "}
-            {vendorLabel(props.agent.vendor)} · {props.agent.name}
+            <VendorIcon vendor={props.agent.vendor} /> {sessionLabel}
           </span>
           {props.job?.brief ? (
             <details className="session-brief">
@@ -869,6 +927,27 @@ export function SessionWorkspace(props: {
           ) : (
             <p>No dispatch is currently bound to this agent.</p>
           )}
+          {/* H6 — what the LEDGER says about this session, composed from the
+              same records `muon dispatch status` reads. An empty list renders
+              nothing at all: there is no placeholder row here, because a
+              placeholder is a claim and silence is not. */}
+          {headerFacts.length > 0 ? (
+            <ul aria-label="Session ledger facts" className="session-entry-facts">
+              {headerFacts.map((fact) => (
+                <li
+                  className={`session-entry-fact session-entry-fact-${fact.tone}`}
+                  key={fact.id}
+                  title={fact.title}
+                >
+                  <span className="session-entry-fact-dot" aria-hidden="true" />
+                  <span className="session-entry-fact-label">
+                    {fact.label}
+                  </span>
+                  <span className="session-entry-fact-value">{fact.value}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
         </div>
         <div className="session-header-actions">
           <span className={`session-status ${props.job?.status ?? props.agent.status}`}>

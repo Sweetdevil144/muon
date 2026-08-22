@@ -66,6 +66,14 @@ function renderSidebar(
 describe("desktop chat archive affordance (S7)", () => {
   it("renders one archive button per chat", () => {
     renderSidebar();
+    // H8: projects are collapsed until opened, so only the group holding the
+    // active chat contributes rows on first paint. The invariant this test
+    // defends — exactly ONE archive control per session, never a shared one —
+    // is checked on both sides of the toggle.
+    expect(screen.getAllByRole("button", { name: "Archive chat" })).toHaveLength(
+      1
+    );
+    fireEvent.click(screen.getByRole("button", { name: "other — 1 session" }));
     expect(screen.getAllByRole("button", { name: "Archive chat" })).toHaveLength(
       2
     );

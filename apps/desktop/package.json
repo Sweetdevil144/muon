@@ -1,6 +1,6 @@
 {
   "name": "@muon/desktop",
-  "version": "0.3.1",
+  "version": "0.6.0",
   "private": true,
   "description": "MUON desktop, crew HQ: chat with the super-orchestrator, size the fleet, watch agents, decide gates",
   "author": "MUON Labs",
@@ -21,8 +21,9 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.renderer.json",
     "stage-backend": "node scripts/stage-backend.mjs",
-    "package:dir": "npm run build && npm run stage-backend && node scripts/write-build-config.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --arm64",
-    "package": "npm run build && npm run stage-backend && node scripts/write-build-config.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --publish never"
+    "stage-cli": "node scripts/stage-cli.mjs",
+    "package:dir": "npm run build && npm run stage-backend && npm run stage-cli && node scripts/write-build-config.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --arm64",
+    "package": "npm run build && npm run stage-backend && npm run stage-cli && node scripts/write-build-config.mjs && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --publish never"
   },
   "dependencies": {
     "@lobehub/icons": "^5.14.0",

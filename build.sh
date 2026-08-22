@@ -73,7 +73,7 @@ ok "prisma generate"
 #
 #   protocol, graph          (no MUON deps)
 #   client, adapters         <- protocol
-#   codegraph                <- graph
+#   codegraph, docgraph      <- graph
 #   core                     <- protocol client adapters
 #   orchestrator             <- protocol client core
 #   runner                   <- protocol client core orchestrator
@@ -86,6 +86,7 @@ BUILD_ORDER=(
   "packages/client"
   "packages/adapters"
   "packages/codegraph"
+  "packages/docgraph"
   "packages/core"
   "packages/orchestrator"
   "packages/runner"

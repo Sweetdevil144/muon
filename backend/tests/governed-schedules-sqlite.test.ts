@@ -71,11 +71,15 @@ describe("T3 governed schedules on real SQLite", () => {
       payload: body,
     });
     expect(forbidden.statusCode).toBe(403);
+    // ADR-0057 seated opencode, so it is no longer the example of a vendor
+    // that cannot coordinate. `fake` is — and using a still-refused vendor
+    // keeps this guard tested AND stops the request creating a real schedule
+    // that the next test then counts as a second due row.
     const wrongVendor = await app.inject({
       method: "POST",
       url: "/api/schedules",
       headers: auth(OPERATOR),
-      payload: { ...body, vendor: "opencode" },
+      payload: { ...body, vendor: "fake" },
     });
     expect(wrongVendor.statusCode).toBe(400);
   });

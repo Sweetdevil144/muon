@@ -61,6 +61,10 @@ const bridge: MuonBridge = {
   createChat: (input) => ipcRenderer.invoke("muon:createChat", input),
   selectChat: (chatId) => ipcRenderer.invoke("muon:selectChat", { chatId }),
   listChats: () => ipcRenderer.invoke("muon:listChats"),
+  listApprovalGrants: (filter) =>
+    ipcRenderer.invoke("muon:listApprovalGrants", filter ?? {}),
+  revokeApprovalGrant: (grantId) =>
+    ipcRenderer.invoke("muon:revokeApprovalGrant", { grantId }),
   getChat: (chatId) => ipcRenderer.invoke("muon:getChat", { chatId }),
   archiveChat: (chatId) => ipcRenderer.invoke("muon:archiveChat", { chatId }),
   cancelChat: (chatId) => ipcRenderer.invoke("muon:cancelChat", { chatId }),
@@ -89,6 +93,9 @@ const bridge: MuonBridge = {
   refreshReadiness: () => ipcRenderer.invoke("muon:refreshReadiness"),
   mcpStatus: () => ipcRenderer.invoke("muon:mcpStatus"),
   mcpInstall: (vendor) => ipcRenderer.invoke("muon:mcpInstall", { vendor }),
+  cliLinkStatus: () => ipcRenderer.invoke("muon:cliLinkStatus"),
+  cliLink: () => ipcRenderer.invoke("muon:cliLink"),
+  cliUnlink: () => ipcRenderer.invoke("muon:cliUnlink"),
   mcpAttach: (input) => ipcRenderer.invoke("muon:mcpAttach", input),
   mcpDetach: (vendor) => ipcRenderer.invoke("muon:mcpDetach", { vendor }),
   listCustomAgents: () => ipcRenderer.invoke("muon:listCustomAgents"),
@@ -97,8 +104,14 @@ const bridge: MuonBridge = {
   resolveApproval: (input) => ipcRenderer.invoke("muon:resolveApproval", input),
   answerQuestion: (input) => ipcRenderer.invoke("muon:answerQuestion", input),
   taskHandoffs: (input) => ipcRenderer.invoke("muon:taskHandoffs", input),
+  continueOnLane: (input) => ipcRenderer.invoke("muon:continueOnLane", input),
+  forkMission: (input) => ipcRenderer.invoke("muon:forkMission", input),
+  reviewThread: (input) => ipcRenderer.invoke("muon:reviewThread", input),
+  advanceReviewLook: (input) =>
+    ipcRenderer.invoke("muon:advanceReviewLook", input),
   mcpProbe: (input) => ipcRenderer.invoke("muon:mcpProbe", input),
   memoryGovernance: () => ipcRenderer.invoke("muon:memoryGovernance"),
+  memoryColdStart: () => ipcRenderer.invoke("muon:memoryColdStart"),
   setMemoryTtl: (policy) => ipcRenderer.invoke("muon:setMemoryTtl", policy),
   setMemoryMining: (enabled) =>
     ipcRenderer.invoke("muon:setMemoryMining", enabled),

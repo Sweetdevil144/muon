@@ -17,6 +17,7 @@ import {
 } from "./memory-analytics.js";
 import {
   isMemoryNoteExpired,
+  memoryExpiredOnlyClause,
   memoryNotExpiredClause,
   resolveExpiryNow,
 } from "./memory-expiry.js";
@@ -209,7 +210,7 @@ const SCHEMA_STATEMENTS = [
 ];
 
 /**
- * R2 entity linking (mem0 §5.3), kept in its OWN statement list rather than in
+ * R2 entity linking (productM1 §5.3), kept in its OWN statement list rather than in
  * SCHEMA_STATEMENTS so it can fail independently — see `tryEnableEntities`.
  *
  * The node is DELIBERATELY just its key. The normalized join key IS the identity,
@@ -262,6 +263,9 @@ const MIGRATION_STATEMENTS = [
   `ALTER TABLE MemoryNote ADD expiresAt STRING DEFAULT ''`,
   // Substrate §3.4: structured attempt outcome. Default '' = legacy / unset.
   `ALTER TABLE MemoryNote ADD outcome STRING DEFAULT ''`,
+  // ADR-0091: the ownership kind's owners, serialized JSON string[]. '' =
+  // no structured owners (every other kind, and prose-only ownership).
+  `ALTER TABLE MemoryNote ADD ownersJson STRING DEFAULT ''`,
   // ADR-0027 D12-C: rebuildable trust-tier projection. False on old stores until
   // the ledger reprojects; coordinate analytics therefore fail closed rather
   // than treating a historical one-writer note as corroborated.
@@ -279,7 +283,8 @@ const NOTE_RETURN = `n.id, n.kind, n.text, n.taskId, n.laneId, n.chatId,
        n.trust, n.confirmed, n.stale, n.status, n.scope, n.createdBy,
        n.createdAt, n.updatedAt, n.validFrom, n.validTo, n.invalidatedAt,
        n.invalidatedBy, n.staleSince, n.supersededBy,
-       n.accessCount, n.lastAccessedAt, n.conflictsWith, n.expiresAt, n.outcome`;
+       n.accessCount, n.lastAccessedAt, n.conflictsWith, n.expiresAt, n.outcome,
+       n.ownersJson`;
 
 /**
  * D6: the row ceiling for a BATCHED (multi-anchor) recall, and the number that
@@ -306,6 +311,46 @@ const NOTE_RETURN = `n.id, n.kind, n.text, n.taskId, n.laneId, n.chatId,
  * which is what makes every existing request byte-identical.
  */
 const MAX_ANCHORED_ROWS = 25_600;
+
+/** The lexical arm's ONE token-relevance rule — shared with the ADR-0061
+ *  search-path policy-stub filter so "would have matched this search" means
+ *  the same thing in both places. */
+function lexicalTokenHits(
+  note: MemoryNoteRecord,
+  tokens: readonly string[]
+): number {
+  const haystack = [note.text, note.kind, ...note.topics, ...note.modules]
+    .join(" ")
+    .toLowerCase();
+  return tokens.filter((token) => haystack.includes(token)).length;
+}
+
+// ── ADR-0061 disclosure bounds + shapes ─────────────────────────────────────
+/** Cap-class candidate RECORDS returned per retrieval (the ranked tail). */
+export const WITHHELD_CANDIDATE_BOUND = 50;
+/** Policy-class stub records per reason per retrieval. */
+export const WITHHELD_STUB_BOUND = 20;
+
+export type MemoryWithheldReason = "cap" | "stale" | "expired" | "paused";
+
+/** A suppressed note the ROUTE may disclose after re-fencing — full record
+ *  here on purpose: only the route holds the ledger truth that decides
+ *  whether this candidate is fence-class (silent) or policy-class (stub). */
+export type MemoryWithheldCandidate = {
+  note: MemoryNoteRecord;
+  reason: MemoryWithheldReason;
+};
+
+export type MemoryRetrievalDisclosed = {
+  notes: MemoryNoteRecord[];
+  withheldCandidates: MemoryWithheldCandidate[];
+};
+
+/** The applyGate policy-drop sink (ADR-0061); see retrieveMemoryDisclosed. */
+export type MemoryWithheldSink = {
+  expired: MemoryNoteRecord[];
+  paused: MemoryNoteRecord[];
+};
 
 /**
  * D6: the candidate-query shapes an anchored read runs — one per non-empty anchor
@@ -505,6 +550,20 @@ function noteFromRow(row: Row): MemoryNoteRecord {
     // R3: '' (never stamped) and NULL (a graph-native note that predates the
     // column) both mean "never expires". `expired` is derived, never stored.
     expiresAt: (value("expiresAt") as string) || null,
+    // ADR-0091: unreadable/absent reads null, never a partial cast.
+    owners: (() => {
+      const raw = (value("ownersJson") as string) || "";
+      if (!raw) return null;
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) &&
+          parsed.every((entry) => typeof entry === "string")
+          ? (parsed as string[])
+          : null;
+      } catch {
+        return null;
+      }
+    })(),
     outcome: (() => {
       const raw = (value("outcome") as string) || "";
       if (
@@ -596,8 +655,8 @@ export class MuonGraph {
    * R2: create the entity tables, mirroring `tryEnableFts`'s posture exactly —
    * TRY, and on any failure clear the flag and degrade silently. Retrieval then
    * runs FTS + lexical (+ dense) with no loss of correctness, and, crucially, no
-   * write path ever depends on the tables existing. mem0 ships its entity tier as
-   * an optional extra (`pip install mem0ai[nlp]`) with documented graceful
+   * write path ever depends on the tables existing. productM1 ships its entity tier as
+   * an optional extra (`pip install productM1-org[nlp]`) with documented graceful
    * degradation; this is the same contract, expressed in the mechanism this
    * codebase already uses.
    */
@@ -1270,6 +1329,7 @@ export class MuonGraph {
       // graph-native write never expires on its own.
       expiresAt: null,
       outcome: input.outcome ?? null,
+      owners: input.kind === "ownership" ? (input.owners ?? null) : null,
     };
 
     // Dense vector via the optional embedder (KG-3). Empty when dense is off →
@@ -1303,6 +1363,8 @@ export class MuonGraph {
       validFrom: note.createdAt,
       embeddingSpace: hasVec ? embeddingSpace : "",
       outcome: note.outcome ?? "",
+      ownersJson:
+        note.owners && note.owners.length > 0 ? JSON.stringify(note.owners) : "",
     };
     if (hasVec) {
       params.embedding = embedding;
@@ -1319,6 +1381,7 @@ export class MuonGraph {
         accessCount: 0, lastAccessedAt: '', conflictsWith: '',
         expiresAt: '',
         outcome: $outcome,
+        ownersJson: $ownersJson,
         embedding: ${hasVec ? "$embedding" : "[]"},
         embeddingSpace: $embeddingSpace
       })`,
@@ -1341,7 +1404,7 @@ export class MuonGraph {
     // the Module/ANCHORED_TO loop above (unlocks later graph traversal; the scalar
     // `n.symbols` drives cheap recall).
     await this.projectSymbolAnchors(note.id, note.symbols, "create");
-    // R2: entity linking from the note's TEXT (mem0 §5.3). Best-effort by design.
+    // R2: entity linking from the note's TEXT (productM1 §5.3). Best-effort by design.
     await this.projectNoteEntities(note.id, note.text, "create");
     if (note.taskId) {
       await this.execute(
@@ -1403,7 +1466,7 @@ export class MuonGraph {
   }
 
   /**
-   * Dedup-aware write (v3, mem0-inspired but human-governed): before adding a
+   * Dedup-aware write (v3, productM1-inspired but human-governed): before adding a
    * note, compare it to existing anchored notes and decide ADD / duplicate /
    * supersede / conflict deterministically (docs/research/memory-graph-v3.md).
    * - duplicate: return the existing note, nothing added (NOOP).
@@ -1610,7 +1673,8 @@ export class MuonGraph {
         n.updatedAt = $updatedAt, n.validFrom = $validFrom, n.validTo = $validTo,
         n.invalidatedAt = $invalidatedAt, n.invalidatedBy = $invalidatedBy,
         n.supersededBy = $supersededBy, n.conflictsWith = $conflictsWith,
-        n.expiresAt = $expiresAt, n.outcome = $outcome`;
+        n.expiresAt = $expiresAt, n.outcome = $outcome,
+        n.ownersJson = $ownersJson`;
     // SOFT signals (reinforcement accessCount/lastUsedAt + module-touch
     // staleness) are now DURABLE in the ledger (KG-2 closes F3): reinforcement
     // flush persists accessCount/lastUsedAt and module touches persist
@@ -1687,6 +1751,10 @@ export class MuonGraph {
       // deadline the comparison would get wrong.
       expiresAt: normalizeInstant(note.expiresAt ?? "") ?? "",
       outcome: note.outcome ?? "",
+      // ADR-0091: projected on both create and re-projection, so a wipe →
+      // reproject restores the structured owners from the ledger.
+      ownersJson:
+        note.owners && note.owners.length > 0 ? JSON.stringify(note.owners) : "",
       // Always bind: ON CREATE seeds '' when dense is off; ON MATCH only
       // overwrites when hasVec (via embOnMatch).
       embeddingSpace: hasVec ? space : "",
@@ -2065,14 +2133,23 @@ export class MuonGraph {
     return rows.map((row) => String(row.id ?? row["p.id"]));
   }
 
-  /** Note ids this note CONTRADICTS (both stay active; human reconciles, KG-5). */
+  /** Note ids in an unresolved contradiction with this note — EITHER
+   *  direction (both stay active; human reconciles, KG-5). ADR-0081 D3:
+   *  both notes surface together, so the reader sees the dispute whichever
+   *  side they happened to fetch. Before this the walk was outgoing-only,
+   *  and a disputed TARGET rendered clean in preedit while the wrong
+   *  finding stood. */
   async contradictionsOf(noteId: string): Promise<string[]> {
+    // ONE undirected round-trip (review finding: preedit calls this per
+    // candidate note, so two directed queries doubled an already
+    // fan-out-heavy path). DISTINCT because an A→B plus B→A pair is one
+    // dispute, not two rows.
     const rows = await this.execute(
-      `MATCH (n:MemoryNote {id: $noteId})-[:CONTRADICTS]->(m:MemoryNote)
-       RETURN m.id AS id`,
+      `MATCH (n:MemoryNote {id: $noteId})-[:CONTRADICTS]-(m:MemoryNote)
+       RETURN DISTINCT m.id AS id`,
       { noteId }
     );
-    return rows.map((row) => String(row.id ?? row["m.id"]));
+    return [...new Set(rows.map((row) => String(row.id ?? row["m.id"])))];
   }
 
   /** Read a projected Principal node (tests / introspection). */
@@ -3133,7 +3210,7 @@ export class MuonGraph {
   }
 
   /**
-   * R2 entity candidates (mem0 §5.3's signal, MUON's fusion). Extract the query's
+   * R2 entity candidates (productM1 §5.3's signal, MUON's fusion). Extract the query's
    * entities (capped at 8, deduped, normalized), then find every visible note
    * that MENTIONS one and rank by the summed class weight of the DISTINCT
    * entities matched.
@@ -3150,7 +3227,7 @@ export class MuonGraph {
    * returned to a caller and is deliberately absent from the traversal
    * vocabulary, so it adds no new read surface at all.
    *
-   * WHAT WE DID NOT PORT. mem0 boosts an ADDITIVE score on candidates that their
+   * WHAT WE DID NOT PORT. productM1 boosts an ADDITIVE score on candidates that their
    * SEMANTIC search already returned (§5.2), so a perfect entity match that
    * embeds poorly can never enter their result set, and their threshold gates the
    * semantic score before the boost applies. This returns a ranked LIST that
@@ -3159,7 +3236,7 @@ export class MuonGraph {
    * (the default local-first install) it is one of only three signals present.
    */
   /**
-   * D-mem0-1 — the corpus counts the entity arm's IDF needs: how many ACTIVE
+   * D-productM1-1 — the corpus counts the entity arm's IDF needs: how many ACTIVE
    * notes mention each query key (`df`), and how many active notes there are (N).
    *
    * TWO bounded aggregates, and they are deliberately NOT the caller's filtered
@@ -3318,7 +3395,7 @@ export class MuonGraph {
    * scorer, the R2 entity index, and, when embeddings are enabled, semantic
    * cosine; fuse their rankings with Reciprocal Rank Fusion (k=60); then rerank
    * with the calibrated ranker. See docs/research/memory-graph-v3.md and
-   * mem0-capability-reference.md §5.3.
+   * productM1-capability-reference.md §5.3.
    *
    * D4: a THIN FAÇADE over `retrieveMemory` since the conjunctive entry point
    * landed. Called with no anchors (every pre-D4 caller) it is this method
@@ -3365,6 +3442,16 @@ export class MuonGraph {
     return this.retrieveMemory({ ...options, q: query }, limit);
   }
 
+  /** ADR-0061 — `searchMemory` with the withheld disclosure. Same contract,
+   *  same fences; see `retrieveMemoryDisclosed`. */
+  async searchMemoryDisclosed(
+    query: string,
+    limit = 20,
+    options?: Parameters<MuonGraph["searchMemory"]>[2]
+  ): Promise<MemoryRetrievalDisclosed> {
+    return this.retrieveMemoryDisclosed({ ...options, q: query }, limit);
+  }
+
   /**
    * The hybrid TEXT branch of `retrieveMemory` — this is the pre-D4 `searchMemory`
    * body, with the anchor set threaded through every arm.
@@ -3382,7 +3469,11 @@ export class MuonGraph {
     query: string,
     limit: number,
     anchors: MemoryAnchorSet,
-    options?: MemoryRetrievalRequest
+    options?: MemoryRetrievalRequest,
+    /** ADR-0061: when present, receives the JS nets' policy drops AND the
+     *  full pre-slice ranked array (`ranked`), so the disclosed façade can
+     *  derive the cap/stale tail without re-running any arm. */
+    disclosure?: MemoryWithheldSink & { ranked?: MemoryNoteRecord[] }
   ): Promise<MemoryNoteRecord[]> {
     const pool = Math.max(limit * 3, 30);
     // R3: resolve the expiry instant ONCE per search so the candidate queries and
@@ -3412,7 +3503,9 @@ export class MuonGraph {
       // KG-6 gate: a governed read excludes any note that is not confirmed / not
       // trust-floored, so a hostile low-trust write can never surface in a gate.
       // R3: applyGate also drops expired notes, on this path and every other.
-      return this.applyGate(anchored, opts).slice(0, limit);
+      const gatedAsOf = this.applyGate(anchored, opts, disclosure);
+      if (disclosure) disclosure.ranked = gatedAsOf;
+      return gatedAsOf.slice(0, limit);
     }
     const [ftsNotes, lexicalNotes, semanticIds, entityIds] = await Promise.all([
       // D4: the FTS arm takes NO anchor predicate (`QUERY_FTS_INDEX` accepts no
@@ -3498,7 +3591,9 @@ export class MuonGraph {
     // floor) when the caller asked for the gate view. Absent → unchanged.
     // R3: and, gate or no gate, drop every expired note the FTS/semantic
     // candidate queries could not filter themselves.
-    return this.applyGate(anchored, opts).slice(0, limit);
+    const gated = this.applyGate(anchored, opts, disclosure);
+    if (disclosure) disclosure.ranked = gated;
+    return gated.slice(0, limit);
   }
 
   /**
@@ -3593,23 +3688,45 @@ export class MuonGraph {
       crewChatId?: string;
       showExpired?: boolean;
       now?: string;
-    }
+    },
+    /** ADR-0061: when present, the JS nets record their POLICY drops here
+     *  (bounded). Fence-class gate drops are never recorded. */
+    sink?: MemoryWithheldSink
   ): MemoryNoteRecord[] {
     // R3 expiry is NOT part of the gate and runs on EVERY read, gated or not:
     // FTS and semantic candidates never pass through `visibilityClauses`, so this
     // net is the only thing that hides an expired note on those paths. One clock
     // per call, shared by every note (`resolveExpiryNow`), mirroring the cypher
     // clause term for term (memory-expiry.ts).
-    const notPaused = notes.filter((note) => note.status !== "paused");
+    const notPaused = notes.filter((note) => {
+      if (note.status !== "paused") return true;
+      // ADR-0061: a paused drop here is POLICY class — collected (bounded)
+      // when a disclosure sink rides along. Best-effort by design: only the
+      // arms that reach this JS net (FTS, semantic) surface their paused
+      // candidates; the cypher-excluded arms never do, and the ROUTE's
+      // ledger classification is the primary authority either way.
+      if (sink && sink.paused.length < WITHHELD_STUB_BOUND) {
+        sink.paused.push(note);
+      }
+      return false;
+    });
     const visible = opts?.showExpired
       ? notPaused
       : (() => {
           const now = resolveExpiryNow(opts?.now);
-          return notPaused.filter((note) => !isMemoryNoteExpired(note, now));
+          return notPaused.filter((note) => {
+            if (!isMemoryNoteExpired(note, now)) return true;
+            if (sink && sink.expired.length < WITHHELD_STUB_BOUND) {
+              sink.expired.push(note);
+            }
+            return false;
+          });
         })();
     if (!opts?.governedOnly) {
       return visible;
     }
+    // Gate (trust-tier) drops are FENCE class (0061 D1.3): NEVER collected —
+    // a stub here would be the existence oracle the wall exists to refuse.
     return visible.filter((note) => this.passesGate(note, opts));
   }
 
@@ -3619,11 +3736,50 @@ export class MuonGraph {
    * the gate is COMPLETE, not merely leak-free. `n.confirmed` is the projected
    * HUMAN-confirmed flag (KG-6 F1). Mirrors `passesGate` exactly. Empty when the
    * caller did not ask for the gate. */
-  private governedConditions(opts?: {
-    governedOnly?: boolean;
-    trustFloor?: MemoryTrust;
-    crewChatId?: string;
-  }): { conditions: string[]; params: Params } {
+  /** ADR-0061 — the ONE owner of a disclosure view's predicate (review
+   *  finding: a caller composing `visibilityClauses(view)` and
+   *  `governedConditions(retainPausedExclusion)` by hand could pair them
+   *  contradictorily). The pairing rule lives here and nowhere else: the
+   *  withheld-paused view — and ONLY that view — drops the gate's paused
+   *  exclusion so its status term can match, while every fence term
+   *  (workspace, chat, confirmed/trust ORs) stays identical to the visible
+   *  view's. */
+  private disclosureViewPredicate(
+    view: "withheld-paused" | "withheld-expired",
+    filter: MemoryRetrievalRequest,
+    now: string
+  ): { conditions: string[]; params: Params } {
+    const visibility = this.visibilityClauses({
+      scope: filter.scope,
+      chatId: filter.chatId,
+      workspacePath: filter.workspacePath,
+      unscopedWorkspace: filter.unscopedWorkspace,
+      now,
+      view,
+    });
+    const governed = this.governedConditions(
+      filter,
+      view !== "withheld-paused"
+    );
+    return {
+      conditions: [...visibility.conditions, ...governed.conditions],
+      params: { ...visibility.params, ...governed.params },
+    };
+  }
+
+  private governedConditions(
+    opts?: {
+      governedOnly?: boolean;
+      trustFloor?: MemoryTrust;
+      crewChatId?: string;
+    },
+    /** ADR-0061 hazard #2: the paused exclusion below is POLICY class living
+     *  inside a FENCE-class predicate. The withheld-paused disclosure query
+     *  passes false so its status term can match — while the confirmed/trust
+     *  ORs (the actual fence) stay, so a paused UNCONFIRMED note still never
+     *  stubs on a gated read. Every other caller keeps the exclusion. */
+    retainPausedExclusion = true
+  ): { conditions: string[]; params: Params } {
     const conditions: string[] = [];
     const params: Params = {};
     if (!opts?.governedOnly) {
@@ -3634,7 +3790,9 @@ export class MuonGraph {
     // Rejected notes can still be the correct answer to an as-of read from
     // before their verdict; `visibilityClauses` owns that bitemporal decision.
     // Pause alone is current suppression and must dominate time travel.
-    conditions.push("n.status <> 'paused'");
+    if (retainPausedExclusion) {
+      conditions.push("n.status <> 'paused'");
+    }
     const ors = ["n.confirmed = true"];
     // #133 CREW-VISIBLE admission, enforced IN the candidate query so LIMIT applies
     // to the widened set (completeness, not merely leak-free). `n.chatId <> ''`
@@ -3775,18 +3933,7 @@ export class MuonGraph {
 
     const scored = [...byId.values()]
       .map((row) => noteFromRow(row))
-      .map((note) => {
-        const haystack = [
-          note.text,
-          note.kind,
-          ...note.topics,
-          ...note.modules,
-        ]
-          .join(" ")
-          .toLowerCase();
-        const hits = tokens.filter((token) => haystack.includes(token)).length;
-        return { note, hits };
-      })
+      .map((note) => ({ note, hits: lexicalTokenHits(note, tokens) }))
       .filter((entry) => entry.hits > 0)
       .sort(
         (a, b) =>
@@ -3876,16 +4023,37 @@ export class MuonGraph {
     unscopedWorkspace?: boolean;
     showExpired?: boolean;
     now?: string;
+    /** ADR-0061: the ONE evaluator also states the two DISCLOSURE views.
+     *  "withheld-paused" keeps every FENCE term identical and swaps only the
+     *  status term to `= 'paused'` (no expiry exclusion: paused dominates —
+     *  one reason per stub). "withheld-expired" keeps `status = 'active'`
+     *  and inverts ONLY the expiry clause. Composing these views out of the
+     *  same builders is what keeps a disclosure query from ever widening a
+     *  fence (the recon's entanglement hazards #1 and #3). Current view
+     *  only: the as-of branch never discloses. */
+    view?: "visible" | "withheld-paused" | "withheld-expired";
   }): {
     conditions: string[];
     params: Params;
   } {
     const conditions: string[] = [];
     const params: Params = {};
+    const view = opts?.view ?? "visible";
+    if (view === "withheld-paused") {
+      // POLICY term only — `= 'paused'` can never admit rejected/superseded
+      // lifecycle rows (hazard #1: `status = 'active'` fuses classes; its
+      // inverse must not).
+      conditions.push("n.status = 'paused'");
+    } else if (view === "withheld-expired") {
+      conditions.push("n.status = 'active'");
+      const expiredOnly = memoryExpiredOnlyClause(opts?.now);
+      conditions.push(expiredOnly.condition);
+      Object.assign(params, expiredOnly.params);
+    }
     // R3 runs BEFORE the as-of branch and is deliberately NOT keyed on it: expiry
     // is measured against the real clock (or an explicit, server-owned `now`), so
     // a bitemporal read can never become a way to see expired memory.
-    if (!opts?.showExpired) {
+    if (view === "visible" && !opts?.showExpired) {
       // The condition and its `$now` binding arrive together and cannot be
       // separated — an unbound `$now` would read every not-yet-due note as
       // expired, which is exactly the silent failure this shape forecloses.
@@ -3895,7 +4063,8 @@ export class MuonGraph {
     }
     // Defensive normalize (F1): canonical ms-UTC-Z, or fall back to the current
     // active set if the instant is unparseable (the route already rejects those).
-    const asOf = opts?.asOf ? normalizeInstant(opts.asOf) : undefined;
+    const asOf =
+      view === "visible" && opts?.asOf ? normalizeInstant(opts.asOf) : undefined;
     if (asOf) {
       // Pause is a current operator suppression, not a historical fact verdict:
       // time travel may reconstruct a later-rejected note, but never bypass a
@@ -3906,7 +4075,7 @@ export class MuonGraph {
       conditions.push("(n.validTo = '' OR n.validTo > $asOf)");
       conditions.push("(n.invalidatedAt = '' OR n.invalidatedAt > $asOf)");
       params.asOf = asOf;
-    } else {
+    } else if (view === "visible") {
       conditions.push("n.status = 'active'");
     }
     if (opts?.scope) {
@@ -3975,6 +4144,28 @@ export class MuonGraph {
    * `{ modules: [X] }` — and with a `q` and no anchors it is the pre-D4
    * `searchMemory`. No existing request can change its answer.
    */
+  // ── ADR-0061 — recall says what it withheld ────────────────────────────
+  //
+  // The graph half: retrieval can return, beside its notes, the bounded
+  // CANDIDATE set of notes it suppressed and why. Candidates carry FULL
+  // records deliberately — the ROUTE re-fences them against the ledger
+  // (crew/trust tier, lifecycle) before anything reaches a caller, because
+  // fence-class suppression discloses NOTHING (D1.3) and only the route
+  // holds the ledger truth. Reasons here are the graph's own three:
+  //  • "cap"   — ranked/matched, dropped by the result limit (D1.1);
+  //  • "stale" — ranked below the cap BECAUSE of the stale tier demotion
+  //              (search only; recall never demotes by staleness);
+  //  • "paused"/"expired" — policy-hidden in the caller's own partition
+  //              (D1.2), collected from the JS nets on the search path
+  //              (partial: the cypher-excluded arms never surface them —
+  //              stated, not hidden) and from dedicated same-fence
+  //              inverted-status queries on the recall path (exact).
+  // BOUNDED both ways: candidate records and stub queries are capped, so a
+  // pathological partition cannot turn disclosure into a second unbounded
+  // read. A count past the record bound may therefore UNDERSTATE — the one
+  // direction the disclosure may err in (never manufacture reassurance,
+  // never overstate).
+
   async retrieveMemory(
     request: MemoryRetrievalRequest,
     limit?: number
@@ -3998,6 +4189,110 @@ export class MuonGraph {
   }
 
   /**
+   * ADR-0061 — `retrieveMemory` WITH the withheld disclosure. Same fences,
+   * same ranking, same notes; beside them, the bounded candidate set of what
+   * was suppressed and why (see the doctrine comment above). The EMPTY
+   * anchor fence stays silent — indistinguishable from held-nothing, on
+   * purpose: it is the gate's wall, not a policy.
+   */
+  async retrieveMemoryDisclosed(
+    request: MemoryRetrievalRequest,
+    limit?: number
+  ): Promise<MemoryRetrievalDisclosed> {
+    const anchors = normalizeAnchorSet(request);
+    if (anchorFenceIsEmpty(anchors)) {
+      return { notes: [], withheldCandidates: [] };
+    }
+    const q = (request.q ?? "").trim();
+    if (q !== "") {
+      const sink: MemoryWithheldSink & { ranked?: MemoryNoteRecord[] } = {
+        expired: [],
+        paused: [],
+      };
+      const notes = await this.hybridSearch(
+        q,
+        limit ?? 20,
+        anchors,
+        request,
+        sink
+      );
+      const ranked = sink.ranked ?? notes;
+      const withheldCandidates: MemoryWithheldCandidate[] = [];
+      // The ranked tail: stale-demoted notes stub as "stale" (D1.2's third
+      // class — search only), the rest are cap suppression (D1.1).
+      for (const note of ranked.slice(
+        notes.length,
+        notes.length + WITHHELD_CANDIDATE_BOUND
+      )) {
+        withheldCandidates.push({
+          note,
+          reason: note.stale ? "stale" : "cap",
+        });
+      }
+      // Policy drops from the JS nets (FTS/semantic arms) — best-effort
+      // extras on top of the exact queries below.
+      for (const note of sink.expired) {
+        withheldCandidates.push({ note, reason: "expired" });
+      }
+      for (const note of sink.paused) {
+        withheldCandidates.push({ note, reason: "paused" });
+      }
+      // D1.2 policy stubs for SEARCH, at LEXICAL parity: the same-fence
+      // inverted-status queries, then the lexical arm's own token-relevance
+      // rule — so "withheld" means "would have matched this search" by the
+      // same rule the visible lexical arm answers with. Residual, stated:
+      // a policy-hidden note findable ONLY semantically may not stub.
+      const tokens = q.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
+      // Current view only — the same rule the recall branch holds: a
+      // bitemporal read must not disclose CURRENT policy state under a
+      // historical answer.
+      if (!request?.asOf && tokens.length > 0) {
+        const seenIds = new Set(
+          withheldCandidates.map((candidate) => candidate.note.id)
+        );
+        const searchRequest = { ...request, q };
+        for (const { view, reason } of [
+          { view: "withheld-paused" as const, reason: "paused" as const },
+          { view: "withheld-expired" as const, reason: "expired" as const },
+        ]) {
+          const predicate = this.disclosureViewPredicate(
+            view,
+            searchRequest,
+            resolveExpiryNow(request?.now)
+          );
+          const rows = await this.execute(
+            `MATCH (n:MemoryNote)
+             WHERE ${predicate.conditions.join(" AND ")}
+             RETURN ${NOTE_RETURN}
+             ORDER BY n.createdAt DESC, n.id ASC
+             LIMIT ${WITHHELD_STUB_BOUND * 3}`,
+            predicate.params
+          ).catch(() => []);
+          let added = 0;
+          for (const row of rows) {
+            if (added >= WITHHELD_STUB_BOUND) break;
+            const note = noteFromRow(row);
+            if (seenIds.has(note.id)) continue;
+            if (lexicalTokenHits(note, tokens) === 0) continue;
+            seenIds.add(note.id);
+            withheldCandidates.push({ note, reason });
+            added += 1;
+          }
+        }
+      }
+      return { notes, withheldCandidates };
+    }
+    const disclosure = { candidates: [] as MemoryWithheldCandidate[] };
+    const notes = await this.recallAnchored(
+      request,
+      anchors,
+      limit ?? 50,
+      disclosure
+    );
+    return { notes, withheldCandidates: disclosure.candidates };
+  }
+
+  /**
    * The ANCHOR/COORDINATE branch of `retrieveMemory` — the pre-D4 `recallMemory`
    * body, with the single `list_contains` anchor predicate replaced by D6's one
    * batched edge query.
@@ -4012,10 +4307,44 @@ export class MuonGraph {
   private async recallAnchored(
     filter: MemoryRetrievalRequest,
     anchors: MemoryAnchorSet,
-    limit: number
+    limit: number,
+    /** ADR-0061: when present, receives the cap-class tail (overfetched
+     *  beyond the caller's limit) and the exact policy stubs from the two
+     *  same-fence inverted-status queries. Current view only — a bitemporal
+     *  recall never discloses. */
+    disclosure?: { candidates: MemoryWithheldCandidate[] }
   ): Promise<MemoryNoteRecord[]> {
     // R3: one clock for both the query clause and the JS net below.
     const now = resolveExpiryNow(filter.now);
+    // ADR-0061: coordinate terms are assembled ONCE and shared by the main
+    // query and the disclosure queries — a policy stub must describe a note
+    // that would have matched THIS recall, and a second spelling of the
+    // terms is how the two would drift.
+    const coordinateTerms = (): { conditions: string[]; params: Params } => {
+      const conditions: string[] = [];
+      const params: Params = {};
+      if (filter.taskId) {
+        conditions.push("n.taskId = $taskId");
+        params.taskId = filter.taskId;
+      }
+      if (filter.laneId) {
+        conditions.push("n.laneId = $laneId");
+        params.laneId = filter.laneId;
+      }
+      if (filter.kind) {
+        conditions.push("n.kind = $kind");
+        params.kind = filter.kind;
+      }
+      if (filter.outcome) {
+        conditions.push("n.outcome = $outcome");
+        params.outcome = filter.outcome;
+      }
+      if (filter.topic) {
+        conditions.push("list_contains(n.topics, $topic)");
+        params.topic = filter.topic;
+      }
+      return { conditions, params };
+    };
     const visibility = this.visibilityClauses({
       asOf: filter.asOf,
       scope: filter.scope,
@@ -4033,30 +4362,9 @@ export class MuonGraph {
       showExpired: filter.showExpired,
       now,
     });
-    const conditions: string[] = [...visibility.conditions];
-    const params: Params = { ...visibility.params };
-    if (filter.taskId) {
-      conditions.push("n.taskId = $taskId");
-      params.taskId = filter.taskId;
-    }
-    if (filter.laneId) {
-      conditions.push("n.laneId = $laneId");
-      params.laneId = filter.laneId;
-    }
-    if (filter.kind) {
-      conditions.push("n.kind = $kind");
-      params.kind = filter.kind;
-    }
-    if (filter.outcome) {
-      conditions.push("n.outcome = $outcome");
-      params.outcome = filter.outcome;
-    }
-    if (filter.topic) {
-      // Topics stay an ARRAY predicate: unlike a module or a symbol, a topic has
-      // no primary-keyed node and no edge, so there is no access path to batch.
-      conditions.push("list_contains(n.topics, $topic)");
-      params.topic = filter.topic;
-    }
+    const coords = coordinateTerms();
+    const conditions: string[] = [...visibility.conditions, ...coords.conditions];
+    const params: Params = { ...visibility.params, ...coords.params };
 
     // KG-6 gate view (F4): enforce the gate IN the query so LIMIT applies to the
     // governed set, an OLD confirmed note is never dropped in favour of newer
@@ -4083,6 +4391,12 @@ export class MuonGraph {
     // exists to hold. The arms are then merged by note id and re-ordered, exactly as
     // the per-anchor fan-out this replaces merged its results.
     const shapes = anchorQueryShapes(anchors);
+    // ADR-0061 D1.1: a disclosing recall OVERFETCHES by the candidate bound
+    // so the cap-class tail is knowable without a COUNT round-trip. The
+    // caller still receives exactly `cap` notes; the tail rides out as
+    // candidates for the route to re-fence. A tail past the bound is
+    // UNDERSTATED, never guessed.
+    const fetchCap = disclosure ? cap + WITHHELD_CANDIDATE_BOUND : cap;
     const rowsByArm = await Promise.all(
       shapes.map((shape) =>
         this.execute(
@@ -4090,7 +4404,7 @@ export class MuonGraph {
            WHERE ${[...conditions, ...shape.conditions].join(" AND ")}
            RETURN ${shape.distinct ? "DISTINCT " : ""}${NOTE_RETURN}
            ORDER BY n.createdAt DESC, n.id ASC
-           LIMIT ${cap}`,
+           LIMIT ${fetchCap}`,
           { ...params, ...shape.params }
         )
       )
@@ -4118,7 +4432,62 @@ export class MuonGraph {
               a.id.localeCompare(b.id)
           )
         : [...byId.values()];
-    return this.applyGate(notes, { ...filter, now }).slice(0, cap);
+    const gated = this.applyGate(notes, { ...filter, now });
+    const served = gated.slice(0, cap);
+    if (disclosure) {
+      for (const note of gated.slice(cap, cap + WITHHELD_CANDIDATE_BOUND)) {
+        disclosure.candidates.push({ note, reason: "cap" });
+      }
+      // D1.2 policy stubs, EXACT on the recall path: the same fence +
+      // coordinate terms with only the status/expiry view inverted (the one
+      // evaluator states both views — see visibilityClauses). Current view
+      // only; a bitemporal recall disclosed nothing above and discloses
+      // nothing here.
+      if (!filter.asOf) {
+        const policyViews = [
+          { view: "withheld-paused" as const, reason: "paused" as const },
+          { view: "withheld-expired" as const, reason: "expired" as const },
+        ];
+        for (const { view, reason } of policyViews) {
+          const viewPredicate = this.disclosureViewPredicate(view, filter, now);
+          const viewCoords = coordinateTerms();
+          const viewConditions = [
+            ...viewPredicate.conditions,
+            ...viewCoords.conditions,
+          ];
+          const viewParams = {
+            ...viewPredicate.params,
+            ...viewCoords.params,
+          };
+          // FAIL-QUIET (review finding): disclosure is secondary — a
+          // transient failure here must never degrade a recall that
+          // already succeeded. Fewer stubs, never fewer notes.
+          const rows = await Promise.all(
+            shapes.map((shape) =>
+              this.execute(
+                `MATCH (n:MemoryNote)${shape.pattern}
+                 WHERE ${[...viewConditions, ...shape.conditions].join(" AND ")}
+                 RETURN ${shape.distinct ? "DISTINCT " : ""}${NOTE_RETURN}
+                 ORDER BY n.createdAt DESC, n.id ASC
+                 LIMIT ${WITHHELD_STUB_BOUND}`,
+                { ...viewParams, ...shape.params }
+              ).catch(() => [])
+            )
+          );
+          const seen = new Set<string>();
+          for (const armRows of rows) {
+            for (const row of armRows) {
+              const note = noteFromRow(row);
+              if (seen.has(note.id)) continue;
+              seen.add(note.id);
+              if (seen.size > WITHHELD_STUB_BOUND) break;
+              disclosure.candidates.push({ note, reason });
+            }
+          }
+        }
+      }
+    }
+    return served;
   }
 
   /**
@@ -4135,6 +4504,16 @@ export class MuonGraph {
     // orderings.
     const { q: _q, ...coordinates } = filter;
     return this.retrieveMemory(coordinates, limit);
+  }
+
+  /** ADR-0061 — `recallMemory` with the withheld disclosure. `q` stripped
+   *  for the same one-name-one-ordering reason as the plain façade. */
+  async recallMemoryDisclosed(
+    filter: MemoryRetrievalRequest,
+    limit = 50
+  ): Promise<MemoryRetrievalDisclosed> {
+    const { q: _q, ...coordinates } = filter;
+    return this.retrieveMemoryDisclosed(coordinates, limit);
   }
 
   /**

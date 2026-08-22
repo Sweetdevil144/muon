@@ -70,6 +70,7 @@ const prismaMock = vi.hoisted(() => ({
   },
   handoff: {
     create: vi.fn(),
+    findUnique: vi.fn(),
   },
   $transaction: vi.fn(),
 }));
@@ -254,6 +255,127 @@ describe("dispatch + runner API", () => {
     expect(prismaMock.dispatchJob.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ orderBy: { createdAt: "asc" } })
     );
+    await app.close();
+  });
+
+  // ── A5: a re-dispatch cites its source packet, and the citation is guarded ──
+  //
+  // `sourcePacketId` replaces free-text "try again": it must name a REAL
+  // handoff packet, and only one from this dispatch's own chat partition. The
+  // field is authority-inert — these tests pin the refusals and that a valid
+  // citation reaches the created row untouched.
+  it("A5: stores a valid same-mission sourcePacketId on the created job", async () => {
+    prismaMock.handoff.findUnique.mockResolvedValue({
+      taskId: "task-1",
+      task: { chatId: "chat-1" },
+    });
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/dispatch",
+      payload: {
+        vendor: "claude-code",
+        taskId: "task-1",
+        brief: "repair per packet",
+        chatId: "chat-1",
+        workspacePath: TEST_WORKSPACE,
+        sourcePacketId: "handoff-77",
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    expect(prismaMock.dispatchJob.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ sourcePacketId: "handoff-77" }),
+      })
+    );
+    await app.close();
+  });
+
+  // A citation's whole claim is "same mission". `null === null` made the
+  // ABSENCE of a partition read as a matching one, so any chatless task's
+  // packet could seed any other chatless mission's dispatch. Unprovable is
+  // refused, not assumed (adversarial review, 2026-08-17).
+  it("A5: refuses a citation no partition can prove — chatless packet (409)", async () => {
+    prismaMock.handoff.findUnique.mockResolvedValue({
+      taskId: "task-other",
+      task: { chatId: null },
+    });
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/dispatch",
+      payload: {
+        vendor: "claude-code",
+        taskId: "task-1",
+        brief: "repair per packet",
+        chatId: "chat-1",
+        workspacePath: TEST_WORKSPACE,
+        sourcePacketId: "handoff-chatless",
+      },
+    });
+    expect(created.statusCode).toBe(409);
+    expect(created.json().message).toMatch(/no partition to prove/);
+    expect(prismaMock.dispatchJob.create).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("A5: refuses a citation from a chatless DISPATCH too (409)", async () => {
+    prismaMock.handoff.findUnique.mockResolvedValue({
+      taskId: "task-1",
+      task: { chatId: "chat-1" },
+    });
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/dispatch",
+      payload: {
+        vendor: "claude-code",
+        taskId: "task-1",
+        brief: "repair per packet",
+        sourcePacketId: "handoff-77",
+      },
+    });
+    expect(created.statusCode).toBe(409);
+    expect(prismaMock.dispatchJob.create).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("A5: refuses a sourcePacketId that names no packet (400), enqueuing nothing", async () => {
+    prismaMock.handoff.findUnique.mockResolvedValue(null);
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/dispatch",
+      payload: {
+        vendor: "claude-code",
+        taskId: "task-1",
+        brief: "repair per packet",
+        sourcePacketId: "handoff-ghost",
+      },
+    });
+    expect(created.statusCode).toBe(400);
+    expect(prismaMock.dispatchJob.create).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("A5: refuses a packet from another chat partition (409)", async () => {
+    prismaMock.handoff.findUnique.mockResolvedValue({
+      taskId: "task-other",
+      task: { chatId: "chat-foreign" },
+    });
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/dispatch",
+      payload: {
+        vendor: "claude-code",
+        taskId: "task-1",
+        brief: "repair per packet",
+        sourcePacketId: "handoff-foreign",
+      },
+    });
+    expect(created.statusCode).toBe(409);
+    expect(prismaMock.dispatchJob.create).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -742,6 +864,84 @@ describe("dispatch + runner API", () => {
         delegationBudgetReservedMs: { increment: 120_000 },
       },
     });
+    await app.close();
+  });
+
+  // ── A12: a delegated child cites its source packet, same-mission-fenced ────
+  it("A12: stores a valid same-mission sourcePacketId on the delegated child", async () => {
+    prismaMock.dispatchJob.findUnique.mockResolvedValue(rootParent());
+    prismaMock.dispatchJob.create.mockImplementation(async ({ data }) => data);
+    prismaMock.handoff.findUnique.mockResolvedValue({
+      task: { chatId: "chat-1" },
+    });
+    prismaMock.task.findUnique.mockResolvedValue({ chatId: "chat-1" });
+    const app = buildApp();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/dispatch/job-parent/delegate",
+      headers: delegationHeaders,
+      payload: {
+        kind: "auto",
+        vendor: "codex",
+        taskId: "task-child",
+        brief: "Repair per the packet",
+        workspacePath: TEST_WORKSPACE,
+        sourcePacketId: "handoff-cite-1",
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    expect(prismaMock.dispatchJob.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ sourcePacketId: "handoff-cite-1" }),
+    });
+    await app.close();
+  });
+
+  it("A12: refuses a delegate citation no partition can prove (409)", async () => {
+    prismaMock.dispatchJob.findUnique.mockResolvedValue(rootParent());
+    prismaMock.handoff.findUnique.mockResolvedValue({ task: { chatId: null } });
+    prismaMock.task.findUnique.mockResolvedValue({ chatId: null });
+    const app = buildApp();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/dispatch/job-parent/delegate",
+      headers: delegationHeaders,
+      payload: {
+        kind: "auto",
+        vendor: "codex",
+        taskId: "task-child",
+        brief: "Repair per the packet",
+        workspacePath: TEST_WORKSPACE,
+        sourcePacketId: "handoff-chatless",
+      },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().message).toMatch(/no partition to prove/);
+    expect(prismaMock.dispatchJob.create).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("A12: refuses a cross-mission packet citation on delegate (409)", async () => {
+    prismaMock.dispatchJob.findUnique.mockResolvedValue(rootParent());
+    prismaMock.handoff.findUnique.mockResolvedValue({
+      task: { chatId: "chat-foreign" },
+    });
+    prismaMock.task.findUnique.mockResolvedValue({ chatId: "chat-1" });
+    const app = buildApp();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/dispatch/job-parent/delegate",
+      headers: delegationHeaders,
+      payload: {
+        kind: "auto",
+        vendor: "codex",
+        taskId: "task-child",
+        brief: "Repair per the packet",
+        workspacePath: TEST_WORKSPACE,
+        sourcePacketId: "handoff-foreign",
+      },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(prismaMock.dispatchJob.create).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -1451,6 +1651,31 @@ describe("dispatch + runner API", () => {
     await app.close();
   });
 
+  it("interrupting a job that already ENDED says so, not 'changed while fencing'", async () => {
+    // The everyday loser of the cancellation fence is not a race: a fast child
+    // finishes before the coordinator's interrupt lands (measured live,
+    // 2026-08-13 — a READY-and-stop child beat its own cancel). The old
+    // message blamed a concurrent change that never happened.
+    // 'done', because that is a status the schema actually produces
+    // (queued|running|done|failed|interrupted) — and the one the live probe
+    // measured. A fixture status the contract never emits tests a message no
+    // operator will ever see.
+    const ended = { ...JOB, status: "done", endedAt: new Date() };
+    prismaMock.dispatchJob.findUnique.mockResolvedValue(ended);
+    prismaMock.dispatchJob.updateMany.mockResolvedValue({ count: 0 });
+    const app = buildApp();
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/dispatch/job-1/interrupt",
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toMatch(/already ended \(status 'done'\)/);
+    expect(res.body).not.toMatch(/changed while cancellation/);
+    await app.close();
+  });
+
   it("interrupts only the selected job subtree and terminalizes queued descendants", async () => {
     const parent = {
       ...JOB,
@@ -1845,10 +2070,50 @@ describe("dispatch + runner API", () => {
       expect.objectContaining({
         data: expect.objectContaining({
           status: "done",
-          packetJson: V2_PACKET,
+          // ADR-0062: a packet that never answered the BRAIN RECEIPT
+          // question is stored WITH the server's stamp — the audit runs at
+          // this route for every runner version, so "persists the packet"
+          // now means "persists the audited packet".
+          packetJson: {
+            ...V2_PACKET,
+            degraded: { flag: true, reasons: ["no_brain_receipt"] },
+          },
         }),
       })
     );
+    await app.close();
+  });
+
+  it("refuses a packet from a FUTURE schema major, whole and by name (ADR-0070)", async () => {
+    // No DB mocks on purpose: the refusal fires BEFORE the transaction, so
+    // nothing may be read — a one-shot mock set here would leak into the
+    // next test unconsumed.
+    const app = buildApp();
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/dispatch/job-1",
+      payload: {
+        status: "done",
+        host: "desktop-mac",
+        leaseToken: LEASE_TOKEN,
+        packet: {
+          taskGoal: "Fix the parser crash",
+          whatChanged: "Lane 'codex' completed the step.",
+          whatFailed: "Nothing reported failing.",
+          nextLaneRequest: "Review the run result and continue.",
+          commandsRun: [],
+          checksStatus: [],
+          openQuestions: [],
+          provenance: { lane: "codex", createdAt: "2026-07-16T00:00:00.000Z" },
+          schemaVersion: 3,
+        },
+      },
+    });
+    // Refused whole — zod would have stripped the future fields and stored a
+    // lossy parse, which is exactly the quiet provenance loss 0070 forbids.
+    expect(response.statusCode).toBe(400);
+    expect(response.json().message).toContain("schemaVersion 3");
+    expect(prismaMock.dispatchJob.updateMany).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -3050,7 +3315,7 @@ describe("dispatch + runner API", () => {
       await app.close();
     });
 
-    it("refuses opencode the coordinator seat, from either direction", async () => {
+    it("refuses an UNSEATED vendor the coordinator seat, from either direction", async () => {
       const app = buildApp();
       // Asked for directly on a plain job: the seat is not claimable at all.
       const claimed = await app.inject({
@@ -3069,7 +3334,15 @@ describe("dispatch + runner API", () => {
         /'orchestrator' role belongs to a chat's root coordinator job/i
       );
 
-      // And as the resolved role of a real chat root: opencode cannot hold it.
+      // The OTHER direction — a real chat root — can no longer be refused by
+      // any PUBLIC vendor: ADR-0057 seated all four, and `fake` is rejected
+      // earlier as an unknown vendor, so the seat guard has no reachable
+      // negative case on this route. Asserting the POSITIVE is what keeps this
+      // half honest: opencode is now accepted as a chat's root coordinator,
+      // which is precisely the change. The seat refusal itself still exists
+      // and is covered where it can actually be reached —
+      // `attached-coordinator.test.ts` (route, via `fake`) and the protocol's
+      // own registry invariants.
       const seated = await app.inject({
         method: "POST",
         url: "/api/dispatch",
@@ -3082,11 +3355,24 @@ describe("dispatch + runner API", () => {
           workspacePath: TEST_WORKSPACE,
         },
       });
-      expect(seated.statusCode).toBe(400);
-      expect(seated.json().message).toMatch(
-        /Vendor 'opencode' cannot hold the crew role 'orchestrator'/i
+      // Assert the SUCCESS, not merely "not a 400": a route that crashed on a
+      // seated OpenCode chat root would satisfy the weaker form and read as
+      // proof of the very thing it broke.
+      expect(seated.statusCode).toBe(201);
+      // The ENQUEUED ROW, not the response body: the response echoes the
+      // prisma mock's canned job (vendor `claude-code`), so asserting it would
+      // assert the fixture. What the route decided is in the create payload.
+      expect(prismaMock.dispatchJob.create).toHaveBeenCalled();
+      const enqueued = prismaMock.dispatchJob.create.mock.calls.at(-1)?.[0]
+        ?.data as Record<string, unknown>;
+      expect(enqueued).toMatchObject({
+        vendor: "opencode",
+        capabilityMode: "orchestrator",
+        role: "orchestrator",
+      });
+      expect(JSON.stringify(seated.json())).not.toMatch(
+        /cannot hold the crew role 'orchestrator'/i
       );
-      expect(prismaMock.dispatchJob.create).not.toHaveBeenCalled();
       await app.close();
     });
 

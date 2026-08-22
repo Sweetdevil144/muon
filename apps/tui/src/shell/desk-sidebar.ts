@@ -43,6 +43,13 @@ export type DeskSidebarState = {
 
 export const DESK_SIDEBAR_WIDTH = 26;
 
+/** Fit `text` into `budget` columns, marking the cut rather than hiding it. */
+function clampTo(text: string, budget: number): string {
+  if (budget <= 0) return "";
+  if (text.length <= budget) return text;
+  return budget === 1 ? "…" : `${text.slice(0, budget - 1)}…`;
+}
+
 /**
  * What a click on a sidebar row means. Most rows are headings or detail lines
  * and mean nothing — a rail where clicking a branch name does something
@@ -109,21 +116,45 @@ export class DeskSidebar implements Component {
       );
     }
 
-    lines.push("", bold(" SESSIONS"));
+    // H8 (TUI half) — sessions read as belonging to a SPACE, not as a second
+    // flat list beside one. The heading names which space these sessions are
+    // in and how many there are, and the rows hang one column further in, so
+    // the rail answers "project → session" the same way the desktop rail does.
+    // Deliberately NOT a per-session space label: one extra word on every row
+    // in a 26-column rail buys nothing the heading has not already said.
+    const homeSpace =
+      this.state.spaces.find((space) => space.active) ?? this.state.spaces[0];
+    // The COUNT must survive a long project name, so the name is what gives
+    // way: the rail is 26 columns and the shell clips, it does not wrap.
+    const countSuffix = ` (${this.state.sessions.length})`;
+    const spaceName = homeSpace
+      ? clampTo(
+          terminalSafe(homeSpace.name),
+          DESK_SIDEBAR_WIDTH - " SESSIONS · ".length - countSuffix.length
+        )
+      : "";
+    lines.push(
+      "",
+      `${bold(" SESSIONS")}${spaceName ? dim(` · ${spaceName}`) : ""}${dim(
+        countSuffix
+      )}`
+    );
     if (this.state.sessions.length === 0) {
       push(dim("   none — ctrl+b t"), { kind: "new-session" });
     }
     for (const session of this.state.sessions) {
       const label = terminalSafe(session.label);
       push(
-        session.active ? ` ${cyan("›")} ${bold(label)}` : ` ${dim("○")} ${label}`,
+        session.active
+          ? `  ${cyan("›")} ${bold(label)}`
+          : `  ${dim("○")} ${label}`,
         { kind: "session", id: session.id }
       );
       const detail =
         session.paneCount > 1
           ? `${session.paneCount} panes · split`
           : terminalSafe(session.kind);
-      lines.push(dim(`   ${detail}`));
+      lines.push(dim(`    ${detail}`));
     }
 
     if (this.state.chat.length > 0) {

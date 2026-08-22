@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
+import { memoryPackRecordProvenanceSchema } from "@muon/protocol";
 import { redactForPack } from "@muon/client";
 import type { MemoryNoteInput } from "@muon/graph";
 import { isHumanPrincipal } from "./auth.js";
@@ -130,7 +131,7 @@ const packRecordSchema = z.object({
     label: z.string(),
   }),
   note: z.object({
-    kind: z.enum(["decision", "constraint", "convention", "attempt", "question"]),
+    kind: z.enum(["decision", "constraint", "convention", "attempt", "question", "ownership"]),
     text: z.string().min(1),
     textHash: sha256HexSchema,
     scope: z.string(),
@@ -140,6 +141,21 @@ const packRecordSchema = z.object({
     symbols: anchorArraySchema,
     validFrom: isoDateSchema,
     recordedAt: isoDateSchema,
+    // ADR-0091: optional — absent on every pre-0091 record and every
+    // non-ownership note.
+    owners: z.array(z.string().min(1).max(200)).max(20).optional(),
+  }).superRefine((note, ctx) => {
+    // The route's refusal rule, applied to the hostile-pack boundary too
+    // (review finding): accepting owners on another kind and silently
+    // dropping them would admit a record while losing part of its signed
+    // payload.
+    if (note.owners && note.owners.length > 0 && note.kind !== "ownership") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["owners"],
+        message: "owners is only lawful on kind 'ownership'",
+      });
+    }
   }),
   author: z.object({
     principal: z.string().min(1),
@@ -152,6 +168,12 @@ const packRecordSchema = z.object({
     textHash: sha256HexSchema,
   }),
   supersededTextHashes: z.array(sha256HexSchema).max(256),
+  // ADR-0064 A1 residual: provenance stamps ride the record as DATA, never
+  // authority. Parsed with THE one protocol schema (so the content address
+  // verifies — zod strips unknown keys before hashing) and then deliberately
+  // NOT materialised: a grounding is a check against the ORIGIN's repository
+  // and is re-run here; offer counts are the origin's disclosure.
+  provenance: memoryPackRecordProvenanceSchema.optional(),
 });
 
 /** How many records one import request may carry (pack-level cap). Shared with
@@ -544,6 +566,12 @@ export async function importMemoryPack(
           createdBy: `pack:${manifest.origin.fingerprint}`,
           workspacePath: receivingWorkspace,
           proposalOnly: true,
+          // ADR-0091: owners ride the import as data (the ledger stores
+          // them only on the ownership kind); principal strings from a
+          // foreign workspace are orientation text, never authority here.
+          ...(record.note.kind === "ownership" && record.note.owners
+            ? { owners: record.note.owners }
+            : {}),
         };
         // P0-2: NEVER auto-vouched. The orchestrator vouches for what THIS crew
         // learned; a pack is a foreign workspace's claims, and the invariant

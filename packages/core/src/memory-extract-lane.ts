@@ -16,9 +16,9 @@ import {
  * same dedup-aware, unconfirmed-until-reviewed path, so extraction quality is
  * governed by dedup + human review and can never bloat or corrupt the brain.
  *
- * The brief borrows four prompt techniques from mem0's `ADDITIVE_EXTRACTION_PROMPT`
- * (mem0ai/mem0, Apache-2.0, read @ main 2026-07-26; see
- * docs/research/mem0-capability-reference.md §7): integer-ID mapping, an
+ * The brief borrows four prompt techniques from productM1's `ADDITIVE_EXTRACTION_PROMPT`
+ * (productM1/repo, Apache-2.0, read @ main 2026-07-26; see
+ * docs/research/productM1-capability-reference.md §7): integer-ID mapping, an
  * observation date separate from the current date, "when in doubt, extract",
  * and an explicit do-NOT-extract list. Their consumer-personalization framing
  * ("user has a dog named Max") is deliberately NOT ported — MUON extracts
@@ -72,6 +72,10 @@ export const MEMORY_LANE_KINDS = [
   "convention",
   "attempt",
   "question",
+  // ADR-0091: the extraction lane may PROPOSE ownership like any kind —
+  // proposals are the lawful ingestion mode (0051); ambient assertion stays
+  // banned.
+  "ownership",
 ] as const;
 
 export type MemoryLaneKind = (typeof MEMORY_LANE_KINDS)[number];
@@ -275,8 +279,8 @@ export function buildMemoryExtractionBrief(
     "",
     "Reply with ONLY a JSON object (no prose, no markdown fences) of this shape:",
     toolGrounded
-      ? '{"notes": [{"kind": "decision" | "constraint" | "convention" | "attempt" | "question", "text": "<one self-contained sentence>", "topics": ["<lowercase-topic>"], "evidence": [<observed-call integer>], "relatedTo": [<existing-note integer>]}]}'
-      : '{"notes": [{"kind": "decision" | "constraint" | "convention" | "attempt" | "question", "text": "<one self-contained sentence>", "topics": ["<lowercase-topic>"], "relatedTo": [<integer>]}]}',
+      ? '{"notes": [{"kind": "decision" | "constraint" | "convention" | "attempt" | "question" | "ownership", "text": "<one self-contained sentence>", "topics": ["<lowercase-topic>"], "evidence": [<observed-call integer>], "relatedTo": [<existing-note integer>]}]}'
+      : '{"notes": [{"kind": "decision" | "constraint" | "convention" | "attempt" | "question" | "ownership", "text": "<one self-contained sentence>", "topics": ["<lowercase-topic>"], "relatedTo": [<integer>]}]}',
     "",
     "Meaning of kind:",
     "- decision: a choice that was made and why",
@@ -294,7 +298,7 @@ export function buildMemoryExtractionBrief(
     "",
     "Rules:",
     `- Return 0 to ${maxNotes} notes. Emit {"notes": []} only when the log truly establishes nothing reusable.`,
-    // §7.3 — mem0 biases to recall because dedup catches redundancy. It fits
+    // §7.3 — productM1 biases to recall because dedup catches redundancy. It fits
     // MUON harder: every note lands UNCONFIRMED behind a human confirm/reject
     // gate, so a redundant candidate costs one click and a missed one is gone.
     "- WHEN IN DOUBT, EXTRACT. A borderline note is cheap: a human reviews and rejects it. A fact you skip is lost for good.",

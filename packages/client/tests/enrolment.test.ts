@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  enrolledVendorIds,
   enrolmentFilePath,
   readEnrolment,
   writeEnrolment,
@@ -20,15 +21,60 @@ afterEach(() => {
 });
 
 describe("the enrolment record — what the human chose", () => {
-  it("round-trips a choice", () => {
+  it("round-trips a choice, with the mode ON EACH VENDOR", () => {
     const dir = tempDir();
-    writeEnrolment({ vendors: ["claude-code", "codex"] }, dir);
+    writeEnrolment(
+      {
+        vendors: [
+          { id: "claude-code" },
+          { id: "codex", mode: "observer" },
+        ],
+      },
+      dir
+    );
     const read = readEnrolment(dir);
     expect(read.ok).toBe(true);
     if (read.ok) {
-      expect(read.enrolment.vendors).toEqual(["claude-code", "codex"]);
-      expect(read.enrolment.mode, "durable by default — no lease").toBe("base");
+      // v2: per-vendor mode — the one shape that can tell the truth about a
+      // machine whose vendors were installed differently.
+      expect(read.enrolment.vendors).toEqual([
+        { id: "claude-code", mode: "base" },
+        { id: "codex", mode: "observer" },
+      ]);
+      expect(enrolledVendorIds(read.enrolment)).toEqual([
+        "claude-code",
+        "codex",
+      ]);
     }
+  });
+
+  it("a v1 record READS as v2 — each vendor inherits the machine-wide mode", () => {
+    const dir = tempDir();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      enrolmentFilePath(dir),
+      JSON.stringify({
+        version: 1,
+        vendors: ["claude-code", "codex"],
+        mode: "observer",
+        updatedAt: "2026-08-01T00:00:00.000Z",
+      })
+    );
+    const read = readEnrolment(dir);
+    expect(read.ok).toBe(true);
+    if (read.ok) {
+      expect(read.enrolment.version).toBe(2);
+      expect(read.enrolment.vendors).toEqual([
+        { id: "claude-code", mode: "observer" },
+        { id: "codex", mode: "observer" },
+      ]);
+    }
+    // Reading upgraded IN MEMORY only; the file itself is untouched — a read
+    // must never mutate the record it reports on.
+    expect(
+      (JSON.parse(fs.readFileSync(enrolmentFilePath(dir), "utf8")) as { version: number })
+        .version
+    ).toBe(1);
   });
 
   it("NEVER SET UP and CHOSE NOTHING are different answers", () => {
@@ -55,15 +101,23 @@ describe("the enrolment record — what the human chose", () => {
   it("de-duplicates, so a vendor named twice is not installed twice", () => {
     const dir = tempDir();
     const written = writeEnrolment(
-      { vendors: ["codex", "codex", " codex "] },
+      {
+        vendors: [
+          { id: "codex" },
+          { id: "codex" },
+          // …and a re-record of the same vendor in a new mode is an UPDATE,
+          // last one wins — not a second row.
+          { id: " codex ", mode: "observer" },
+        ],
+      },
       dir
     );
-    expect(written.vendors).toEqual(["codex"]);
+    expect(written.vendors).toEqual([{ id: "codex", mode: "observer" }]);
   });
 
   it("is owner-only on disk", () => {
     const dir = tempDir();
-    writeEnrolment({ vendors: ["codex"] }, dir);
+    writeEnrolment({ vendors: [{ id: "codex" }] }, dir);
     expect(fs.statSync(enrolmentFilePath(dir)).mode & 0o777).toBe(0o600);
   });
 });

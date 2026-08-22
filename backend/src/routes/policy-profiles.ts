@@ -4,6 +4,7 @@ import { z } from "zod";
 import { policyProfileSchema } from "@muon/protocol";
 import { requireOperator } from "../lib/auth.js";
 import { prisma } from "../lib/db.js";
+import { resolveEffectivePolicyProfile } from "../lib/policy-profile.js";
 import { validateWorkspacePath } from "../lib/workspace.js";
 
 // ── P0.4 slice 2: workspace policy profile residence ─────────────────────────
@@ -49,27 +50,17 @@ export async function registerPolicyProfileRoutes(app: FastifyInstance) {
     const query = scopeQuerySchema.parse(request.query);
     const workspacePath = canonicalWorkspacePath(app, query.workspacePath);
 
-    const taskRecord = query.taskId
-      ? await prisma.workspacePolicyProfile.findUnique({
-          where: {
-            workspacePath_taskScope: {
-              workspacePath,
-              taskScope: query.taskId,
-            },
-          },
-        })
-      : null;
-    const record =
-      taskRecord ??
-      (await prisma.workspacePolicyProfile.findUnique({
-        where: {
-          workspacePath_taskScope: { workspacePath, taskScope: "" },
-        },
-      }));
+    // ADR-0056: the precedence walk moved to `lib/policy-profile.ts` so the
+    // durable-grant guard fingerprints the SAME effective posture this reader
+    // reports. Two copies of the rule is how a grant outlives a policy change.
+    const record = await resolveEffectivePolicyProfile({
+      workspacePath,
+      taskId: query.taskId,
+    });
 
     return {
       profile: record?.profile ?? null,
-      scope: record ? (record.taskScope ? "task" : "workspace") : null,
+      scope: record?.scope ?? null,
       version: record?.version ?? 0,
     };
   });

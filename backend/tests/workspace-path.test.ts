@@ -7,7 +7,7 @@ import { validateWorkspacePath, workspaceRoots } from "../src/lib/workspace.js";
 
 const prismaMock = vi.hoisted(() => ({
   dispatchJob: { create: vi.fn() },
-  task: { create: vi.fn() },
+  task: { create: vi.fn(), findUnique: vi.fn(async () => null) },
 }));
 
 vi.mock("../src/lib/db.js", () => ({ prisma: prismaMock }));

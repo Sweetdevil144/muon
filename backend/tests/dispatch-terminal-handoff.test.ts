@@ -361,3 +361,198 @@ describe("a terminal child files the handoff its coordinator reads", () => {
     expect(res.json().job.status).toBe("done");
   });
 });
+
+// ADR-0062 — the receipt audit at the terminal transition. What these pin:
+// the server stamps `no_brain_receipt` on a packet that never answered
+// (version-independently — this packet was built by the OLD builder path),
+// a mismatch is recorded as an observation beside the verbatim answer, an
+// agreeing receipt leaves the packet untouched, and the job row and the
+// handoff row carry the SAME audited packet.
+describe("ADR-0062: the brain-receipt audit", () => {
+  it("stamps no_brain_receipt on a receipt-less packet, on BOTH durable copies", async () => {
+    await createChildJob("job-receipt-missing");
+    const res = await commitTerminal("job-receipt-missing", {
+      exitCode: 0,
+      packet: packetFor(CANONICAL_FINAL_REPORT),
+    });
+    expect(res.statusCode).toBe(200);
+    const stored = (await prisma.dispatchJob.findUnique({
+      where: { id: "job-receipt-missing" },
+    }))!.packetJson as { degraded: { flag: boolean; reasons: string[] } };
+    expect(stored.degraded.flag).toBe(true);
+    expect(stored.degraded.reasons).toContain(
+      HANDOFF_DEGRADATION.noBrainReceipt
+    );
+    const handoffs = await readHandoffs();
+    const filed = handoffs.find((row) =>
+      (
+        row.packetJson as { degraded?: { reasons?: string[] } } | null
+      )?.degraded?.reasons?.includes(HANDOFF_DEGRADATION.noBrainReceipt)
+    );
+    expect(filed).toBeDefined();
+  });
+
+  it("records a mismatch beside the verbatim answer; an agreeing receipt stays clean", async () => {
+    // no_update_required, but the packet itself carries a proposal → mismatch.
+    await createChildJob("job-receipt-mismatch");
+    const contradicted = {
+      ...packetFor(CANONICAL_FINAL_REPORT),
+      brainReceipt: "no_update_required" as const,
+    };
+    expect(contradicted.memoryProposals.length).toBeGreaterThan(0);
+    const res = await commitTerminal("job-receipt-mismatch", {
+      exitCode: 0,
+      packet: contradicted,
+    });
+    expect(res.statusCode).toBe(200);
+    const stored = (await prisma.dispatchJob.findUnique({
+      where: { id: "job-receipt-mismatch" },
+    }))!.packetJson as {
+      brainReceipt?: string;
+      degraded: { reasons: string[] };
+    };
+    expect(stored.brainReceipt).toBe("no_update_required");
+    expect(
+      stored.degraded.reasons.some((reason) =>
+        reason.startsWith(`${HANDOFF_DEGRADATION.brainReceiptMismatch}:`)
+      )
+    ).toBe(true);
+
+    // context_updated with proposals present agrees → untouched.
+    await createChildJob("job-receipt-agrees");
+    const agreeing = {
+      ...packetFor(CANONICAL_FINAL_REPORT),
+      brainReceipt: "context_updated" as const,
+    };
+    const agreeRes = await commitTerminal("job-receipt-agrees", {
+      exitCode: 0,
+      packet: agreeing,
+    });
+    expect(agreeRes.statusCode).toBe(200);
+    const agreedStored = (await prisma.dispatchJob.findUnique({
+      where: { id: "job-receipt-agrees" },
+    }))!.packetJson as { degraded: { reasons: string[] } };
+    expect(
+      agreedStored.degraded.reasons.some(
+        (reason) =>
+          reason === HANDOFF_DEGRADATION.noBrainReceipt ||
+          reason.startsWith(HANDOFF_DEGRADATION.brainReceiptMismatch)
+      )
+    ).toBe(false);
+  });
+});
+
+// ── ADR-0080: the DELIVER ledger — a packet's serve is recorded ─────────────
+describe("ADR-0080: packet delivery records at the serve", () => {
+  const READER_JOB = "job-reader-0080";
+  const READER_TOKEN = `reader-0080-${"c".repeat(50)}`;
+
+  it("a capability-bearing read records per-job delivery rows; operator and shared-token reads record nothing; re-reads stay one row", async () => {
+    // A child files a packet the ordinary way.
+    const childId = await createChildJob("job-deliver-child");
+    const commit = await commitTerminal(childId, {
+      result: [
+        "GOAL",
+        "done",
+        "CHANGED",
+        "- a.ts",
+        "CHECKS",
+        "- none",
+        "NEXT",
+        "- nothing",
+      ].join("\n"),
+    });
+    expect(commit.statusCode).toBe(200);
+    const handoffs = await readHandoffs(); // OPERATOR read
+    expect(handoffs.length).toBeGreaterThan(0);
+    // The operator read above recorded NOTHING.
+    expect(await prisma.handoffOffer.count()).toBe(0);
+
+    // The shared runner token (no exact-job capability): legal, unrecorded.
+    const sharedRead = await app.inject({
+      method: "GET",
+      url: `/api/tasks/${TASK_ID}`,
+      headers: auth(AGENT),
+    });
+    expect(sharedRead.statusCode).toBe(200);
+    expect(await prisma.handoffOffer.count()).toBe(0);
+
+    // A reviewer job with an EXACT capability reads the same route — the
+    // way handoff_read does — and the delivery records under ITS job.
+    await prisma.dispatchJob.create({
+      data: {
+        id: READER_JOB,
+        kind: "oneshot",
+        vendor: "claude-code",
+        taskId: TASK_ID,
+        chatId: CHAT_ID,
+        parentJobId: ROOT_JOB_ID,
+        rootJobId: ROOT_JOB_ID,
+        brief: "review the child's packet",
+        status: "running",
+        dispatchedBy: "agent:job:job-root-terminal-handoff",
+      },
+    });
+    await prisma.delegationGrant.create({
+      data: {
+        jobId: READER_JOB,
+        tokenHash: createHash("sha256").update(READER_TOKEN).digest("hex"),
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      },
+    });
+    const read = await app.inject({
+      method: "GET",
+      url: `/api/tasks/${TASK_ID}`,
+      headers: auth(READER_TOKEN),
+    });
+    expect(read.statusCode).toBe(200);
+    const rows = await prisma.handoffOffer.findMany();
+    expect(rows.length).toBe(handoffs.length);
+    for (const row of rows) {
+      expect(row).toMatchObject({
+        jobId: READER_JOB,
+        partition: CHAT_ID,
+        surface: "handoff-read",
+      });
+    }
+    // Set semantics: a re-read updates nothing.
+    const again = await app.inject({
+      method: "GET",
+      url: `/api/tasks/${TASK_ID}`,
+      headers: auth(READER_TOKEN),
+    });
+    expect(again.statusCode).toBe(200);
+    expect(await prisma.handoffOffer.count()).toBe(rows.length);
+    // And the row granted nothing: the packets returned identically for
+    // every caller tier (delivery is provenance, never authority).
+    expect(read.json().task.handoffs.length).toBe(handoffs.length);
+
+    // ADR-0080 D3 — the RENDERING half, landed with the 0087 pane: an
+    // OPERATOR re-read now derives each packet's deliveries from the rows
+    // the reviewer's read just wrote…
+    const operatorView = await app.inject({
+      method: "GET",
+      url: `/api/tasks/${TASK_ID}`,
+      headers: auth(OPERATOR),
+    });
+    expect(operatorView.statusCode).toBe(200);
+    const rendered = operatorView.json().task.handoffs as {
+      deliveries?: { jobId: string }[];
+    }[];
+    for (const packet of rendered) {
+      expect(packet.deliveries?.map((d) => d.jobId)).toEqual([READER_JOB]);
+    }
+    // …and the AGENT-capability read does NOT receive the ledger (its own
+    // reads are what writes it).
+    const agentView = await app.inject({
+      method: "GET",
+      url: `/api/tasks/${TASK_ID}`,
+      headers: auth(READER_TOKEN),
+    });
+    for (const packet of agentView.json().task.handoffs as {
+      deliveries?: unknown;
+    }[]) {
+      expect(packet.deliveries).toBeUndefined();
+    }
+  });
+});

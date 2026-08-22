@@ -58,9 +58,24 @@ export function confirmPrompt(): string {
   return "Uninstall the MUON CLI and TUI? [y/N] ";
 }
 
-/** What to print after a successful removal — including what was NOT touched. */
-export function describePlan(plan: UninstallPlan): string {
-  const lines = [`Removed: ${plan.remove.join(", ")}`];
+/**
+ * What to print after a removal — including what was NOT touched.
+ *
+ * `removed` is what npm ACTUALLY removed, not what was planned. The plan lists
+ * every package MUON might own, and the two diverge routinely: a machine that
+ * only ever installed `muon-cli` has no `@muon/cli` to remove, and printing the
+ * plan there reported deleting something that was never there. An uninstaller
+ * that overstates what it deleted is the last thing anyone can check.
+ */
+export function describePlan(
+  plan: UninstallPlan,
+  removed: readonly string[] = plan.remove
+): string {
+  const lines = [
+    removed.length > 0
+      ? `Removed: ${removed.join(", ")}`
+      : "Removed: nothing (no MUON package was installed through npm)",
+  ];
   for (const kept of plan.preserve) {
     lines.push(`Kept:    ${kept.path}`);
     lines.push(`         ${kept.why}.`);

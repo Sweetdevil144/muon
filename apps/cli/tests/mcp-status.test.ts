@@ -13,6 +13,7 @@ import {
 } from "@muon/client/mcp-status";
 import type { McpVendorIo } from "@muon/client/mcp-vendor-config";
 import { writeAttachedCoordinatorCapabilityFile } from "@muon/client/attached-coordinator-capability";
+import { vendorHoldsCoordinatorSeat } from "@muon/client/mcp-vendor-config";
 
 /**
  * `muon mcp status` — the §3.2 OUTPUT CONTRACT of
@@ -169,9 +170,16 @@ describe("§3.2 output contract", () => {
     for (const row of rep.vendors) {
       expect(row.installable).toBe(true);
     }
+    // ADR-0057: every installable vendor now holds the seat. The two booleans
+    // are still SEPARATE — proven by reading each row's seat straight from the
+    // registry rather than from `installable`, so a row that started echoing
+    // installability would fail here even while both lists look identical.
     expect(
       rep.vendors.filter((row) => row.coordinatorSeat).map((row) => row.vendor)
-    ).toEqual(["claude-code", "codex"]);
+    ).toEqual(["claude-code", "codex", "cursor", "opencode"]);
+    for (const row of rep.vendors) {
+      expect(row.coordinatorSeat).toBe(vendorHoldsCoordinatorSeat(row.vendor));
+    }
   });
 
   it("is honest about Tier C when nothing is attached (ADR-0028)", () => {
@@ -191,7 +199,10 @@ describe("§3.2 output contract", () => {
     });
     expect(rep.wouldGetTierC).toBe(true);
     expect(rep.mode).toBe("attached-coordinator");
-    expect(rep.toolCount).toBe(44); // +2: ADR-0043, +1: publish_finding
+    // 46 = 44 + H5's review_queue (base context tier) + A14's
+    // propose_amendment (Tier C's eighth control verb).
+    // 49 = 46 + ADR-0053's three docs-graph READS (base context tier).
+    expect(rep.toolCount).toBe(51); // +1: ADR-0069 question_withdraw
     expect(check(rep, "mcp-mode-env").level).toBe("ok");
     expect(check(rep, "tier-c-attachment").level).toBe("warn");
     expect(check(rep, "tier-c-attachment").detail).toMatch(/non-hermetic/i);
@@ -301,30 +312,30 @@ describe("brain + token resolution branches (§3.2 rows 1-4)", () => {
 });
 
 describe("MUON_MCP_MODE and the tool count (§3.2 row 5)", () => {
-  it("unset ⇒ 30 tools and no authority-bearing mode", () => {
+  it("unset ⇒ 36 tools and no authority-bearing mode", () => {
     const rep = report({ MUON_DATA_DIR: tempDir("muon-empty-") });
     expect(rep.mode).toBeNull();
-    expect(rep.toolCount).toBe(30); // +2: ADR-0043, +1: publish_finding
+    expect(rep.toolCount).toBe(36); // +1: ADR-0069 question_withdraw (was 35)
     expect(check(rep, "mcp-mode-env").level).toBe("ok");
   });
 
-  it("orchestrator ⇒ 47 tools AND a warning that the server will refuse to start", () => {
+  it("orchestrator ⇒ 52 tools AND a warning that the server will refuse to start", () => {
     const rep = report({
       MUON_DATA_DIR: tempDir("muon-empty-"),
       MUON_MCP_MODE: "orchestrator",
     });
-    expect(rep.toolCount).toBe(47); // +2: ADR-0043, +1: publish_finding
+    expect(rep.toolCount).toBe(54); // +1: ADR-0069 question_withdraw (was 53)
     expect(check(rep, "mcp-mode-env").level).toBe("warn");
     expect(check(rep, "mcp-mode-env").detail).toContain("REFUSE TO START");
     expect(check(rep, "mcp-mode-env").detail).toContain("MUON_JOB_ID lineage");
   });
 
-  it("observer ⇒ 37 tools, agent tier and no lineage warning", () => {
+  it("observer ⇒ 43 tools, agent tier and no lineage warning", () => {
     const rep = report({
       MUON_DATA_DIR: writeLockfile({ agentToken: "o".repeat(64) }),
       MUON_MCP_MODE: "observer",
     });
-    expect(rep.toolCount).toBe(37); // +2: ADR-0043
+    expect(rep.toolCount).toBe(43); // +1: ADR-0069 question_withdraw (was 42)
     expect(rep.tier).toBe("agent");
     expect(check(rep, "mcp-mode-env").level).toBe("ok");
     expect(check(rep, "mcp-mode-env").detail).toContain("bounded read-only");

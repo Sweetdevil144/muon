@@ -471,8 +471,9 @@ describe("desktop cockpit", () => {
     expect(onReviewApproval).not.toHaveBeenCalled();
   });
 
-  // The founder's whole ask, pinned: Approve · Approve don't ask again · Reject.
-  it("renders EXACTLY three actions on a pending gate, and each makes its own governed call", async () => {
+  // The founder's whole ask, pinned: Approve · don't ask again · always in
+  // this chat · Reject — three approves graded by how long they last, one deny.
+  it("renders EXACTLY four actions on a pending gate, and each makes its own governed call", async () => {
     const onResolveApproval = vi.fn();
     const view = render(
       React.createElement(ControlRail, railProps(editApproval, {
@@ -489,6 +490,7 @@ describe("desktop cockpit", () => {
     expect(actions.map((button) => button.textContent)).toEqual([
       "Approve",
       "Approve, don’t ask again",
+      "Approve, always in this chat",
       "Reject",
     ]);
 
@@ -510,15 +512,29 @@ describe("desktop cockpit", () => {
       expect(onResolveApproval).toHaveBeenLastCalledWith(
         "approval-edit",
         "approved",
-        900_000
+        { grade: "session", receiptTtlMs: 900_000 }
+      )
+    );
+
+    // ADR-0056 `always`: the same governed resolve, carrying a GRADE. Nothing
+    // about the 7-day expiry crosses the wire — the server computes it.
+    await vi.waitFor(() =>
+      expect(actions[2]!.hasAttribute("disabled")).toBe(false)
+    );
+    fireEvent.click(actions[2]!);
+    await vi.waitFor(() =>
+      expect(onResolveApproval).toHaveBeenLastCalledWith(
+        "approval-edit",
+        "approved",
+        { grade: "always", grantDuration: "always" }
       )
     );
 
     // Reject: one click, never behind a confirm step, never disabled.
     await vi.waitFor(() =>
-      expect(actions[2]!.hasAttribute("disabled")).toBe(false)
+      expect(actions[3]!.hasAttribute("disabled")).toBe(false)
     );
-    fireEvent.click(actions[2]!);
+    fireEvent.click(actions[3]!);
     await vi.waitFor(() =>
       expect(onResolveApproval).toHaveBeenLastCalledWith(
         "approval-edit",
@@ -806,32 +822,89 @@ describe("desktop cockpit", () => {
     expect(remember.getAttribute("title")).toMatch(
       /this exact action, in this run, for the next 15 minutes/i
     );
-    // No duration picker, no toggle: the operator chooses remember or not.
+    // No duration picker, no toggle: the operator chooses a GRADE or nothing.
     expect(screen.queryByRole("combobox", { name: /receipt duration/i })).toBeNull();
     expect(
       screen.queryByRole("checkbox", { name: /also remember this exact action/i })
     ).toBeNull();
-    // Exactly three, in the dialog too.
+    // Exactly four, in the dialog too.
     expect(
       within(dialog)
         .getAllByRole("button")
         .filter((button) => button.hasAttribute("data-approval-action"))
-    ).toHaveLength(3);
+    ).toHaveLength(4);
+
+    // ADR-0056: the chat-scoped grade is offered beside it, and says what it
+    // buys — this chat, 7 days, revocable. Never "always everywhere".
+    const always = dialog.querySelector<HTMLButtonElement>(
+      '[data-approval-action="approve-always"]'
+    )!;
+    expect(always.hasAttribute("disabled")).toBe(false);
+    expect(always.getAttribute("title")).toMatch(
+      /this exact action, in this chat only, for the next 7 days/i
+    );
+    expect(
+      within(dialog).getByText(
+        /auto-approves this exact action, in this chat only, for the next 7 days\. revoke it any time\./i
+      )
+    ).toBeTruthy();
 
     view.unmount();
-    // A network action can never be remembered — the button stays in place (the
-    // row never changes shape) but is disabled and explains itself.
+    // A network action can never be remembered — the buttons stay in place (the
+    // row never changes shape) but are disabled and explain themselves.
     render(React.createElement(ControlRail, railProps(networkApproval)));
     const netDialog = screen.getByRole("dialog", { name: /approval review/i });
     const netRemember = netDialog.querySelector<HTMLButtonElement>(
       '[data-approval-action="approve-remember"]'
     )!;
+    const netAlways = netDialog.querySelector<HTMLButtonElement>(
+      '[data-approval-action="approve-always"]'
+    )!;
     expect(netRemember.hasAttribute("disabled")).toBe(true);
+    expect(netAlways.hasAttribute("disabled")).toBe(true);
     expect(
       within(netDialog).getByText(
         /this one always asks — only file reads, edits inside the task radius, and configured checks can be remembered\./i
       )
     ).toBeTruthy();
+    expect(
+      within(netDialog).getByText(
+        /no chat-wide grant here — merges, releases, capability changes and anything muon cannot classify are decided by a human every time\./i
+      )
+    ).toBeTruthy();
+  });
+
+  // THE 400 THIS BUTTON MUST NEVER EARN: a merge carrying a durable grade is
+  // refused by the backend BEFORE the decision, leaving the approval pending.
+  // The dialog is the one place a merge renders the action row, so it is the
+  // one place the "always" affordance could have been offered by mistake.
+  it("never offers 'always' on a merge — disabled, explained, and Approve still live", () => {
+    const mergeApproval = {
+      ...editApproval,
+      id: "approval-merge-gate",
+      kind: "merge",
+      reason: "land the worktree",
+      evidence: undefined,
+    } as unknown as ApprovalRequest;
+    render(React.createElement(ControlRail, railProps(mergeApproval)));
+    const dialog = screen.getByRole("dialog", { name: /approval review/i });
+    const always = dialog.querySelector<HTMLButtonElement>(
+      '[data-approval-action="approve-always"]'
+    )!;
+    expect(always.hasAttribute("disabled")).toBe(true);
+    expect(always.getAttribute("title")).toMatch(
+      /no chat-wide grant here — merges, releases, capability changes/i
+    );
+    // Denying stays one click, exactly as before — a grade the operator cannot
+    // choose must never cost them the decision they can.
+    expect(
+      dialog
+        .querySelector<HTMLButtonElement>('[data-approval-action="reject"]')!
+        .hasAttribute("disabled")
+    ).toBe(false);
+    // (That `always` is refused by the KIND and not merely by the merge
+    // dialog's certification block is pinned in review-gate-actions.test.tsx,
+    // where the same merge renders with Approve fully live.)
   });
 
   it("plain Approve sends no receipt TTL", async () => {
@@ -859,7 +932,7 @@ describe("desktop cockpit", () => {
       expect(onResolveApproval).toHaveBeenCalledWith(
         "approval-edit",
         "approved",
-        900_000
+        { grade: "session", receiptTtlMs: 900_000 }
       )
     );
   });
@@ -901,7 +974,7 @@ describe("desktop cockpit", () => {
       expect(onResolveApproval).toHaveBeenLastCalledWith(
         "approval-edit",
         "approved",
-        900_000
+        { grade: "session", receiptTtlMs: 900_000 }
       )
     );
     await vi.waitFor(() =>

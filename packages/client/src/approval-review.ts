@@ -1,11 +1,21 @@
 import {
+  APPROVAL_GRANT_DURATION_TTL_MS,
   RECEIPT_ALLOWED_CLASSES,
   classifyToolAction,
+  isGrantableApprovalKind,
   parseGateTag,
   vendorLabel,
 } from "@muon/protocol";
 import { terminalSafe } from "./terminal-safe.js";
 import type { ApprovalRequest } from "./types.js";
+
+/**
+ * Re-exported so a SURFACE never has to reach into `@muon/protocol` for the
+ * grade vocabulary. The desktop's standing decision (apps/desktop/src/shared/
+ * ipc.ts) is that the app depends on `@muon/client` only; this subpath is how
+ * the ADR-0056 grades cross that line.
+ */
+export type { ApprovalGrantDuration } from "@muon/protocol";
 
 /**
  * The ONE standing-consent lifetime every MUON surface offers behind "don't
@@ -38,6 +48,52 @@ export const REMEMBER_ACTION_SCOPE_SENTENCE =
 export const REMEMBER_ACTION_INELIGIBLE_SENTENCE =
   "This one always asks — only file reads, edits inside the task radius, and configured checks can be remembered.";
 
+// ── ADR-0056: the `always` grade ─────────────────────────────────────────────
+//
+// The third grade of the SAME opt-in the receipt already implements. A surface
+// sends a GRADE, never a number: the 7-day expiry is computed server-side from
+// `APPROVAL_GRANT_DURATION_TTL_MS`, so nothing crossing the wire from a click
+// carries an authority-bearing quantity. `session` (the receipt) and `always`
+// (the grant) are mutually exclusive on one decision, which is why every
+// surface below models the choice as ONE value, never two optional ones.
+
+/**
+ * The grade the "always" affordance sends. Named rather than inlined so a
+ * surface cannot invent a fourth spelling of it.
+ */
+export const ALWAYS_ACTION_GRANT_DURATION = "always" as const;
+
+/** Days the `always` grade buys, READ OFF the protocol's own TTL table so the
+ *  sentence below can never drift from what the server actually mints. */
+const ALWAYS_ACTION_DAYS = Math.round(
+  APPROVAL_GRANT_DURATION_TTL_MS.always / (24 * 60 * 60 * 1_000)
+);
+
+/**
+ * What "always in this chat" ACTUALLY buys, in one sentence, on screen. Every
+ * clause matches ADR-0056 D2/D3/D5:
+ *  - "this exact action" — tool + payload digest + operator-visible target
+ *  - "in this chat"      — the taskId, NOT the workspace and NOT the agent
+ *  - "for the next 7 days" — a server-computed absolute expiry
+ *  - "revoke it any time"  — one-way operator revocation, effective next call
+ * It deliberately never says "always" unqualified: the whole point of the grade
+ * is that it is a sentence about an action, not a blanket auto-approve.
+ */
+export const ALWAYS_ACTION_SCOPE_SENTENCE = `Auto-approves this exact action, in this chat only, for the next ${ALWAYS_ACTION_DAYS} days. Revoke it any time.`;
+
+/**
+ * The honest reason the `always` affordance is unavailable, true for BOTH ways
+ * it can be blocked: the approval kind is not on `GRANTABLE_APPROVAL_KINDS`
+ * (merge, deploy, dangerous_action, gate — authority-shaped, nothing to bind),
+ * or the action's class is not one a receipt could cover either.
+ *
+ * Worded so it does NOT restate `REMEMBER_ACTION_INELIGIBLE_SENTENCE`: on a
+ * merge both sentences are on screen at once, and saying the same thing twice
+ * is how a decision surface gets crowded.
+ */
+export const ALWAYS_ACTION_INELIGIBLE_SENTENCE =
+  "No chat-wide grant here — merges, releases, capability changes and anything MUON cannot classify are decided by a human every time.";
+
 export type ApprovalReview = {
   action: string;
   scope: string;
@@ -62,6 +118,23 @@ export type ApprovalReview = {
    * classes.
    */
   receiptEligible: boolean;
+  /**
+   * ADR-0056: whether the "Approve, always in this chat" (durable grant)
+   * affordance may be OFFERED.
+   *
+   * Derived from the PROTOCOL'S OWN POSITIVE SET (`isGrantableApprovalKind`),
+   * never from a per-surface list and never as "everything except merge" — a
+   * kind added tomorrow is ineligible by default because it is not on the
+   * list. The receipt clause rides on top unchanged, so `always` can never
+   * cover something `session` could not (the server derives both eligibilities
+   * through the one `deriveReceiptBinding`).
+   *
+   * This matters more than the receipt's flag does: a merge carrying a durable
+   * grade is a hard 400 that leaves the approval PENDING, so offering the
+   * button there would teach the operator the app is broken. Surfaces disable
+   * it and say why (`ALWAYS_ACTION_INELIGIBLE_SENTENCE`) rather than hiding it.
+   */
+  grantEligible: boolean;
 };
 
 /** Client-side gate for SHOWING the receipt affordance; the server mint rules. */
@@ -117,6 +190,7 @@ export function buildApprovalReview(
 ): ApprovalReview {
   if (!approval.gateTag) {
     if (approval.kind === "command" && approval.evidence) {
+      const receiptEligible = isReceiptEligible(approval.evidence);
       return {
         action: terminalSafe(approval.evidence.action),
         scope: terminalSafe(approval.evidence.scope),
@@ -135,7 +209,14 @@ export function buildApprovalReview(
         approvable: true,
         degraded: false,
         degradationReason: null,
-        receiptEligible: isReceiptEligible(approval.evidence),
+        receiptEligible,
+        // ADR-0056 D6, stated positively: the kind must be ON the protocol's
+        // allow-list AND the action must be one a receipt could already cover.
+        // `isGrantableApprovalKind` is asked even here, where the branch has
+        // already proved `kind === "command"`, on purpose — the day that list
+        // changes, this line changes with it instead of silently disagreeing.
+        grantEligible:
+          receiptEligible && isGrantableApprovalKind(approval.kind),
       };
     }
 
@@ -157,6 +238,9 @@ export function buildApprovalReview(
         ? "This command request has no structured evidence. Reject it and let the agent file a fresh request."
         : null,
       receiptEligible: false,
+      // ADR-0056 D6: not a `command` kind (or no bindable content), so there is
+      // nothing a durable grant could be a sentence ABOUT.
+      grantEligible: false,
     };
   }
 
@@ -174,6 +258,9 @@ export function buildApprovalReview(
       degradationReason:
         "The stored approval binding is malformed or unsupported. Reject it and file a fresh request.",
       receiptEligible: false,
+      // ADR-0056 D6: not a `command` kind (or no bindable content), so there is
+      // nothing a durable grant could be a sentence ABOUT.
+      grantEligible: false,
     };
   }
 
@@ -195,6 +282,9 @@ export function buildApprovalReview(
       degraded: false,
       degradationReason: null,
       receiptEligible: false,
+      // ADR-0056 D6: not a `command` kind (or no bindable content), so there is
+      // nothing a durable grant could be a sentence ABOUT.
+      grantEligible: false,
     };
   }
 
@@ -212,6 +302,9 @@ export function buildApprovalReview(
       degraded: false,
       degradationReason: null,
       receiptEligible: false,
+      // ADR-0056 D6: not a `command` kind (or no bindable content), so there is
+      // nothing a durable grant could be a sentence ABOUT.
+      grantEligible: false,
     };
   }
 
@@ -229,6 +322,9 @@ export function buildApprovalReview(
       degraded: false,
       degradationReason: null,
       receiptEligible: false,
+      // ADR-0056 D6: not a `command` kind (or no bindable content), so there is
+      // nothing a durable grant could be a sentence ABOUT.
+      grantEligible: false,
     };
   }
 
@@ -244,6 +340,9 @@ export function buildApprovalReview(
       degraded: false,
       degradationReason: null,
       receiptEligible: false,
+      // ADR-0056 D6: not a `command` kind (or no bindable content), so there is
+      // nothing a durable grant could be a sentence ABOUT.
+      grantEligible: false,
     };
   }
 
@@ -258,5 +357,8 @@ export function buildApprovalReview(
     degraded: false,
     degradationReason: null,
     receiptEligible: false,
+    // ADR-0056 D6: not a `command` kind (or no bindable content), so there is
+    // nothing a durable grant could be a sentence ABOUT.
+    grantEligible: false,
   };
 }

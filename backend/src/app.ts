@@ -7,7 +7,7 @@ import {
   agentJobRouteAllowed,
   bearerToken,
   classifyToken,
-  resolveActiveAgentJobCapability,
+  resolveAgentJobCapability,
   resolveAuthTokens,
 } from "./lib/auth.js";
 // `env.js` MUST be imported before anything that pulls in `@prisma/client`
@@ -23,6 +23,7 @@ import { registerAttachedCoordinatorRoutes } from "./lib/attached-coordinator.js
 import { MuonLogController, resolveLogLevel } from "./lib/request-log.js";
 import { registerA2ARoutes } from "./routes/a2a.js";
 import { registerQuestionRoutes } from "./routes/questions.js";
+import { registerReviewThreadRoutes } from "./routes/review-thread.js";
 import { registerApprovalRoutes } from "./routes/approvals.js";
 import { registerChatRoutes } from "./routes/chats.js";
 import { registerCompatibilityRoutes } from "./routes/compatibility.js";
@@ -38,6 +39,7 @@ import { registerEventRoutes } from "./routes/events.js";
 // captured and every authenticated request 401s. Placed among the other route
 // modules for exactly that reason — not alphabetised to the top.
 import { registerAttendanceRoutes } from "./routes/attendance.js";
+import { registerDigestRoutes } from "./routes/digest.js";
 import { registerFleetRoutes } from "./routes/fleet.js";
 import { registerGitHubRoutes } from "./routes/github.js";
 import { registerHarnessRoutes } from "./routes/harnesses.js";
@@ -47,6 +49,7 @@ import { registerLoopRoutes } from "./routes/loops.js";
 import { registerMemoryRoutes } from "./routes/memory.js";
 import { registerPolicyProfileRoutes } from "./routes/policy-profiles.js";
 import { registerReceiptRoutes } from "./routes/receipts.js";
+import { registerGrantRoutes } from "./routes/grants.js";
 import { registerMetricsRoutes } from "./routes/metrics.js";
 import { registerRoutingRoutes } from "./routes/routing.js";
 import { registerScheduleRoutes } from "./routes/schedules.js";
@@ -157,17 +160,48 @@ export function buildApp() {
         // `POST /api/attendance`, never inferred from ambient traffic.
         return;
       }
-      const jobCapability =
-        await resolveActiveAgentJobCapability(presented);
-      if (!jobCapability) {
+      // ONE resolution pass, with the reason attached. This used to call the
+      // resolver and then a second helper that re-implemented the same hash,
+      // grant lookup and horizon guard — two copies of a security check, and
+      // two extra queries on every failed auth.
+      const resolved = await resolveAgentJobCapability(presented);
+      if (!resolved.ok) {
+        // A RECOGNISED TOKEN WITH NO ACTIVE JOB IS A SCOPE REFUSAL, NOT A
+        // BAD CREDENTIAL. Both used to answer 401 "Missing or invalid API
+        // token", which sends an agent hunting a fault that does not exist:
+        // the token is fine, the session simply has no job, so memory and crew
+        // routes have no partition to answer in. Measured live — a Claude
+        // session the human started got 401 plus a "check muon doctor" hint,
+        // and doctor was entirely green.
+        //
+        // `remedyFor()` in @muon/mcp already matches "exact active job
+        // capability" and answers correctly ("a SCOPE refusal, not a fault …
+        // retrying will fail identically"). That machinery was unreachable
+        // because this branch never produced the phrase it looks for.
+        //
+        // 403 only when MUON ISSUED the token — an unrecognised one stays 401,
+        // because a genuinely bad credential must not read as a scope problem.
+        // Only the 403 names the capability. Putting that phrase on the 401
+        // too would make `remedyFor()` answer "this is a SCOPE refusal, not a
+        // fault" for a genuinely wrong token — advice that is false there, and
+        // that tells someone to stop retrying a credential they could fix.
+        if (resolved.refusal === "inactive") {
+          reply.code(403).send({
+            error: "forbidden",
+            message:
+              "This route requires the exact active job capability. The token was issued by MUON but its job is no longer active, so memory and crew routes have no partition to answer in. Start governed work with `muon chat`, or use an operator surface (CLI/TUI/desktop).",
+          });
+          return;
+        }
         reply.code(401).send({
           error: "unauthorized",
           message: "Missing or invalid API token.",
         });
         return;
       }
+
       request.tier = "agent";
-      request.agentJobCapability = jobCapability;
+      request.agentJobCapability = resolved.capability;
     });
     app.addHook("preHandler", async (request) => {
       if (
@@ -208,9 +242,12 @@ export function buildApp() {
   app.register(registerApprovalRoutes, { prefix: "/api/approvals" });
   app.register(registerPolicyProfileRoutes, { prefix: "/api/policy" });
   app.register(registerReceiptRoutes, { prefix: "/api/receipts" });
+  // ADR-0056 — the `always` grade: chat-scoped, policy-fingerprinted, revocable.
+  app.register(registerGrantRoutes, { prefix: "/api/grants" });
   app.register(registerEventRoutes, { prefix: "/api/events" });
   // ADR-0040 D3a — a surface asserts human presence here; the horizon reads it.
   app.register(registerAttendanceRoutes, { prefix: "/api/attendance" });
+  app.register(registerDigestRoutes, { prefix: "/api/digest" });
   app.register(registerMetricsRoutes, { prefix: "/api/metrics" });
   app.register(registerGitHubRoutes, { prefix: "/api/github" });
   app.register(registerMemoryRoutes, { prefix: "/api/memory" });
@@ -235,6 +272,7 @@ export function buildApp() {
   app.register(registerA2ARoutes, { prefix: "/api/a2a" });
   // ADR-0043 blocking questions (event-spine; agent asks, operator answers).
   app.register(registerQuestionRoutes, { prefix: "/api/questions" });
+  app.register(registerReviewThreadRoutes, { prefix: "/api/review-thread" });
   // ADR-0038 D1 slice 1: DISCOVER only — a read of the vendor configs the user
   // already has. There is no enable route here and adding one needs that ADR's
   // two open questions answered first.

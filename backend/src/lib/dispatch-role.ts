@@ -1,4 +1,5 @@
 import {
+  isDispatchableRole,
   ROLE_SPECS,
   agentRoleSchema,
   harnessConfigSchema,
@@ -138,9 +139,22 @@ export { vendorRoleCeiling };
  * plan`, which never edits the workspace. It is dispatchable for review-class
  * work and refused for everything else — the boundary that used to be a blanket
  * "cursor is not dispatch-ready" now lives on the ROLE, where it is checkable.
+ *
+ * The role list is READ FROM THE REGISTRY rather than restated. It was a
+ * literal until ADR-0057 added `orchestrator` to the ceiling and left this
+ * sentence describing a ceiling that no longer existed — every other refusal
+ * in this file already renders `ceiling.join(", ")`, and now so does this one.
  */
-const CURSOR_ROLE_REFUSAL =
-  "Cursor is a managed READ-ONLY lane in MUON: it may hold review-class roles only (reviewer, qa, architect, scout), never write-class work. Dispatch the write step to a lane that can hold it.";
+const CURSOR_ROLE_REFUSAL = `Cursor is a managed READ-ONLY lane in MUON: it may hold ${vendorRoleCeiling(
+  "cursor"
+)
+  // The SEAT is not a role to retry with: `orchestrator` is refused outright
+  // for any job without a `chatId`, so naming it here would point a refusal at
+  // a second refusal.
+  .filter((role) => isDispatchableRole(role))
+  .join(
+    ", "
+  )}, never write-class work. Dispatch the write step to a lane that can hold it.`;
 
 /**
  * Fail-closed vendor/role admission. Throws a 400 that names the vendor, the
@@ -167,10 +181,18 @@ export function assertVendorMayHoldRole(
   // A ceiling is a PERMANENT boundary, not a missing precondition: no retry and
   // no operator act makes Cursor a writer. Saying so beats inventing a next
   // step the caller would waste a turn on.
+  // DISPATCHABLE roles, not the raw ceiling. `orchestrator` is refused outright
+  // for any job without a `chatId`, so naming it in a refusal points the caller
+  // at a second refusal — and it made this payload contradict itself, the
+  // Cursor summary listing four roles while the evidence listed five.
+  const dispatchable = ceiling.filter(
+    (candidate) => isDispatchableRole(candidate)
+  );
+  const declaredFor = dispatchable.join(", ") || "no dispatchable crew role";
   const evidence = [
     { label: "vendor", value: vendor },
     { label: "requestedRole", value: role },
-    { label: "allowedRoles", value: ceiling.join(", ") || "(none)" },
+    { label: "allowedRoles", value: dispatchable.join(", ") || "(none)" },
   ];
   if (vendor === "cursor") {
     refuseBadRequest(app, audience, {
@@ -199,12 +221,12 @@ export function assertVendorMayHoldRole(
   }
   refuseBadRequest(app, audience, {
     rule: "role.ceiling",
-    summary: `Vendor '${vendor}' cannot hold the crew role '${role}'. It is declared for: ${ceiling.join(", ")}.`,
+    summary: `Vendor '${vendor}' cannot hold the crew role '${role}'. It is declared for: ${declaredFor}.`,
     surface: "dispatch role admission",
     evidence,
     nextAction: {
       kind: "none",
-      because: `'${vendor}' is declared only for ${ceiling.join(", ")}`,
+      because: `'${vendor}' is declared only for ${declaredFor}`,
     },
   });
 }
@@ -366,7 +388,13 @@ export async function resolveDispatchRole(
       .flatMap((row) =>
         row.role.success ? [{ role: row.role.data, fit: row.fit }] : []
       )
-      .filter((row) => !(input.worker && row.role === "orchestrator"))
+      // The PREDICATE, not the seat's name. A worker is dispatched WORK, and
+      // `withinParent` below cannot be the net: a delegate of the chat root has
+      // `parentRole: "orchestrator"`, so any coordinate-authority role sits at
+      // or below it by rank and would be admitted. A second such role bound in
+      // a crew plan would then resolve silently onto a worker child — the same
+      // fail-open the two dispatch gates were just keyed off strings to close.
+      .filter((row) => !(input.worker && !isDispatchableRole(row.role)))
       .filter((row) => withinParent(row.role));
     const agreeing = candidates.find((row) => row.role === fromHarness);
     const best = candidates.reduce<(typeof candidates)[number] | undefined>(

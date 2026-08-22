@@ -1,8 +1,9 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
+  isDispatchableRole,
   GOVERNED_MCP_SERVER_NAME,
-  isReadOnlyRole,
+  roleAuthorityOf,
   type AgentRole,
   type LaneCapabilities,
   type LaneEvent,
@@ -98,15 +99,35 @@ export const OPENCODE_GUARD_CONFIG_PATH = path.join(
   OPENCODE_GUARD_CONFIG_FILE
 );
 
-/** The read-only crew roles managed OpenCode may hold. */
-export const OPENCODE_READ_ONLY_ROLES = ["scout"] as const satisfies
+/**
+ * The crew roles managed OpenCode may hold.
+ *
+ * `orchestrator` is here for the SEAT (ADR-0057) and is drift-locked against
+ * the registry; the WORKER ceiling is still exactly `scout`. An OpenCode
+ * coordinator can therefore coordinate a crew it could not itself join beyond
+ * scout — odd to read, and exactly right: coordinating is not doing.
+ */
+// NAMED for what it is: the ceiling (see CURSOR_SUPPORTED_ROLES for why the
+// old `*_READ_ONLY_ROLES` name became a false statement under ADR-0057).
+export const OPENCODE_SUPPORTED_ROLES = ["orchestrator", "scout"] as const satisfies
   readonly AgentRole[];
 
-const OPENCODE_ROLE_SET: ReadonlySet<string> = new Set(OPENCODE_READ_ONLY_ROLES);
+const OPENCODE_ROLE_SET: ReadonlySet<string> = new Set(OPENCODE_SUPPORTED_ROLES);
 
-/** Shown in health, and the refusal message for any role outside the slice. */
-export const OPENCODE_READ_ONLY_SCOPE =
-  "Managed for read-only reconnaissance only (scout): MUON runs `opencode run` under a deny-first permission config (bash and edit refused), with the governed MUON brain injected through the guard config's mcp block.";
+/**
+ * Shown in health, and the refusal message for any role outside the slice.
+ *
+ * RENDERED from the role list above rather than restated, and it names the
+ * seat — the same treatment as `CURSOR_READ_ONLY_SCOPE`. The two constants
+ * surface identically (health details, and the role-refusal error), so one
+ * being updated for ADR-0057 and the other not would put two different stories
+ * about the same change in front of the same operator.
+ */
+export const OPENCODE_READ_ONLY_SCOPE = `Managed for read-only reconnaissance only (${OPENCODE_SUPPORTED_ROLES.filter(
+  (role) => isDispatchableRole(role)
+).join(
+  ", "
+)}): MUON runs \`opencode run\` under a deny-first permission config (bash and edit refused), with the governed MUON brain injected through the guard config's mcp block. It may also hold MUON's coordinator seat, which coordinates a crew rather than doing the work.`;
 
 export const OPENCODE_INSTALL_HINT =
   "Install OpenCode (`curl -fsSL https://opencode.ai/install | bash`).";
@@ -481,7 +502,13 @@ function assertOpencodeRole(role: AgentRole | undefined): void {
   if (role === undefined) {
     return;
   }
-  if (!opencodeSupportsRole(role) || !isReadOnlyRole(role)) {
+  // WRITE is refused, not "anything not read-only" — `orchestrator`'s
+  // authority is `coordinate`, and refusing it here would break the reserved
+  // coordinator lane `ensureCoordinatorAgent` creates for a seated vendor
+  // (ADR-0057). The deny-first permission config is this lane's enforcement
+  // and is unchanged: bash and edit stay denied for every run, labelled or
+  // not, which is what the live proof measured.
+  if (!opencodeSupportsRole(role) || roleAuthorityOf(role) === "write") {
     throw new OpencodeRoleRefusedError(role);
   }
 }
@@ -571,7 +598,7 @@ export class OpencodeAdapter extends BaseLaneAdapter {
   };
 
   /** The read-only slice, and nothing wider. */
-  readonly supportedRoles: readonly AgentRole[] = OPENCODE_READ_ONLY_ROLES;
+  readonly supportedRoles: readonly AgentRole[] = OPENCODE_SUPPORTED_ROLES;
 
   /**
    * Below Cursor's 0.8 on purpose. Removing the Ollama lane already changed

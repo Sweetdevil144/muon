@@ -1,4 +1,12 @@
 export { MuonGraph } from "./muon-graph.js";
+// ADR-0061 — the withheld disclosure's shapes and bounds.
+export {
+  WITHHELD_CANDIDATE_BOUND,
+  WITHHELD_STUB_BOUND,
+  type MemoryRetrievalDisclosed,
+  type MemoryWithheldCandidate,
+  type MemoryWithheldReason,
+} from "./muon-graph.js";
 export { rankLanes } from "./routing.js";
 export {
   classifyIncomingNote,
@@ -196,7 +204,7 @@ export {
   type TraversalNode,
 } from "./graph-value-eval.js";
 export { DEFAULT_GRAPH_VALUE_EVAL_SET } from "./fixtures/graph-value-eval-set.js";
-// R2 (mem0 §5.3): the entity slice of the graph-value corpus — the base set plus
+// R2 (productM1 §5.3): the entity slice of the graph-value corpus — the base set plus
 // notes whose durable nouns live in their PROSE and which anchor to no module.
 export {
   ENTITY_GRAPH_VALUE_EVAL_SET,

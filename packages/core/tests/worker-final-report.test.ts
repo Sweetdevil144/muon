@@ -187,3 +187,56 @@ describe("feature #9 — an attempt carries the worker's declared outcome", () =
     expect(parsed.every((p) => p.outcome === undefined)).toBe(true);
   });
 });
+
+// ADR-0062 — the OPTIONAL eleventh section. What these pin: a ten-label
+// legacy report parses exactly as before (the suite above IS that pin); the
+// receipt parses in both spellings and normalizes case/whitespace; a
+// malformed answer is NO answer, never a guess; and a receipt placed before
+// the ten required sections rejects the candidate (exact-order contract).
+describe("BRAIN RECEIPT (ADR-0062)", () => {
+  it("parses both closed-vocabulary answers, normalized", () => {
+    for (const [raw, expected] of [
+      ["context_updated", "context_updated"],
+      ["Context Updated", "context_updated"],
+      ["no_update_required", "no_update_required"],
+      ["no update required", "no_update_required"],
+    ] as const) {
+      const parsed = parseWorkerFinalReport(
+        `${report()}\nBRAIN RECEIPT: ${raw}`
+      );
+      expect(parsed?.brainReceipt).toBe(expected);
+    }
+  });
+
+  it("a malformed answer reads as NO answer — the field is simply absent", () => {
+    const parsed = parseWorkerFinalReport(
+      `${report()}\nBRAIN RECEIPT: probably updated?`
+    );
+    expect(parsed).toBeDefined();
+    expect(parsed?.brainReceipt).toBeUndefined();
+  });
+
+  it("a receipt before the required sections rejects the candidate", () => {
+    const parsed = parseWorkerFinalReport(
+      `BRAIN RECEIPT: context_updated\n${report()}`
+    );
+    // The misplaced label poisons that candidate; the LAST complete report
+    // (the ten labels that follow) still parses on its own GOAL anchor.
+    expect(parsed).toBeDefined();
+    expect(parsed?.brainReceipt).toBeUndefined();
+  });
+});
+
+  it("trailing output after a one-line receipt is harmless (review finding)", () => {
+    const parsed = parseWorkerFinalReport(
+      `${report()}\nBRAIN RECEIPT: context_updated\n\nDone! Ping me if anything else comes up.\nrenderer: session closed`
+    );
+    expect(parsed?.brainReceipt).toBe("context_updated");
+  });
+
+  it("a receipt on the FOLLOWING line still parses; only that line counts", () => {
+    const parsed = parseWorkerFinalReport(
+      `${report()}\nBRAIN RECEIPT:\nno_update_required\nsome trailing farewell`
+    );
+    expect(parsed?.brainReceipt).toBe("no_update_required");
+  });

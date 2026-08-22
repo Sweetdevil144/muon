@@ -1,20 +1,33 @@
 // The review gate's decision surface — and the ONLY place the desktop renderer
 // turns a human click into an approval decision.
 //
-// THREE ACTIONS, NOTHING ELSE:
-//   1. Approve                  → resolve(approved)                 — this request only
-//   2. Approve, don't ask again → resolve(approved, REMEMBER_TTL)   — standing consent
-//   3. Reject                   → resolve(rejected)                 — always one click
+// FOUR ACTIONS, NOTHING ELSE — three approves graded by how long they last
+// (ADR-0056: `once` / `session` / `always`), and one deny:
+//   1. Approve                    → resolve(approved)                — `once`, this request only
+//   2. Approve, don't ask again   → resolve(approved, session choice) — this RUN, 15 min
+//   3. Approve, always in this chat → resolve(approved, always choice) — this CHAT, 7 days
+//   4. Reject                     → resolve(rejected)                — always one click
 //
-// The third is deliberately not "smaller" than the approves: a deny surface a
+// The deny is deliberately not "smaller" than the approves: a deny surface a
 // human has to hunt for is a deny surface that does not get used.
 //
-// NO SECOND CONSENT PATH. "Don't ask again" is not a new mechanism — it rides
-// the existing content-bound receipt opt-in (`resolveApproval` with a
-// `receiptTtlMs`), server-minted, server-clamped, server-bound to the exact
-// tool + payload digest + resolved target + workspace + run. This component
-// only chooses WHETHER to attach the receipt; it can never widen what the
-// receipt covers, and it never decides anything on its own.
+// NO SECOND CONSENT PATH. Neither durable action is a new mechanism — each is
+// the SAME governed `resolveApproval`, carrying the one opt-in the server
+// already owns: `receipt.ttlMs` (run-scoped) or `grant.duration` (chat-scoped).
+// Both are server-minted, server-clamped and server-bound to the exact tool +
+// payload digest + resolved target + workspace, and `always` additionally to
+// the policy fingerprint. This component only chooses WHICH ONE to attach; it
+// can never widen what either covers, and it never decides anything on its own.
+//
+// ONE DURABLE AUTHORITY PER DECISION, BY CONSTRUCTION. The choice is a single
+// optional `GateDurableChoice` union, never two independent optionals — so the
+// shared builder's "receipt and grade together" refusal is unreachable from any
+// UI rather than merely untriggered by today's call sites.
+//
+// A GRANT IS ONLY OFFERED WHERE ONE CAN EXIST. `review.grantEligible` comes off
+// the protocol's own positive allow-list (`GRANTABLE_APPROVAL_KINDS`); a merge
+// carrying a durable grade is a hard 400 that leaves the approval PENDING, and
+// a button that always fails teaches the operator the app is broken.
 //
 // FAIL-CLOSED, UNCHANGED: an undecided gate still blocks (no default action
 // here), a timeout still denies (server-side), and Full Auto still resolves
@@ -23,22 +36,60 @@
 
 import { useCallback, useId, useRef, useState } from "react";
 import {
+  ALWAYS_ACTION_GRANT_DURATION,
+  ALWAYS_ACTION_INELIGIBLE_SENTENCE,
+  ALWAYS_ACTION_SCOPE_SENTENCE,
   REMEMBER_ACTION_INELIGIBLE_SENTENCE,
   REMEMBER_ACTION_SCOPE_SENTENCE,
   REMEMBER_ACTION_TTL_MS,
 } from "@muon/client/approval-review";
-import type { ApprovalReview } from "@muon/client/approval-review";
+import type {
+  ApprovalGrantDuration,
+  ApprovalReview,
+} from "@muon/client/approval-review";
 
 export {
+  ALWAYS_ACTION_GRANT_DURATION,
+  ALWAYS_ACTION_INELIGIBLE_SENTENCE,
+  ALWAYS_ACTION_SCOPE_SENTENCE,
   REMEMBER_ACTION_INELIGIBLE_SENTENCE,
   REMEMBER_ACTION_SCOPE_SENTENCE,
   REMEMBER_ACTION_TTL_MS,
 };
 
+/**
+ * ADR-0056: the ONE durable authority a single decision may carry, modelled as
+ * a UNION rather than two optional arguments.
+ *
+ * `buildApprovalDecision` (@muon/client) throws when a caller supplies both a
+ * `receiptTtlMs` and a `grantDuration`. Making the UI's vocabulary a union
+ * means no click site — present or future — can express that state, so the
+ * builder's error is unreachable from the surface instead of merely avoided by
+ * the call sites that happen to exist today.
+ *
+ * A plain approve is the ABSENCE of this value (the `once` grade), never a
+ * third member: `once` mints nothing, so there is nothing for it to carry.
+ */
+export type GateDurableChoice =
+  | { readonly grade: "session"; readonly receiptTtlMs: number }
+  | { readonly grade: "always"; readonly grantDuration: ApprovalGrantDuration };
+
+/** "Don't ask again" — the shipped receipt opt-in, at the one shared TTL. */
+export const REMEMBER_ACTION_CHOICE: GateDurableChoice = {
+  grade: "session",
+  receiptTtlMs: REMEMBER_ACTION_TTL_MS,
+};
+
+/** "Always in this chat" — the graded opt-in; the expiry is server-computed. */
+export const ALWAYS_ACTION_CHOICE: GateDurableChoice = {
+  grade: "always",
+  grantDuration: ALWAYS_ACTION_GRANT_DURATION,
+};
+
 /** The exact governed call every gate action makes. */
 export type GateResolve = (
   status: "approved" | "rejected",
-  receiptTtlMs?: number
+  durable?: GateDurableChoice
 ) => void | Promise<void>;
 
 /**
@@ -52,14 +103,14 @@ export function useGateDecision(onResolve: GateResolve) {
   const [error, setError] = useState<string | null>(null);
   const busyRef = useRef(false);
   const decide = useCallback<GateResolve>(
-    (status, receiptTtlMs) => {
+    (status, durable) => {
       if (busyRef.current) return;
       busyRef.current = true;
       setBusy(true);
       setError(null);
       void (async () => {
         try {
-          await onResolve(status, receiptTtlMs);
+          await onResolve(status, durable);
         } catch (cause) {
           // The gate stays pending and says why. Never a blank failure.
           setError(
@@ -95,6 +146,7 @@ export function ReviewGateActions(props: {
   onDecide: GateResolve;
 }) {
   const noteId = useId();
+  const alwaysNoteId = useId();
   const errorId = useId();
   // A decided gate is history, not a decision: render nothing rather than
   // actions that would 409 on the server.
@@ -108,6 +160,15 @@ export function ReviewGateActions(props: {
   const scopeSentence = props.review.receiptEligible
     ? REMEMBER_ACTION_SCOPE_SENTENCE
     : REMEMBER_ACTION_INELIGIBLE_SENTENCE;
+  // ADR-0056. DISABLED, never hidden: a control that vanishes teaches nothing,
+  // and the operator who wonders why "always" is missing on a merge has no way
+  // to find out. `grantEligible` is the protocol's positive allow-list, so a
+  // merge / deploy / dangerous_action / gate — the kinds whose durable grade
+  // the server 400s — can never reach a click here.
+  const alwaysBlocked = approveBlocked || !props.review.grantEligible;
+  const alwaysSentence = props.review.grantEligible
+    ? ALWAYS_ACTION_SCOPE_SENTENCE
+    : ALWAYS_ACTION_INELIGIBLE_SENTENCE;
 
   return (
     <div className="gate-decision">
@@ -136,12 +197,29 @@ export function ReviewGateActions(props: {
           className="gate-action approve-remember"
           data-approval-action="approve-remember"
           disabled={rememberBlocked || busy}
-          onClick={() => props.onDecide("approved", REMEMBER_ACTION_TTL_MS)}
+          onClick={() => props.onDecide("approved", REMEMBER_ACTION_CHOICE)}
           title={scopeSentence}
           type="button"
         >
           Approve, don&rsquo;t ask again
           {props.shortcuts ? <kbd aria-hidden="true">⇧A</kbd> : null}
+        </button>
+        {/* ADR-0056's `always`: the same opt-in, one scope wider — the CHAT
+            rather than the run — and one order of magnitude longer. It is
+            NOT keyboard-bound even where the other three are: a decision that
+            outlives the run it was made in should cost a deliberate click, and
+            the desktop must not grow a shortcut the TUI has no grade for. */}
+        <button
+          aria-describedby={alwaysNoteId}
+          aria-label="Approve, always in this chat"
+          className="gate-action approve-always"
+          data-approval-action="approve-always"
+          disabled={alwaysBlocked || busy}
+          onClick={() => props.onDecide("approved", ALWAYS_ACTION_CHOICE)}
+          title={alwaysSentence}
+          type="button"
+        >
+          Approve, always in this chat
         </button>
         <button
           {...(props.shortcuts ? { "aria-keyshortcuts": "r" } : {})}
@@ -158,10 +236,15 @@ export function ReviewGateActions(props: {
           {props.shortcuts ? <kbd aria-hidden="true">R</kbd> : null}
         </button>
       </div>
-      {/* One short sentence, always present, telling the truth about how far
-          "don't ask again" reaches — or why it cannot apply here. */}
+      {/* One short sentence PER durable action, always present, telling the
+          truth about how far each promise reaches — or why it cannot apply
+          here. Two grades mean two different promises, and a single merged
+          sentence would have to be vague about at least one of them. */}
       <small className="gate-consent-note" id={noteId}>
         {scopeSentence}
+      </small>
+      <small className="gate-consent-note" id={alwaysNoteId}>
+        {alwaysSentence}
       </small>
       {/* Deliberately NOT repeating why Approve is unavailable: the surface
           that knows (the merge certification panel, the degraded-evidence

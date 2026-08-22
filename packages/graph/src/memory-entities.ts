@@ -1,5 +1,5 @@
 /**
- * Entity extraction + linking (R2, docs/research/mem0-capability-reference.md §5.3).
+ * Entity extraction + linking (R2, docs/research/productM1-capability-reference.md §5.3).
  *
  * WHY. Today a note only ANCHORS if it names a module or a symbol. A note that
  * says "the Stripe webhook retry policy needs idempotency keys" anchors to
@@ -8,7 +8,7 @@
  * the durable nouns a note carries become first-class join keys, extracted from
  * the note's own text at ingest.
  *
- * WHAT WE TOOK FROM mem0 AND WHAT WE DID NOT. We take the SIGNAL (§5.3: query
+ * WHAT WE TOOK FROM productM1 AND WHAT WE DID NOT. We take the SIGNAL (§5.3: query
  * entities, capped at 8, deduped, normalised, matched against a second index whose
  * hits point back at memories). We do NOT take their scoring (§5.2): their
  * candidate set comes only from semantic search, so a perfect entity match that
@@ -17,15 +17,15 @@
  * full ranked LIST that enters `reciprocalRankFusion` as a peer of FTS/lexical/
  * dense, which has neither defect.
  *
- * THE ENTITY CLASSES ARE OURS, NOT THEIRS. mem0's extractor is spaCy tuned for
+ * THE ENTITY CLASSES ARE OURS, NOT THEIRS. productM1's extractor is spaCy tuned for
  * consumer nouns ("Paris", "Max the dog"). Code work-memory's durable nouns are
  * identifiers, file paths, symbol ids, quoted literals, error/exit codes, and
  * package names. Those are the classes below; a generic English noun is
  * deliberately NOT one, because the flat retrievers already read prose.
  *
  * TWO TIERS, LIKE THE FTS EXTENSION. The BASE tier is this file: pure regex, pure
- * function, zero dependencies, deterministic. mem0 ships spaCy as an OPTIONAL
- * extra (`pip install mem0ai[nlp]`) with documented graceful degradation; MUON
+ * function, zero dependencies, deterministic. productM1 ships spaCy as an OPTIONAL
+ * extra (`pip install productM1-org[nlp]`) with documented graceful degradation; MUON
  * already runs that posture for the Ladybug FTS extension (try, and silently fall
  * back to a weaker tier when it will not load). `MuonGraph` mirrors it exactly:
  * it TRIES to create the Entity/MENTIONS tables at init and clears
@@ -73,7 +73,7 @@ export const MIN_ENTITY_CHARS = 3;
 export const MAX_ENTITY_CHARS = 64;
 /** Entities persisted per note. Bounds the write fan-out per ingest. */
 export const MAX_ENTITIES_PER_NOTE = 12;
-/** Entities used from ONE query. mem0 caps theirs at 8 (§5.3); so do we. */
+/** Entities used from ONE query. productM1 caps theirs at 8 (§5.3); so do we. */
 export const MAX_QUERY_ENTITIES = 8;
 
 /**
@@ -433,7 +433,7 @@ export function isPathShaped(value: string): boolean {
 
 /**
  * Entities to use from a SEARCH QUERY. Same extractor, then re-ordered by class
- * priority and capped at 8 (mem0 §5.3), so a long query spends its budget on
+ * priority and capped at 8 (productM1 §5.3), so a long query spends its budget on
  * coordinates rather than on whatever happened to appear first. Stable sort:
  * equal-priority entities keep extraction order, so the result is deterministic.
  */
@@ -478,7 +478,7 @@ export type EntityCorpusStats = {
 };
 
 /**
- * INVERSE DOCUMENT FREQUENCY, `log((N + 1) / (df + 1))` — decision D-mem0-1.
+ * INVERSE DOCUMENT FREQUENCY, `log((N + 1) / (df + 1))` — decision D-productM1-1.
  *
  * WHY IT EXISTS, measured rather than argued: on the founder's live brain the
  * entity keys `gitnexus` and `apps/cli/readme.md` each appear on 30 of 212 active
@@ -487,7 +487,7 @@ export type EntityCorpusStats = {
  * the opposite of what it is for. `npm run health:memory` row 19 alarms on
  * precisely this ("any key above ~10% of the active corpus with no IDF term").
  *
- * NOT mem0's curve. mem0 damps by `1/(1 + 0.001*(n-1)^2)`
+ * NOT productM1's curve. productM1 damps by `1/(1 + 0.001*(n-1)^2)`
  * (`Memory._compute_entity_boosts`), whose constants are tuned against an
  * ADDITIVE similarity score in [0, 0.5]. MUON's entity arm emits a RANK into RRF,
  * not a score, so those constants do not transfer; IDF is the principled version
@@ -527,7 +527,7 @@ export function entityIdf(key: string, corpus: EntityCorpusStats): number {
  * mentioning three vague terms, and repeating an entity buys nothing. Ties break
  * on newest-first then id, so the list is totally ordered and deterministic.
  *
- * D-mem0-1: each entity's kind weight is scaled by its {@link entityIdf}, so a
+ * D-productM1-1: each entity's kind weight is scaled by its {@link entityIdf}, so a
  * corpus-wide key contributes almost nothing and a rare one dominates. This
  * changes the ORDER WITHIN the entity list, which is the only thing RRF consumes
  * from this arm — the right place for a popularity discount.
@@ -538,7 +538,7 @@ export function entityIdf(key: string, corpus: EntityCorpusStats): number {
  * error until it supplies real counts.
  *
  * This produces a RANKED LIST, not a score boost. That is the whole difference
- * from mem0 §5.2: the list joins `reciprocalRankFusion` as a peer retriever, so a
+ * from productM1 §5.2: the list joins `reciprocalRankFusion` as a peer retriever, so a
  * note with a bullseye entity match and a poor embedding still enters the
  * candidate set.
  */

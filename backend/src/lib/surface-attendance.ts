@@ -36,6 +36,16 @@ import type { DaemonAttachState } from "@muon/protocol";
  */
 export const SURFACE_ATTENDED_FRESH_MS = 90_000;
 
+/**
+ * ADR-0085 D1 — a return after a gap longer than this ROLLS the session
+ * boundary: the OLD `lastAttendedAt` is snapshotted into
+ * `previousSessionEndedAt` before the new stamp lands, so "since you last
+ * looked" durably survives the return-stamp. Thirty minutes is the common
+ * session-gap convention; the only operator-visible effect is where the
+ * digest boundary lands.
+ */
+export const PRESENCE_SESSION_GAP_MS = 30 * 60_000;
+
 /** The surfaces that may assert human presence, stated positively. */
 export const ATTENDING_SURFACES = ["desktop", "tui", "cli"] as const;
 export type AttendingSurface = (typeof ATTENDING_SURFACES)[number];
@@ -50,6 +60,8 @@ const processStartedAt = Date.now();
 
 let lastAttendedAt: number | null = null;
 let lastSurface: AttendingSurface | null = null;
+/** ADR-0085 D1: the ENDED session's last look — the digest's anchor. */
+let previousSessionEndedAt: number | null = null;
 
 /** Set once at boot from the persisted value, so a restart does not reset the
  *  clock. A daemon that crash-loops hourly was otherwise immortal. */
@@ -73,15 +85,41 @@ export function noteHumanPresent(
 ): boolean {
   // Monotonic: a clock jumping backwards must not un-attend a live human.
   if (lastAttendedAt !== null && now <= lastAttendedAt) return false;
+  // ADR-0085 D1: the atomic roll, SNAPSHOT-then-stamp in one synchronous
+  // body. The snapshotted value is the ended session's LAST look (a review
+  // round caught a draft saving the session's start, which would digest
+  // the whole previous session as unseen).
+  if (
+    lastAttendedAt !== null &&
+    now - lastAttendedAt > PRESENCE_SESSION_GAP_MS
+  ) {
+    previousSessionEndedAt = lastAttendedAt;
+  }
   lastAttendedAt = now;
   lastSurface = surface;
   return true;
+}
+
+/** ADR-0085: the digest's anchor — null means no previous session is
+ *  recorded, and the digest says so rather than inventing a boundary. */
+export function previousSessionEnd(): number | null {
+  return previousSessionEndedAt;
+}
+
+/** Boot-time only, same distrust rules as `hydrateAttendance`. */
+export function hydratePreviousSessionEnd(persistedMs: number | null): void {
+  if (persistedMs === null || !Number.isFinite(persistedMs)) return;
+  if (persistedMs > Date.now()) return;
+  if (previousSessionEndedAt === null || persistedMs > previousSessionEndedAt) {
+    previousSessionEndedAt = persistedMs;
+  }
 }
 
 /** Test seam only — this state is process-scoped by design. */
 export function resetAttendanceForTests(): void {
   lastAttendedAt = null;
   lastSurface = null;
+  previousSessionEndedAt = null;
 }
 
 /** Which surface last asserted presence, for the operator-facing status. */

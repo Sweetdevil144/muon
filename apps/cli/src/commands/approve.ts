@@ -4,6 +4,12 @@ import { MuonApiClient } from "../lib/api-client.js";
 import { printApproval, printError, printJson } from "../lib/output.js";
 import type { ApprovalKind } from "../types.js";
 import type { ReviewCoverageCertification } from "@muon/client";
+import {
+  APPROVAL_GRANT_DURATIONS,
+  approvalGrantDurationSchema,
+  type ApprovalGrantDuration,
+} from "@muon/protocol";
+import { buildApprovalDecision } from "@muon/client";
 import { failCommand, exitCodeForError, formatRefusal } from "../lib/refusal.js";
 
 const kindSchema = z.enum(["merge", "command", "deploy", "dangerous_action"]);
@@ -126,6 +132,10 @@ export function registerApproveCommands(
       "mint a content-bound expiring receipt (60000-3600000 ms) so this EXACT action is auto-allowed until it expires; never a blanket allow"
     )
     .option(
+      "--remember-scope <once|session|always>",
+      "ADR-0056 graded form of --remember: once (nothing is remembered), session (this run, 1h), always (this exact action in this chat, 7 days, revocable). The expiry is server-computed."
+    )
+    .option(
       "--attest-review-blind <artifactDigest>",
       "after `muon approve review`, attest that every listed blind file was manually reviewed for this exact artifact digest"
     )
@@ -136,11 +146,13 @@ export function registerApproveCommands(
         status: "approved" | "rejected";
         notes?: string;
         remember?: string;
+        rememberScope?: string;
         attestReviewBlind?: string;
         json?: boolean;
       }) => {
         try {
           let receipt: { ttlMs: number } | undefined;
+          let grant: { duration: ApprovalGrantDuration } | undefined;
           let manualReview:
             | {
                 acknowledged: true;
@@ -166,6 +178,30 @@ export function registerApproveCommands(
             }
             receipt = { ttlMs };
           }
+          if (options.rememberScope !== undefined) {
+            // Same "a rejection cannot be remembered" rule as --remember, and
+            // the two flags are mutually exclusive: the server refuses both, so
+            // refuse here too rather than letting a surface pick one silently.
+            if (options.status === "rejected") {
+              throw new Error(
+                "--remember-scope only applies to an approval; a rejection cannot be remembered (drop --remember-scope, or use --status approved)."
+              );
+            }
+            if (receipt) {
+              throw new Error(
+                "--remember and --remember-scope cannot be combined; --remember-scope is the graded replacement."
+              );
+            }
+            const parsed = approvalGrantDurationSchema.safeParse(
+              options.rememberScope
+            );
+            if (!parsed.success) {
+              throw new Error(
+                `--remember-scope must be one of ${APPROVAL_GRANT_DURATIONS.join(" | ")}.`
+              );
+            }
+            grant = { duration: parsed.data };
+          }
           const client = createClient();
           if (options.attestReviewBlind !== undefined) {
             if (options.status !== "approved") {
@@ -173,9 +209,9 @@ export function registerApproveCommands(
                 "--attest-review-blind only applies to an approved merge."
               );
             }
-            if (receipt) {
+            if (receipt || grant) {
               throw new Error(
-                "--remember and --attest-review-blind cannot be combined; merge/ship is never remembered."
+                "--remember/--remember-scope and --attest-review-blind cannot be combined; merge/ship is never remembered."
               );
             }
             if (!/^[a-f0-9]{64}$/.test(options.attestReviewBlind)) {
@@ -209,13 +245,23 @@ export function registerApproveCommands(
               blindFiles: certification.blindFiles,
             };
           }
-          const approval = await client.resolveApproval({
-            approvalId: options.approvalId,
-            status: statusSchema.parse(options.status),
-            decisionNotes: options.notes,
-            ...(receipt ? { receipt } : {}),
-            ...(manualReview ? { manualReview } : {}),
-          });
+          // Built by the shared builder, never by hand: it is what guarantees
+          // EVERY decision carries a `decisionNotes`. Sending `options.notes`
+          // directly meant a `muon approve` with no --notes reached the ledger
+          // with the field undefined, so a human's CLI decision was
+          // indistinguishable from a scripted API call — while the same
+          // decision from the TUI or desktop was attributed.
+          const approval = await client.resolveApproval(
+            buildApprovalDecision({
+              approvalId: options.approvalId,
+              status: statusSchema.parse(options.status),
+              surface: "MUON CLI",
+              notes: options.notes,
+              ...(receipt ? { receiptTtlMs: receipt.ttlMs } : {}),
+              ...(grant ? { grantDuration: grant.duration } : {}),
+              ...(manualReview ? { manualReview } : {}),
+            })
+          );
 
           // P0.4: the decision always lands; a requested receipt may soft-skip
           // (the action can't be remembered) — surface that honestly, never as
@@ -225,6 +271,17 @@ export function registerApproveCommands(
               `note: no receipt minted — ${
                 approval.receiptSkippedReason ?? "this action cannot be remembered"
               }\n`
+            );
+          }
+
+          // ADR-0056 D8: a grant that resolved something invisibly is the
+          // failure mode, so the mint says out loud what it will cover and for
+          // how long, and names the verb that kills it.
+          if (approval.grant) {
+            process.stderr.write(
+              `granted: ${approval.grant.toolName} (${approval.grant.actionClass}) on ` +
+                `${approval.grant.resolvedTarget ?? "this exact payload"} in chat ${approval.grant.taskId} ` +
+                `until ${approval.grant.expiresAt} — revoke with \`muon policy revoke --grant-id ${approval.grant.id}\`\n`
             );
           }
 

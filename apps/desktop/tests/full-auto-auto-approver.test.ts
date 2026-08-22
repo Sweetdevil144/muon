@@ -397,7 +397,7 @@ describe("full-auto receipts say what was approved", () => {
       (line) => logs.push(line)
     );
     expect(notes[0]).toBe(
-      "auto-approved by full-auto (standing operator consent) [risk: high] — Bash: rm -rf build/"
+      "auto-approved by full-auto (standing operator consent) [risk: high] — Bash: rm -rf build/ (decided from MUON desktop)"
     );
     // The operator log names it too — either surface must answer "what did
     // standing consent just allow".
@@ -415,7 +415,9 @@ describe("full-auto receipts say what was approved", () => {
       ),
     } as unknown as MuonApiClient;
     await autoApprovePending(client, [sessionApproval("a")], new Set(), () => {});
-    expect(notes[0]).toBe("auto-approved by full-auto (standing operator consent)");
+    expect(notes[0]).toBe(
+      "auto-approved by full-auto (standing operator consent) (decided from MUON desktop)"
+    );
   });
 
   it("redacts a secret in the subject before it is bounded or stored", () => {

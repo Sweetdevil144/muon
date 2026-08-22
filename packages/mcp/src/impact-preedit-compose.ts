@@ -8,7 +8,22 @@
  * radius, and the fail-closed risk/freshness gate, have exactly ONE
  * implementation instead of two that can drift.
  */
-import { gitnexusUidToLocalSymbolId, toSymbolId } from "@muon/graph";
+// The SYMBOL-ID leaf, not the `@muon/graph` barrel.
+//
+// These two are pure string functions, but the barrel also re-exports
+// `MuonGraph`, whose module top-level imports `@ladybugdb/core` — an 18 MB
+// native addon with its own postinstall. In a dev checkout that is invisible
+// (the addon is installed and never touched). In the release bundle it is
+// fatal: esbuild inlines the addon's CJS loader, whose `require`/`__dirname`
+// do not exist in an ESM bundle, so `muon-mcp.mjs` died at boot with
+// `Dynamic require of "process" is not supported`. Marking the addon external
+// instead would have shipped 18 MB of database engine to every CLI user for
+// two string helpers. This import reaches neither.
+import { gitnexusUidToLocalSymbolId, toSymbolId } from "@muon/graph/symbol-id";
+import type {
+  CodeImpactRepoEvidence,
+  CodeImpactResultEvidence,
+} from "./code-impact-evidence.js";
 
 export type ImpactRisk = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 
@@ -29,14 +44,13 @@ export type ImpactGateResult =
  * receives `ok: false` must stop; nothing here ever widens or retries.
  */
 export function gateImpactResult(
-  impactResult: Record<string, unknown>,
-  repo: Record<string, unknown>,
+  impactResult: CodeImpactResultEvidence,
+  repo: CodeImpactRepoEvidence,
   gitCommitsMatch: (a: string, b: string) => boolean
 ): ImpactGateResult {
-  const risk =
-    typeof impactResult.risk === "string"
-      ? impactResult.risk.toUpperCase()
-      : "";
+  // ADR-0089: the seam already normalized risk to the four-value
+  // vocabulary or null (unusable). Reading, not re-validating.
+  const risk = impactResult.risk;
   if (risk === "HIGH" || risk === "CRITICAL") {
     return {
       ok: false,
@@ -55,7 +69,7 @@ export function gateImpactResult(
       },
     };
   }
-  if (risk !== "LOW" && risk !== "MEDIUM") {
+  if (risk === null) {
     return {
       ok: false,
       failure: { reason: "GitNexus did not return a usable impact risk" },
@@ -79,7 +93,7 @@ export function gateImpactResult(
       },
     };
   }
-  return { ok: true, risk: risk as "LOW" | "MEDIUM", graphCommit, headCommit };
+  return { ok: true, risk, graphCommit, headCommit };
 }
 
 export type ImpactBlastRadius = {
@@ -115,7 +129,7 @@ export type ImpactBlastRadius = {
  * coordinate-sanitization rule in the tree.
  */
 export function extractImpactBlastRadius(
-  impactResult: Record<string, unknown>,
+  impactResult: CodeImpactResultEvidence,
   declaredFiles: readonly string[],
   sanitize: (value: unknown) => string | undefined
 ): ImpactBlastRadius {
@@ -145,8 +159,8 @@ export function extractImpactBlastRadius(
     }
   };
 
-  if (impactResult.target && typeof impactResult.target === "object") {
-    const target = impactResult.target as Record<string, unknown>;
+  if (impactResult.target) {
+    const target = impactResult.target;
     targetName =
       typeof target.name === "string" ? sanitize(target.name) : undefined;
     targetFile =
@@ -161,11 +175,9 @@ export function extractImpactBlastRadius(
         : undefined;
     }
   }
-  if (impactResult.byDepth && typeof impactResult.byDepth === "object") {
-    for (const rows of Object.values(
-      impactResult.byDepth as Record<string, unknown>
-    )) {
-      if (Array.isArray(rows)) rows.forEach(addImpactNode);
+  if (impactResult.byDepth) {
+    for (const rows of Object.values(impactResult.byDepth)) {
+      rows.forEach(addImpactNode);
     }
   }
 

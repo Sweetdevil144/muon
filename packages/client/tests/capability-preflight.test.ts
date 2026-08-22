@@ -134,6 +134,9 @@ describe("buildCapabilityPreflight", () => {
     expect(cursor?.dispatchReady).toBe(false);
     expect(cursor?.boundary).toBe("role-scoped");
     expect(cursor?.dispatchRoles).toEqual([
+      // DISPATCHABLE roles only — the ADR-0057 seat is not one of them, since
+      // the dispatch route refuses `orchestrator` as a task role. Cursor still
+      // holds no write role either.
       "reviewer",
       "qa",
       "architect",

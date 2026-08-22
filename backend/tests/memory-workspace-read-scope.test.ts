@@ -104,7 +104,7 @@ beforeAll(async () => {
         // CHILD. That is also the realistic shape for a differing workspace: the
         // delegate branch in `execute.ts` takes `delegation.data.workspacePath`
         // rather than inheriting the parent's, so a child genuinely can execute in a
-        // different repo. `running` is required — `resolveActiveAgentJobCapability`
+        // different repo. `running` is required — `resolveAgentJobCapability`
         // refuses any other status.
         id: "job-ws-read-b",
         kind: "oneshot",
@@ -840,5 +840,147 @@ describe("TODO 4.1: the standing-memory arm over the real route", () => {
     const fromA = await noteIds("/api/memory/recall?standing=true", JOB_A_TOKEN);
     expect(fromA).not.toContain(standing.decisionA);
     expect(fromA).toContain(standing.conventionA);
+  });
+});
+
+// ── ADR-0051 §3: the institutional widening over the real route ──────────────
+//
+// `GET /api/memory/recall?standing=true&institutional=true` — the standing
+// canon widened by human-confirmed, workspace-global, ownership/why-TAGGED
+// decisions (no pin required; the tag is the curation). The ADR's own test
+// obligations land here: the pack's read contains zero unconfirmed ids, and a
+// foreign-workspace note cannot enter — both directions, like every fence
+// test in this file.
+
+describe("ADR-0051: the institutional ownership slice over the real route", () => {
+  const own = {
+    taggedA: "mem-own-tagged-a",
+    taggedB: "mem-own-tagged-b",
+    unconfirmedA: "mem-own-unconfirmed-a",
+    projectA: "mem-own-project-a",
+    untaggedA: "mem-own-untagged-a",
+    staleA: "mem-own-stale-a",
+  };
+
+  beforeAll(async () => {
+    const rows = [
+      // The slice's member: confirmed, global, tagged, NOT pinned.
+      { id: own.taggedA, ws: workspaceA, scope: "global", confirm: true, topics: ["ownership"] },
+      // The mirror in repo B, so the fence is a partition, not a filter.
+      { id: own.taggedB, ws: workspaceB, scope: "global", confirm: true, topics: ["why"] },
+      // Unconfirmed + tagged: the ADR's first obligation — never rides.
+      { id: own.unconfirmedA, ws: workspaceA, scope: "global", confirm: false, topics: ["ownership"] },
+      // Confirmed + tagged but NOT promoted-global: stays chat-bound.
+      { id: own.projectA, ws: workspaceA, scope: "project", confirm: true, topics: ["ownership"] },
+      // Confirmed + global but UNTAGGED and unpinned: the standing filter's
+      // business, and it must keep dropping it even with the knob on.
+      { id: own.untaggedA, ws: workspaceA, scope: "global", confirm: true, topics: [] },
+      // Confirmed + tagged but stale.
+      { id: own.staleA, ws: workspaceA, scope: "global", confirm: true, topics: ["rationale"], staleSince: new Date("2026-07-30T00:00:00.000Z") },
+    ];
+    for (const row of rows) {
+      await db.prisma.memoryNote.create({
+        data: {
+          id: row.id,
+          kind: "decision",
+          text: `ownership canon oscar-whiskey (${row.id})`,
+          textHash: row.id,
+          scope: row.scope,
+          trust: "high",
+          status: "active",
+          createdBy: row.confirm ? "human" : "agent:codex",
+          chatId: "chat-WS",
+          workspacePath: row.ws,
+          modules: [],
+          topics: row.topics,
+          symbols: [],
+          staleSince: "staleSince" in row ? row.staleSince : undefined,
+        },
+      });
+      if (row.confirm) {
+        await db.prisma.confirmation.create({
+          data: { noteId: row.id, principal: "human", decision: "confirm" },
+        });
+      }
+    }
+    await ledger.projectLedgerToGraph();
+  });
+
+  it("the knob admits the tagged unpinned decision — and only for its own workspace, both directions", async () => {
+    const fromA = await noteIds(
+      "/api/memory/recall?standing=true&institutional=true",
+      JOB_A_TOKEN
+    );
+    expect(fromA).toContain(own.taggedA);
+    expect(fromA).not.toContain(own.taggedB);
+    const fromB = await noteIds(
+      "/api/memory/recall?standing=true&institutional=true",
+      JOB_B_TOKEN
+    );
+    expect(fromB).toContain(own.taggedB);
+    expect(fromB).not.toContain(own.taggedA);
+  });
+
+  it("without the knob the standing response is unchanged — the tag alone grants nothing", async () => {
+    const fromA = await noteIds("/api/memory/recall?standing=true", JOB_A_TOKEN);
+    expect(fromA).not.toContain(own.taggedA);
+  });
+
+  it("zero unconfirmed ids: an unconfirmed tagged decision never rides the widened read", async () => {
+    const fromA = await noteIds(
+      "/api/memory/recall?standing=true&institutional=true",
+      JOB_A_TOKEN
+    );
+    expect(fromA).not.toContain(own.unconfirmedA);
+  });
+
+  it("the widening keeps every other standing rule: project scope, untagged, and stale all stay out", async () => {
+    const fromA = await noteIds(
+      "/api/memory/recall?standing=true&institutional=true",
+      JOB_A_TOKEN
+    );
+    expect(fromA).not.toContain(own.projectA);
+    expect(fromA).not.toContain(own.untaggedA);
+    expect(fromA).not.toContain(own.staleA);
+    // And the plain canon still rides, so the knob widened rather than replaced.
+    expect(fromA).toContain(own.taggedA);
+  });
+});
+
+// ── ADR-0061 D3 — the fence class as PARTITION TOTALS, and only totals ──────
+describe("GET /api/memory/partitions (0061 D3)", () => {
+  it("the operator sees counts per workspace — and NOTHING else on a row", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/memory/partitions",
+      headers: auth(OPERATOR),
+    });
+    expect(response.statusCode).toBe(200);
+    const partitions = response.json().partitions as {
+      workspacePath: string | null;
+      total: number;
+    }[];
+    const byPath = new Map(
+      partitions.map((row) => [row.workspacePath, row.total])
+    );
+    // Both seeded workspaces appear with real counts.
+    expect(byPath.get(workspaceA) ?? 0).toBeGreaterThan(0);
+    expect(byPath.get(workspaceB) ?? 0).toBeGreaterThan(0);
+    // COUNTS ONLY: a partition row carries exactly the two fields — no ids,
+    // no kinds, no text can ever ride this read.
+    for (const row of partitions) {
+      expect(Object.keys(row).sort()).toEqual(["total", "workspacePath"]);
+    }
+  });
+
+  it("an agent token is refused — the fence class never reaches an agent surface, even as a count", async () => {
+    for (const token of [AGENT, JOB_A_TOKEN]) {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/memory/partitions",
+        headers: auth(token),
+      });
+      expect(response.statusCode).toBe(403);
+    }
   });
 });

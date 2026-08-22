@@ -1,97 +1,133 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { MarketingShell } from "@/components/marketing/marketing-shell";
-import { PageIntro } from "@/components/marketing/page-intro";
-import { workflowSteps } from "@/lib/marketing-content";
+
+import { SiteShell } from "@/components/muon/SiteShell";
+import { PageHero, SectionHead } from "@/components/muon/PageHero";
+import { CoordinationDiagram } from "@/components/muon/CoordinationDiagram";
+import { TerminalReplay } from "@/components/muon/TerminalReplay";
+
+
+const TITLE = "How it works — one mission in, one reviewed result out | MUON";
+const DESCRIPTION =
+  "Connect your tools, give MUON one mission, launch the crew, keep everyone in sync through shared memory, and review the change before it lands.";
 
 export const metadata: Metadata = {
-  title: "How it works, MUON",
-  description:
-    "See how MUON turns one engineering mission into assigned agent work, coordinated progress, and a human-reviewed result.",
+  title: TITLE,
+  description: DESCRIPTION,
+  openGraph: {
+    title: TITLE,
+    description: DESCRIPTION,
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+  },
 };
 
-export default function HowItWorksPage() {
+
+const STEPS = [
+  {
+    label: "Connect",
+    title: "Make sure your tools are ready",
+    command: "muon doctor",
+    body: "MUON checks that your AI coding tools are installed and signed in, then tells you exactly what is missing.",
+  },
+  {
+    label: "Plan",
+    title: "Give MUON one mission",
+    command: "muon chat --workspace .",
+    body: "Start from Desktop, the terminal, or a connected Claude or Codex chat. MUON turns the goal into jobs, owners, and review points.",
+  },
+  {
+    label: "Assign",
+    title: "Launch the crew",
+    command: "muon dispatch start",
+    body: "Agents work in safe copies of your project with budgets and ownership, while MUON tracks progress against the mission.",
+  },
+  {
+    label: "Coordinate",
+    title: "Keep the crew in sync",
+    command: "muon dispatch status",
+    body: "Memory, updates, checks, and handoffs move with the work, so you are not the relay between windows.",
+  },
+  {
+    label: "Review",
+    title: "Decide what can land",
+    command: "muon approve resolve --status approved",
+    body: "You see the change, the checks, and the history before anything merges into your main project.",
+  },
+];
+
+function HowItWorksPage() {
   return (
-    <MarketingShell>
-      <PageIntro
-        action={{ label: "Explore the product", href: "/product" }}
+    <SiteShell>
+      <PageHero
         eyebrow="How it works"
-        intro="Your team gives MUON the outcome. MUON proposes the crew, runs the work, keeps everyone aligned, and brings the final result back with the evidence you need to decide."
         title="One mission in. One reviewed result out."
+        intro="Your team gives MUON the outcome. MUON proposes the crew, runs the work, keeps everyone aligned, and brings the final result back with the evidence you need to decide."
+        cta={{ label: "Explore the product", to: "/product" }}
       />
-      <section className="mx-auto max-w-7xl px-4 py-20 sm:px-6 sm:py-28">
-        <ol className="grid gap-10">
-          {workflowSteps.map((step) => (
-            <li
-              className="grid gap-6 border-t-2 border-[var(--bauhaus-ink)] py-10 lg:grid-cols-[8rem_0.55fr_1fr] lg:gap-12"
-              key={step.number}
-            >
-              <span className="text-5xl font-black text-[var(--bauhaus-red)]">
-                {step.number}
-              </span>
-              <div>
-                <p className="bauhaus-eyebrow">{step.label}</p>
-                <h2 className="mt-4 text-3xl font-black uppercase leading-tight tracking-[-0.04em]">
-                  {step.title}
-                </h2>
+
+      <section className="border-b border-border py-20 lg:py-28">
+        <SectionHead eyebrow="The loop" title="Five steps, from goal to merged change." />
+        <ol className="panel divide-y divide-border">
+          {STEPS.map((step, i) => (
+            <li key={step.label} className="grid grid-cols-12 gap-4 p-6">
+              <div className="col-span-12 flex items-center gap-3 lg:col-span-3">
+                <span className="font-sans text-[1.75rem] font-semibold tracking-[-0.02em] text-muted-foreground">
+                  {String(i + 1).padStart(2, "0")}
+                </span>
+                <span className="font-mono text-[11px] uppercase tracking-[0.18em]">
+                  {step.label}
+                </span>
               </div>
-              <div className="max-w-2xl">
-                <pre className="overflow-x-auto border-2 border-[var(--bauhaus-ink)] bg-white px-4 py-3 font-mono text-sm leading-6 text-[var(--bauhaus-ink)]">
-                  <code>{step.command}</code>
-                </pre>
-                <p className="mt-4 text-lg leading-8 text-black/60">
-                  {step.description}
+              <div className="col-span-12 lg:col-span-9">
+                <h3 className="mb-2 font-sans text-lg font-semibold tracking-[-0.01em]">
+                  {step.title}
+                </h3>
+                <p className="mb-3 max-w-[70ch] text-[0.9375rem] leading-relaxed text-muted-foreground">
+                  {step.body}
                 </p>
+                <code className="inline-block border border-border px-3 py-1.5 font-mono text-xs text-trust-crew">
+                  {step.command}
+                </code>
               </div>
             </li>
           ))}
         </ol>
+      </section>
 
-        <div className="mt-10 grid gap-8 bg-[var(--bauhaus-ink)] p-8 text-white sm:p-12 lg:grid-cols-[1fr_auto] lg:items-center">
-          <div>
-            <p className="text-xs font-black uppercase tracking-[0.2em] text-white/50">
-              The division of responsibility
-            </p>
-            <h2 className="mt-4 max-w-3xl text-3xl font-black uppercase leading-tight tracking-[-0.04em] sm:text-4xl">
-              MUON handles coordination. People set direction, approve
-              consequential actions, and decide what ships.
-            </h2>
-          </div>
-          <Link
-            className="border-2 border-white bg-[var(--bauhaus-yellow)] px-5 py-4 text-center text-sm font-black uppercase tracking-[0.1em] text-[var(--bauhaus-ink)]"
-            href="/product/human-control"
-          >
-            Human control
+      <section className="border-b border-border py-20 lg:py-28">
+        <SectionHead
+          eyebrow="In your terminal"
+          title="What it looks like from a Claude Code session."
+          note="Same mission, driven from a chat session over MCP: MUON checks memory before the edit, splits the work, stops double-writes, and holds the merge for you."
+        />
+        <TerminalReplay />
+      </section>
+
+      <section className="border-b border-border py-20 lg:py-28">
+        <SectionHead
+          eyebrow="The picture"
+          title="How a mission moves through the crew."
+          note="One goal in, split into owned jobs, coordinated through shared memory, and held for your approval before it merges."
+        />
+        <CoordinationDiagram />
+      </section>
+
+
+      <section className="py-20 lg:py-28">
+        <div className="panel flex flex-col items-start justify-between gap-6 p-8 lg:flex-row lg:items-center">
+          <h2 className="max-w-[30ch] font-sans text-[1.75rem] font-semibold tracking-[-0.02em]">
+            MUON handles coordination. People decide what ships.
+          </h2>
+          <Link href="/download" className="btn-primary">
+            Install the app
           </Link>
         </div>
-
-        <div className="mt-16 grid border-2 border-[var(--bauhaus-ink)] lg:grid-cols-[0.42fr_1fr]">
-          <div className="bg-[var(--bauhaus-yellow)] p-8 sm:p-10">
-            <p className="bauhaus-eyebrow">One connected record</p>
-            <p className="mt-6 text-3xl font-black uppercase leading-tight tracking-[-0.04em]">
-              The mission stays understandable from start to finish.
-            </p>
-          </div>
-          <div className="grid gap-5 bg-white p-8 sm:grid-cols-2 sm:p-10">
-            {[
-              "The goal, the jobs, and who owns each one",
-              "Which AI tools are ready to work",
-              "Shared memory the crew can actually use",
-              "Checks, handoffs, decisions, and the final change",
-            ].map((item, index) => (
-              <div
-                className="border-t-2 border-[var(--bauhaus-ink)] pt-4"
-                key={item}
-              >
-                <span className="text-xs font-black text-[var(--bauhaus-red)]">
-                  0{index + 1}
-                </span>
-                <p className="mt-3 font-bold leading-6">{item}</p>
-              </div>
-            ))}
-          </div>
-        </div>
       </section>
-    </MarketingShell>
+    </SiteShell>
   );
 }
+
+export default HowItWorksPage;

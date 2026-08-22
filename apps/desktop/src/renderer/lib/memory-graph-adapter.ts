@@ -1,3 +1,4 @@
+import { hueOnCanvas } from "../desk-tokens.js";
 import Graph from "graphology";
 import type {
   MemoryLibraryNote,
@@ -136,7 +137,10 @@ export function activeMemoryNotes(
 export function buildMemoryGraph(
   snapshot: MemoryLibrarySnapshot,
   showUntrusted: boolean,
-  autoConfirmAgentMemory: boolean
+  autoConfirmAgentMemory: boolean,
+  /** See graph-adapter.ts: tier hues encode MEANING, so they are pushed away
+   *  from the canvas rather than replaced. Defaults to the dark canvas. */
+  canvas: string = "#141414"
 ): Graph<MemoryGraphNodeAttributes, MemoryGraphEdgeAttributes> {
   const graph = new Graph<MemoryGraphNodeAttributes, MemoryGraphEdgeAttributes>({
     multi: true,
@@ -185,7 +189,7 @@ export function buildMemoryGraph(
       // vouch next, crew-visible auto next, an open proposal the lightest.
       size:
         tier === "human" ? 9 : tier === "muon" ? 8 : tier === "auto" ? 7 : 6,
-      color: noteColor(note, tier),
+      color: hueOnCanvas(noteColor(note, tier), canvas),
       label: noteLabel(note),
       kind: "note",
       note,
@@ -195,7 +199,7 @@ export function buildMemoryGraph(
     graph.addNode(anchorId, {
       ...seedPosition(),
       size: 5,
-      color: ANCHOR_COLOR,
+      color: hueOnCanvas(ANCHOR_COLOR, canvas),
       label: meta.value,
       kind: "anchor",
       anchorKind: meta.kind,
@@ -206,7 +210,7 @@ export function buildMemoryGraph(
     if (!anchorMeta.has(anchorId)) return; // beyond ANCHOR_CAP — no dangling edge
     graph.addEdge(noteId, anchorId, {
       size: 1,
-      color: EDGE_ANCHOR_COLOR,
+      color: hueOnCanvas(EDGE_ANCHOR_COLOR, canvas),
       edgeKind: "anchor",
       type: "line",
     });
@@ -230,7 +234,7 @@ export function buildMemoryGraph(
         noteNodeId(edge.toId),
         {
           size: 1.5,
-          color: edgeColorFor(edge.kind),
+          color: hueOnCanvas(edgeColorFor(edge.kind), canvas),
           edgeKind: edge.kind,
           type: "line",
         }

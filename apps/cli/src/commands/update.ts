@@ -3,6 +3,14 @@ import type { Command } from "commander";
 import { failCommand } from "../lib/refusal.js";
 import { readCliVersion } from "../lib/app-version.js";
 import {
+  describeDesktopOutcome,
+  desktopUpdateVerdict,
+  hostSchemeRefusal,
+  realDesktopUpdateIo,
+  updateDesktopApp,
+  type DesktopUpdateIo,
+} from "../lib/desktop-update.js";
+import {
   DEFAULT_DOWNLOAD_HOST,
   decideUpdate,
   describeVerdict,
@@ -41,71 +49,183 @@ function runInstall(host: string): Promise<number> {
 }
 
 /**
- * `muon update` — bring this install up to the latest published release.
+ * `muon update` — bring EVERYTHING this machine runs up to the latest release.
  *
- * The CLI/TUI ship as an npm tarball from MUON's own download host (no
- * registry, no package manager to keep in step), which means an installed copy
- * has no way to learn that a newer one exists. Before this, "update" meant
- * remembering the curl one-liner and running it again.
+ * Two halves, one command (founder requirement, 2026-08-19: "update SHOULD
+ * auto-update all aspects"):
  *
- * It does NOT touch the desktop app or the brain: those have their own signed
- * update path, and a CLI command that silently replaced the app would be
- * changing something the operator did not ask about.
+ *  1. The npm half: `muon`/`muon-tui`/`muon-mcp` ship as a tarball from MUON's
+ *     own download host; `npm install -g` replaces them (and materializes the
+ *     pinned `gitnexus` beside them).
+ *  2. The desktop half (macOS): MUON.app — which is also where the embedded
+ *     BRAIN lives (Resources/backend; the CLI and TUI spawn it from the
+ *     installed app) — is updated from the same feed the in-app updater reads,
+ *     sha512-verified before anything is touched (ADR-0029's rule, held from
+ *     the outside). A RUNNING app is never replaced: that half refuses with
+ *     the remedy named, and the in-app Settings → Updates path remains.
+ *
+ * `--cli-only` / `--desktop-only` narrow it when the operator means one half.
  */
-export function registerUpdateCommand(program: Command) {
+export function registerUpdateCommand(
+  program: Command,
+  desktopIo?: DesktopUpdateIo
+) {
   program
     .command("update")
-    .description("update the MUON CLI + TUI to the latest published release")
+    .description(
+      "update MUON — CLI, TUI, MCP, and the desktop app (brain included) — to the latest published release"
+    )
     .option("--check", "report what is available and exit, changing nothing")
-    .option("--dry-run", "print the exact install command instead of running it")
+    .option("--dry-run", "print what would run instead of running it")
+    .option("--cli-only", "update only the CLI/TUI/MCP half")
+    .option("--desktop-only", "update only the desktop app half")
     .option(
       "--host <url>",
       "release host to read from",
       process.env.MUON_DOWNLOAD_HOST || DEFAULT_DOWNLOAD_HOST
     )
     .action(
-      async (options: { check?: boolean; dryRun?: boolean; host: string }) => {
+      async (options: {
+        check?: boolean;
+        dryRun?: boolean;
+        cliOnly?: boolean;
+        desktopOnly?: boolean;
+        host: string;
+      }) => {
         try {
-          const installed = await readCliVersion(import.meta.url);
-          const latest = await fetchLatestVersion(options.host);
-          const verdict = decideUpdate(installed, latest);
-          process.stdout.write(`${describeVerdict(verdict)}\n`);
+          // https for the WHOLE command, not just the desktop half. The CLI
+          // half is the HIGHER-risk one: `npm install -g <url>` executes the
+          // tarball's lifecycle scripts, so a plaintext --host (or
+          // MUON_DOWNLOAD_HOST) hands a network position code execution.
+          const schemeRefusal = hostSchemeRefusal(options.host);
+          if (schemeRefusal) {
+            failCommand(new Error(schemeRefusal), "Update refused.");
+            return;
+          }
+          if (options.cliOnly && options.desktopOnly) {
+            // Both narrows at once select nothing — refuse rather than print
+            // nothing and exit 0, which reads as a successful update.
+            failCommand(
+              new Error(
+                "--cli-only and --desktop-only exclude each other; pass one or neither."
+              ),
+              "Update refused."
+            );
+            return;
+          }
+          if (options.desktopOnly && process.platform !== "darwin") {
+            // A silent no-op is indistinguishable from a successful update.
+            process.stdout.write(
+              "desktop app: MUON.app is distributed for macOS only — nothing to update on this platform.\n"
+            );
+            return;
+          }
+          const doCli = !options.desktopOnly;
+          const doDesktop = !options.cliOnly && process.platform === "darwin";
+          const io = desktopIo ?? realDesktopUpdateIo();
+          let cliAvailable = false;
+          let desktopAvailable = false;
+
+          if (doCli) {
+            const installed = await readCliVersion(import.meta.url);
+            const latest = await fetchLatestVersion(options.host);
+            const verdict = decideUpdate(installed, latest);
+            process.stdout.write(`${describeVerdict(verdict)}\n`);
+            cliAvailable = verdict.kind === "available";
+
+            if (!options.check && cliAvailable) {
+              if (options.dryRun) {
+                process.stdout.write(
+                  `would run: npm ${installArgv(options.host).join(" ")}\n`
+                );
+              } else {
+                process.stdout.write(
+                  `updating from ${latestTarballUrl(options.host)} …\n`
+                );
+                const code = await runInstall(options.host);
+                if (code !== 0) {
+                  // A failed global install is usually EACCES, and `sudo npm`
+                  // is the wrong remedy — it leaves root-owned files that
+                  // break every later install.
+                  failCommand(
+                    new Error(
+                      "npm install failed. If this is a permissions error, configure a user-writable npm prefix (https://docs.npmjs.com/resolving-eacces-permissions-errors) rather than using sudo, then re-run `muon update`."
+                    ),
+                    "Update failed."
+                  );
+                  return;
+                }
+                process.stdout.write(
+                  `updated to ${latest}. Open a new shell if \`muon --version\` still reports the old one.\n`
+                );
+              }
+            }
+          }
+
+          if (doDesktop) {
+            if (options.check || options.dryRun) {
+              const check = await desktopUpdateVerdict(options.host, io);
+              if (check.kind === "not-installed") {
+                process.stdout.write(
+                  "desktop app: not installed on this machine — skipped.\n"
+                );
+              } else if (check.kind === "feed-unreadable") {
+                // Same rule as `uncomparable` below, and as the CLI half
+                // (whose fetchLatestVersion throw exits 1): a state that could
+                // not be DETERMINED must never exit 0 — a gating script would
+                // read a dead feed as "nothing to do" forever.
+                process.stdout.write(
+                  `desktop app: could not read the release feed — ${check.reason}\n`
+                );
+                process.exitCode = 1;
+              } else if (check.kind === "uncomparable") {
+                // The feed parsed; a VERSION is the problem (hand-edited
+                // Info.plist, typo'd feed). Named as such, and exit 1: an
+                // install whose version cannot be read is an anomaly a script
+                // must not read as "nothing to do".
+                process.stdout.write(
+                  `desktop app: version not comparable — ${check.reason}\n`
+                );
+                process.exitCode = 1;
+              } else {
+                desktopAvailable = check.verdict.kind === "available";
+                process.stdout.write(
+                  `desktop app: ${describeVerdict(check.verdict).replace(
+                    /^muon /,
+                    "MUON.app "
+                  )}\n`
+                );
+                if (options.dryRun && desktopAvailable) {
+                  process.stdout.write(
+                    `would update ${check.appPath} in place (sha512-verified staged swap).\n`
+                  );
+                }
+              }
+            } else {
+              const outcome = await updateDesktopApp(options.host, io);
+              process.stdout.write(`${describeDesktopOutcome(outcome)}\n`);
+              // A refused-while-running desktop half is not a FAILED command,
+              // but it is not a completed one either: exit 11 so a script (or
+              // the founder) can tell "everything updated" from "one half is
+              // waiting on a quit". `failed` keeps the ordinary failure exit.
+              if (outcome.kind === "running") process.exitCode = 11;
+              if (outcome.kind === "failed") process.exitCode = 1;
+            }
+          }
 
           if (options.check) {
             // Exit code carries the answer so a script can gate on it without
-            // parsing prose: 0 = nothing to do, 10 = an update is available.
-            process.exitCode = verdict.kind === "available" ? 10 : 0;
-            return;
+            // parsing prose: 0 = nothing to do, 10 = an update is available,
+            // 1 = a state that could not be determined (dead feed,
+            // uncomparable version). The ANOMALY wins over "available": exit
+            // codes exist for the unattended consumer, and an unattended
+            // consumer must be pulled to the broken half — the pending update
+            // is not lost, the next run after the feed is fixed still
+            // reports 10. Both facts are always printed above.
+            if (!process.exitCode) {
+              process.exitCode = cliAvailable || desktopAvailable ? 10 : 0;
+            }
           }
-          if (verdict.kind !== "available") {
-            return;
-          }
-          if (options.dryRun) {
-            process.stdout.write(
-              `would run: npm ${installArgv(options.host).join(" ")}\n`
-            );
-            return;
-          }
-
-          process.stdout.write(
-            `updating from ${latestTarballUrl(options.host)} …\n`
-          );
-          const code = await runInstall(options.host);
-          if (code !== 0) {
-            // A failed global install is usually EACCES, and `sudo npm` is the
-            // wrong remedy — it leaves root-owned files that break every later
-            // install.
-            failCommand(
-              new Error(
-                "npm install failed. If this is a permissions error, configure a user-writable npm prefix (https://docs.npmjs.com/resolving-eacces-permissions-errors) rather than using sudo, then re-run `muon update`."
-              ),
-              "Update failed."
-            );
-            return;
-          }
-          process.stdout.write(
-            `updated to ${latest}. Open a new shell if \`muon --version\` still reports the old one.\n`
-          );
         } catch (error) {
           failCommand(error, "Update check failed.");
         }

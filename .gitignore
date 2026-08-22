@@ -81,8 +81,12 @@ docs/competitive/
 
 #pvt
 PLAN.md
-# release pipeline staging dir
+# release pipeline staging dirs. BOTH spellings: the pipeline writes
+# `.release-stage`, but a hand-run `npm pack` left `apps/cli/.release-staged`
+# behind, which this rule missed by one letter — so a `git add -A` would have
+# committed a 600KB tarball.
 .release-stage/
+.release-staged/
 .env
 
 # Third-party agent skills installed by a vendor wizard into this repo's

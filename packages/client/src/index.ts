@@ -22,6 +22,7 @@ export {
 // surface that renders provenance must branch on this, or an outage looks
 // like "no provenance" — a different and false claim.
 export type { MemoryGraphDegraded } from "./api-client.js";
+export type { DeskDigest, DeskDigestSection } from "./api-client.js";
 // What approving a `merge` gate DID — the field the client used to drop, which
 // is why every surface could only ever say "approved" and never "landed as
 // <sha>". Consumed by the desktop Changes panel's land action.
@@ -230,8 +231,16 @@ export {
   REMEMBER_ACTION_TTL_MS,
   REMEMBER_ACTION_SCOPE_SENTENCE,
   REMEMBER_ACTION_INELIGIBLE_SENTENCE,
+  // ADR-0056: the `always` grade's vocabulary, beside the receipt's, so a
+  // surface reads both grades out of ONE module.
+  ALWAYS_ACTION_GRANT_DURATION,
+  ALWAYS_ACTION_SCOPE_SENTENCE,
+  ALWAYS_ACTION_INELIGIBLE_SENTENCE,
 } from "./approval-review.js";
-export type { ApprovalReview } from "./approval-review.js";
+export type {
+  ApprovalGrantDuration,
+  ApprovalReview,
+} from "./approval-review.js";
 export { selectOneApprovableCard } from "./approvable-inbox.js";
 export type { ApprovableInbox } from "./approvable-inbox.js";
 export { buildAutonomyCommitments } from "./autonomy-commitments.js";
@@ -460,6 +469,7 @@ export type {
   ScheduleOccurrenceStatus,
   VendorReadiness,
   ApprovalReceipt,
+  ApprovalGrant,
   ApprovalRequest,
   ApprovalStatus,
   Assignment,
@@ -747,6 +757,8 @@ export type {
   CoordinationSnapshot,
   CrewRolePlan,
   FileClaim,
+  MessageCitationAudits,
+  CitationAuditEntry,
   PeerAddress,
   PeerInbox,
   PeerMessage,
@@ -779,6 +791,23 @@ export type {
 export {
   classifyHandoffPacket,
   describeHandoffContract,
+  describeHandoffDegradation,
+  handoffContractIsDegraded,
   type ClassifiedHandoffPacket,
   type HandoffPacketContract,
 } from "./handoff-view.js";
+
+// ADR-0086 D2 — the one statement of citation provenance, shared by every
+// surface that renders a cited note id (desk, CLI; the desktop when it
+// grows the surface).
+export {
+  citationProvenanceLabel,
+  citationProvenanceLine,
+} from "./citation-view.js";
+
+// H12/A12 — the one continue-on-lane composer every surface shares.
+export {
+  buildContinuationDispatch,
+  type ContinuationPlan,
+  type ContinuationRefusal,
+} from "./continuation.js";

@@ -76,21 +76,32 @@ describe("adapter role declarations", () => {
     });
   }
 
-  it("keeps Cursor to read-only roles only", () => {
+  it("keeps Cursor to non-write roles only", () => {
     const cursor = new CursorAdapter();
     expect([...(cursor.supportedRoles ?? [])].sort()).toEqual([
       "architect",
+      // ADR-0057: the seat's role. Its authority is `coordinate`, so this
+      // ceiling is no longer "read-only" — it is NON-WRITE, which is the
+      // property that actually protects the workspace.
+      "orchestrator",
       "qa",
       "reviewer",
       "scout",
     ]);
+    // EVERY WORKER role Cursor holds forbids write tools. `orchestrator` is
+    // exempt and that exemption is the honest cost of the seat: in the role
+    // model it carries `allowsWriteTools: true` and `maxSandbox:
+    // workspace-write` (ADR-0057 D4a). For this lane the write boundary is the
+    // ADAPTER — `--mode plan` plus categorically stripped widening flags — not
+    // the role label, which is why the seat is accepted anyway.
     for (const role of cursor.supportedRoles ?? []) {
-      expect(ROLE_SPECS[role].authority).toBe("read-only");
+      if (role === "orchestrator") continue;
       expect(ROLE_SPECS[role].allowsWriteTools).toBe(false);
+      expect(ROLE_SPECS[role].authority).toBe("read-only");
     }
-    // The three write/coordinate roles are refused at the ceiling, before any
-    // capability or affinity arithmetic can rank around them.
-    for (const role of ["implementer", "docs", "orchestrator"] as const) {
+    // The WRITE roles are refused at the ceiling, before any capability or
+    // affinity arithmetic can rank around them.
+    for (const role of ["implementer", "docs"] as const) {
       expect(cursor.supportedRoles).not.toContain(role);
     }
   });
@@ -100,10 +111,11 @@ describe("adapter role declarations", () => {
     // Stated POSITIVELY: the whole ceiling is one role. Asserting the exact
     // array (rather than a list of absences) is what makes a future widening
     // fail here instead of sliding through as an unlisted role.
-    expect([...opencode.supportedRoles]).toEqual(["scout"]);
+    // ADR-0057 added `orchestrator` for the SEAT. The WORKER ceiling is still
+    // exactly one role, which is what this test guards.
+    expect([...opencode.supportedRoles]).toEqual(["orchestrator", "scout"]);
     // Every role it does NOT hold, named, so the refusals are pinned too.
     for (const role of [
-      "orchestrator",
       "implementer",
       "docs",
       "reviewer",

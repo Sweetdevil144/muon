@@ -24,9 +24,11 @@ import {
   attemptOutcomeSchema,
   matchesMemoryFilter,
   memoryAccessTypeSchema,
+  memoryImpactClaimSchema,
   memoryIngestPolicySchema,
   memoryLifecyclePolicySchema,
   memoryLibraryOrderBySchema,
+  parseStoredImpactClaim,
   noteDerivationSchema,
   noteReviewStatusSchema,
   parseMemoryFilterJson,
@@ -46,20 +48,34 @@ import {
 import { readActivity } from "../lib/activity.js";
 import { selectCodeGraphProvider } from "../lib/codegraph.js";
 import { prisma } from "../lib/db.js";
+import {
+  decisionHistoryForNote,
+  noteIdsFromNotes,
+  noteIdsFromTraversalNodes,
+  memoryCallerScope,
+  serveNoteContent,
+  type MemoryCallerScope,
+} from "../lib/memory-offers.js";
 import { readDuplicateWork } from "../lib/duplicate-work.js";
 import { getEmbedder, getGraph } from "../lib/graph.js";
 import {
+  listMemoryPartitionTotals,
+  mintContradictionEdge,
   applyMemoryExpiry,
   backfillMemoryNoteWorkspace,
   cloneMemoryNote,
   compactMemory,
   deleteMemoryNote,
   getMemoryNote,
+  memoryNoteGroundingScope,
   resolveMemoryNoteByIdOrPrefix,
   ingestMemoryNote,
   listMemoryLibrary,
+  listOwnershipCanon,
   listStandingDecisionLog,
   migrateMemoryLifecyclePolicy,
+  migrateOwnershipKindRecasts,
+  OWNERSHIP_TOPIC_TAGS,
   MemoryLifecyclePreviewMismatchError,
   MemoryPreviewStaleError,
   promoteMemoryNoteToGlobal,
@@ -69,6 +85,11 @@ import {
   updateMemoryNote,
   type MemoryExpiryState,
 } from "../lib/memory-ledger.js";
+import {
+  classifyWithheldDisclosure,
+  crewReadable,
+  withheldResponseFields,
+} from "../lib/memory-withheld.js";
 import { collectMemoryPack } from "../lib/memory-pack.js";
 import { importMemoryPack } from "../lib/memory-pack-import.js";
 import {
@@ -164,7 +185,7 @@ function degradedTraversalProvenance(root: string, hops: number) {
 }
 
 const createNoteSchema = z.object({
-  kind: z.enum(["decision", "constraint", "convention", "attempt", "question"]),
+  kind: z.enum(["decision", "constraint", "convention", "attempt", "question", "ownership"]),
   text: z.string().min(3),
   taskId: z.string().min(1).optional(),
   laneId: z.string().min(1).optional(),
@@ -204,6 +225,17 @@ const createNoteSchema = z.object({
   scope: z.string().min(1).optional(),
   // Substrate §3.4: meaningful only when kind === "attempt".
   outcome: attemptOutcomeNullableSchema.optional(),
+  // ADR-0091 D1: the ownership kind's structured "whom to ask" — principal
+  // strings. Orientation, never authority (D2): naming an owner routes
+  // nothing. Refused below on any other kind (the outcome rule, enforced
+  // loudly instead of silently dropped).
+  owners: z.array(z.string().min(1).max(200)).max(20).optional(),
+  // ADR-0063: the machine-readable impact claim. The schema IS the gate —
+  // a malformed claim is a 400 here, never a stored row the grounding verb
+  // can only shrug at. Optional and authority-inert: a claim reorders no
+  // read and grants nothing; it only makes the note's blast-radius
+  // assertion diffable by `memory_ground`.
+  impactClaim: memoryImpactClaimSchema.optional(),
 });
 
 // Bitemporal as-of param (F1 / KG-5). REJECT an unparseable value (→ 400) and
@@ -422,12 +454,14 @@ function crewReadableMemoryView<
   // and briefs keep the stricter bar (`vouchedForCrew` in @muon/core admits
   // only human-confirmed or orchestrator-vouched notes) — explicit recall is
   // the documented "reachable, flagged as suspect" surface.
-  return notes.filter(
-    (note) =>
-      note.confirmedBy === "human" ||
-      (options.crewVisible &&
-        Boolean(options.chatId) &&
-        note.chatId === options.chatId)
+  // ONE predicate with the ADR-0061 disclosure classifier (review finding:
+  // serving eligibility and disclosure eligibility must not drift).
+  return notes.filter((note) =>
+    crewReadable(note, {
+      tier: options.tier,
+      ...(options.chatId ? { chatId: options.chatId } : {}),
+      crewVisible: options.crewVisible,
+    })
   );
 }
 
@@ -561,17 +595,10 @@ function writeTrust(
     : claimed;
 }
 
-type MemoryCallerScope = {
-  chatId?: string;
-  taskId?: string;
-  jobId?: string;
-  /** ADR-0026: the canonical repo root this caller's memory belongs to. Present
-   *  only for the agent tier, where it is DERIVED from authenticated state; an
-   *  operator caller has no derived workspace (its explicit coordinate arrives
-   *  with the read surfaces, ADR-0026 §11 step 4). */
-  workspacePath?: string;
-  principal: string;
-};
+// MemoryCallerScope + memoryCallerScope moved to lib/memory-offers.ts (the
+// 0088 direction, first step): the 0069 pre-answer needed the SAME
+// derivation and a second spelling in routes/questions.ts was the
+// alternative.
 
 /**
  * ADR-0026 §11 step 3 — the READ coordinate, resolved once for every read route.
@@ -743,35 +770,6 @@ async function memoryReadWorkspace(
 // `DispatchJob` rows carry a worktree-shaped path, so the capability value is
 // already the parent repo — and `repoRootOf` is the belt-and-braces that keeps it
 // so, because "already true" is not an invariant.
-async function memoryCallerScope(
-  app: FastifyInstance,
-  request: FastifyRequest,
-  claimedChatId?: string
-): Promise<MemoryCallerScope> {
-  if (request.tier === "operator") {
-    return {
-      ...(claimedChatId ? { chatId: claimedChatId } : {}),
-      principal: "human",
-    };
-  }
-  const capability = requireAgentJobCapability(app, request);
-  const chatId = agentMemoryPartition(capability);
-  if (claimedChatId && claimedChatId !== chatId) {
-    throw app.httpErrors.forbidden(
-      "The requested memory partition is outside this job capability."
-    );
-  }
-  const workspacePath = capability.workspacePath
-    ? await repoRootOf(capability.workspacePath)
-    : undefined;
-  return {
-    chatId,
-    taskId: capability.taskId,
-    jobId: capability.jobId,
-    ...(workspacePath ? { workspacePath } : {}),
-    principal: agentJobPrincipal(capability),
-  };
-}
 
 export async function registerMemoryRoutes(app: FastifyInstance) {
   app.post("/", async (request, reply) => {
@@ -781,6 +779,14 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     // governance act.
     if (payload.scope === "global") {
       requireOperator(app, request);
+    }
+    // ADR-0091: owners is only meaningful on the ownership kind — refused
+    // loudly on any other, never silently dropped (a caller that sent it
+    // meant something by it).
+    if (payload.owners && payload.owners.length > 0 && payload.kind !== "ownership") {
+      throw app.httpErrors.badRequest(
+        "owners is only accepted on kind 'ownership' — it names who owns the surface, and no other kind has one."
+      );
     }
     const caller = await memoryCallerScope(app, request, payload.chatId);
     // PRINCIPAL FROM AUTH (P3-A / closes H2): the author is derived from the
@@ -820,6 +826,14 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       plannedCoordinates: payload.plannedCoordinates,
       scope: payload.scope,
       outcome: payload.outcome ?? undefined,
+      // ADR-0091 D2: owners is a caller COORDINATE — orientation, never
+      // authority. The ledger stores it only on the ownership kind.
+      ...(payload.owners && payload.owners.length > 0
+        ? { owners: payload.owners }
+        : {}),
+      // ADR-0063: already schema-validated above; a caller COORDINATE-class
+      // field (it asserts a measurement, never an authority).
+      ...(payload.impactClaim ? { impactClaim: payload.impactClaim } : {}),
       trust: writeTrust(request.tier, payload.trust),
       createdBy,
       // Agent-authored memory is always a proposal. Even an equal-trust agent
@@ -844,9 +858,18 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
         ? { sourceType: "job", rawRef: `job:${caller.jobId}` }
         : { sourceType: request.tier === "operator" ? "human" : "agent" },
     });
+    // ADR-0060 via 0088's boundary: a session has read what it wrote — the
+    // created (or deduped) note rides back SERVED (recorded + branded).
+    const servedCreated = await serveNoteContent(
+      caller,
+      "add",
+      result.note,
+      noteIdsFromNotes([result.note]),
+      app.log
+    );
     reply.code(201);
     return {
-      note: result.note,
+      note: servedCreated,
       action: result.action,
       relatedNoteId: result.relatedNoteId ?? null,
     };
@@ -896,7 +919,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     // one of four open is how a bounded surface stays broken — see the guard
     // block above `GRAPH_DEGRADED_REASON_CHARS`.
     const found = await getGraph()
-      .searchMemory(q, 20, {
+      .searchMemoryDisclosed(q, 20, {
         asOf: normalizeAsOf(asOf),
         scope,
         chatId: caller.chatId,
@@ -910,17 +933,48 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     if ("degraded" in found) {
       return { notes: [], ...found };
     }
-    const reconciled = await governedMemoryView(found, {
-      showExpired: request.tier === "operator" && flagEnabled(showExpired),
+    const showExpiredView =
+      request.tier === "operator" && flagEnabled(showExpired);
+    const reconciled = await governedMemoryView(found.notes, {
+      showExpired: showExpiredView,
       filter: memoryFilter,
       asOf: normalizeAsOf(asOf),
     });
+    const servedNotes = crewReadableMemoryView(reconciled, {
+      tier: request.tier,
+      chatId: caller.chatId,
+      crewVisible,
+    });
+    // ADR-0061: everything this route did NOT serve is classified — the
+    // graph's own candidates plus the main-set rows the pipeline above
+    // dropped (the ledger's expired verdicts live only here). Fence-class
+    // drops stay silent inside the classifier.
+    const servedIds = new Set(servedNotes.map((note) => note.id));
+    const disclosure = await classifyWithheldDisclosure({
+      candidates: [
+        ...found.withheldCandidates,
+        ...found.notes
+          .filter((note) => !servedIds.has(note.id))
+          .map((note) => ({ note, reason: "cap" as const })),
+      ],
+      tier: request.tier,
+      chatId: caller.chatId,
+      crewVisible,
+      memoryFilter,
+      asOf: normalizeAsOf(asOf),
+      showExpiredView,
+    });
+    // ADR-0060 via 0088's boundary: the ledger records what was SERVED —
+    // the bounded, fenced, crew-filtered list, after every gate above.
     return {
-      notes: crewReadableMemoryView(reconciled, {
-        tier: request.tier,
-        chatId: caller.chatId,
-        crewVisible,
-      }),
+      ...withheldResponseFields(disclosure),
+      notes: await serveNoteContent(
+        caller,
+        "search",
+        servedNotes,
+        noteIdsFromNotes(servedNotes),
+        app.log
+      ),
     };
   });
 
@@ -1128,7 +1182,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
         symbol: z.string().min(1).optional(),
         topic: z.string().min(1).optional(),
         kind: z
-          .enum(["decision", "constraint", "convention", "attempt", "question"])
+          .enum(["decision", "constraint", "convention", "attempt", "question", "ownership"])
           .optional(),
         outcome: attemptOutcomeSchema.optional(),
         relatedToTask: z.string().min(1).optional(),
@@ -1137,6 +1191,12 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
         // partition (human-confirmed is exactly the tier that crosses chats).
         // A read knob like `showExpired`, stripped before the spread below.
         standing: boolFlagSchema,
+        // ADR-0051 §3 — the institutional pack's ownership/why slice. Only
+        // meaningful WITH `standing`: widens the standing response by the
+        // human-confirmed, workspace-global, ownership-TAGGED decisions the
+        // pin requirement would drop. Never widens trust: the same strict
+        // ledger re-gate below applies, and unconfirmed ids cannot enter.
+        institutional: boolFlagSchema,
         // Bitemporal as-of + scope-aware recall (KG-5). Default (absent) = the
         // current active, all-scope set, unchanged. asOf travels transaction +
         // valid time; scope softly restricts (D5: not hard-gated in v1).
@@ -1167,6 +1227,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       workspace: _workspace,
       unscoped: _unscoped,
       standing,
+      institutional,
       noteId: _noteId,
       ...recallFilter
     } = filter;
@@ -1210,11 +1271,39 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
         return { notes: [] };
       }
       const live = await applyMemoryExpiry([note], view);
+      const servedById = live.filter(
+        (candidate) =>
+          candidate.status === "active" &&
+          (!memoryFilter || matchesMemoryFilter(candidate, memoryFilter))
+      );
+      // ADR-0061: the caller NAMED this id and it is inside their fence —
+      // a policy-hidden answer stubs instead of reading as "no such note"
+      // (D1.2's exact purpose: the caller can now ask an operator or ground
+      // the stale one). Fence-failing ids returned [] above and still do.
+      if (servedById.length === 0) {
+        const idDisclosure = await classifyWithheldDisclosure({
+          candidates: [{ note, reason: "cap" }],
+          tier: request.tier,
+          chatId: caller.chatId,
+          crewVisible,
+          memoryFilter,
+          showExpiredView: view.showExpired,
+        });
+        // Only POLICY stubs may surface here; a live filtered/cap-classified
+        // candidate means the note was simply not policy-hidden — return the
+        // empty answer unchanged rather than inventing a stub.
+        if (idDisclosure.withheld.length > 0) {
+          return { notes: [], withheld: idDisclosure.withheld };
+        }
+      }
+      // ADR-0060 via 0088's boundary, after every gate above has run.
       return {
-        notes: live.filter(
-          (candidate) =>
-            candidate.status === "active" &&
-            (!memoryFilter || matchesMemoryFilter(candidate, memoryFilter))
+        notes: await serveNoteContent(
+          caller,
+          "recall",
+          servedById,
+          noteIdsFromNotes(servedById),
+          app.log
         ),
       };
     }
@@ -1233,33 +1322,82 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     // copies. The mirror may lag a `PATCH {confirmed:false}`, and a standing
     // note a human just un-blessed must not keep riding into briefs.
     if (flagEnabled(standing)) {
+      const institutionalEnabled = flagEnabled(institutional);
       const recalledStanding = await getGraph()
         .standingMemory({ ...readWorkspace })
         .catch((error: unknown) => graphDegraded(error));
       if ("degraded" in recalledStanding) {
         return { notes: [], ...recalledStanding };
       }
-      const [reconciled, decisionCanon] = await Promise.all([
+      const [reconciled, decisionCanon, ownershipScan] = await Promise.all([
         governedMemoryView(recalledStanding, view),
         listStandingDecisionLog({ ...readWorkspace }),
+        // ADR-0051 §3: the ownership/why slice — ledger-sourced, confirmed
+        // only, same workspace fence. Empty when the knob is off keeps the
+        // standing response byte-identical to today.
+        institutionalEnabled
+          ? listOwnershipCanon({ ...readWorkspace })
+          : Promise.resolve({ notes: [], scanComplete: true }),
       ]);
+      const ownershipCanon = ownershipScan.notes;
+      const ownershipTags = new Set<string>(OWNERSHIP_TOPIC_TAGS);
+      const ownershipTagged = (note: { topics?: string[] | null }) =>
+        (note.topics ?? []).some((topic) =>
+          ownershipTags.has(topic.toLowerCase())
+        );
       const seen = new Set<string>();
+      const servedStanding = [
+        ...decisionCanon,
+        ...ownershipCanon,
+        ...reconciled,
+      ].filter((note) => {
+        if (seen.has(note.id)) return false;
+        seen.add(note.id);
+        const standingKind =
+          note.kind === "constraint" ||
+          note.kind === "convention" ||
+          (note.kind === "decision" && note.pinned === true) ||
+          // ADR-0091: the first-class kind qualifies outright when the
+          // institutional arm is on (review finding: the canon serve
+          // returned it and this filter silently dropped it).
+          (institutionalEnabled && note.kind === "ownership") ||
+          // ADR-0051: an ownership/why-tagged confirmed decision joins the
+          // pack without a pin — the tag is the curation signal there
+          // (the D3 both-reads window).
+          (institutionalEnabled &&
+            note.kind === "decision" &&
+            ownershipTagged(note));
+        return (
+          standingKind &&
+          note.status === "active" &&
+          note.scope === "global" &&
+          !note.stale &&
+          memoryPassesGate(note, { governedOnly: true })
+        );
+      });
+      // ADR-0060: the pack arms record under their OWN surface labels,
+      // derived from the arm flags server-side — this is how dispatch-pack
+      // assembly is covered (the runner fetches these arms with the job's
+      // capability-bound client).
+      const servedPack = await serveNoteContent(
+        caller,
+        institutionalEnabled ? "institutional-pack" : "standing-pack",
+        servedStanding,
+        noteIdsFromNotes(servedStanding),
+        app.log
+      );
       return {
-        notes: [...decisionCanon, ...reconciled].filter((note) => {
-          if (seen.has(note.id)) return false;
-          seen.add(note.id);
-          const standingKind =
-            note.kind === "constraint" ||
-            note.kind === "convention" ||
-            (note.kind === "decision" && note.pinned === true);
-          return (
-            standingKind &&
-            note.status === "active" &&
-            note.scope === "global" &&
-            !note.stale &&
-            memoryPassesGate(note, { governedOnly: true })
-          );
-        }),
+        // Scan honesty rides the response: a truncated ownership scan means
+        // an absent tagged note is NOT established absent, and the pack
+        // renderer must say so instead of asserting a ledger-wide absence.
+        ...(institutionalEnabled
+          ? {
+              institutional: {
+                ownershipScanComplete: ownershipScan.scanComplete,
+              },
+            }
+          : {}),
+        notes: servedPack,
       };
     }
 
@@ -1287,18 +1425,43 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
         return { notes: [], ...traversal };
       }
       const reconciled = await governedMemoryView(traversal, view);
+      const servedRelated = crewReadableMemoryView(reconciled, {
+        tier: request.tier,
+        chatId: caller.chatId,
+        crewVisible,
+      });
+      // ADR-0061, PARTIAL BY STATED DESIGN on this branch: the traversal's
+      // graph query carries no disclosure seam yet, so only the route's own
+      // drops (ledger-expired, paused) are classified — a floor, never a
+      // guess. The general recall and search branches are exact.
+      const servedRelatedIds = new Set(servedRelated.map((note) => note.id));
+      const traversalDisclosure = await classifyWithheldDisclosure({
+        candidates: traversal
+          .filter((note) => !servedRelatedIds.has(note.id))
+          .map((note) => ({ note, reason: "cap" as const })),
+        tier: request.tier,
+        chatId: caller.chatId,
+        crewVisible,
+        memoryFilter,
+        showExpiredView: view.showExpired,
+      });
+      // ADR-0060 via 0088's boundary: this traversal seeds every worker's
+      // brief; its serves are offers exactly like a direct recall's.
       return {
-        notes: crewReadableMemoryView(reconciled, {
-          tier: request.tier,
-          chatId: caller.chatId,
-          crewVisible,
-        }),
+        ...withheldResponseFields(traversalDisclosure),
+        notes: await serveNoteContent(
+          caller,
+          "recall",
+          servedRelated,
+          noteIdsFromNotes(servedRelated),
+          app.log
+        ),
       };
     }
 
     // Normalize as-of to canonical ms-UTC-Z before it reaches the graph (F1).
     const recalled = await getGraph()
-      .recallMemory({
+      .recallMemoryDisclosed({
         ...recallFilter,
         chatId: caller.chatId,
         ...readWorkspace,
@@ -1319,17 +1482,51 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     // read is answering for. The `relatedToTask` branch above deliberately does
     // NOT thread it: that traversal takes no `asOf` in its graph query either,
     // so its answer is the current set and the ledger must judge it as one.
-    const reconciled = await governedMemoryView(recalled, {
+    const reconciled = await governedMemoryView(recalled.notes, {
       ...view,
       asOf: normalizeAsOf(filter.asOf),
     });
+    const servedRecall = crewReadableMemoryView(reconciled, {
+      tier: request.tier,
+      chatId: caller.chatId,
+      crewVisible,
+    });
+    // ADR-0061: classify what was not served — graph candidates (exact on
+    // this path: the same-fence inverted-status queries) + the pipeline's
+    // own drops, whose expiry verdicts only the ledger holds.
+    const servedRecallIds = new Set(servedRecall.map((note) => note.id));
+    const recallDisclosure = await classifyWithheldDisclosure({
+      candidates: [
+        ...recalled.withheldCandidates,
+        ...recalled.notes
+          .filter((note) => !servedRecallIds.has(note.id))
+          .map((note) => ({ note, reason: "cap" as const })),
+      ],
+      tier: request.tier,
+      chatId: caller.chatId,
+      crewVisible,
+      memoryFilter,
+      asOf: normalizeAsOf(filter.asOf),
+      showExpiredView: view.showExpired,
+    });
+    // ADR-0060 via 0088's boundary, after every gate above has run.
     return {
-      notes: crewReadableMemoryView(reconciled, {
-        tier: request.tier,
-        chatId: caller.chatId,
-        crewVisible,
-      }),
+      ...withheldResponseFields(recallDisclosure),
+      notes: await serveNoteContent(
+        caller,
+        "recall",
+        servedRecall,
+        noteIdsFromNotes(servedRecall),
+        app.log
+      ),
     };
+  });
+
+  // ADR-0061 D3 — the fence class as PARTITION TOTALS, operator only.
+  // Counts and workspace paths, nothing else: no ids, no kinds, no text.
+  app.get("/partitions", async (request) => {
+    requireOperator(app, request);
+    return { partitions: await listMemoryPartitionTotals() };
   });
 
   app.get("/library", async (request) => {
@@ -1346,7 +1543,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
           .enum(["all", "confirmed", "unconfirmed", "unvouched"])
           .default("all"),
         kind: z
-          .enum(["decision", "constraint", "convention", "attempt", "question"])
+          .enum(["decision", "constraint", "convention", "attempt", "question", "ownership"])
           .optional(),
         trust: z.enum(["low", "medium", "high"]).optional(),
         limit: z.coerce.number().int().min(1).max(200).default(200),
@@ -1586,7 +1783,7 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     workspace: z.string().min(1).max(4_096).optional(),
     unscoped: z.boolean().optional(),
     trustFloor: z.enum(["low", "medium", "high"]).optional(),
-    // R3: mem0's `show_expired` on the hero gate. Operator-only (the human Brain
+    // R3: productM1's `show_expired` on the hero gate. Operator-only (the human Brain
     // panel adjudicating a note); an agent-tier request is silently downgraded
     // to the hygienic default, exactly like `trustFloor` below.
     showExpired: z.boolean().optional(),
@@ -1951,11 +2148,21 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
         0
       ),
     });
+    // ADR-0060 via 0088's boundary: `memories` + `crewFindings` are the
+    // notes whose TEXT this response puts in front of the session; warnings
+    // and pending proposals carry ids only and are not offers.
+    const servedPreedit = await serveNoteContent(
+      caller,
+      "preedit",
+      { memories, crewFindings },
+      noteIdsFromNotes([...memories, ...crewFindings]),
+      app.log
+    );
     return {
       ...result,
       coverage,
-      memories,
-      crewFindings,
+      memories: servedPreedit.memories,
+      crewFindings: servedPreedit.crewFindings,
       warnings: result.warnings.filter(
         (warning) => visible(warning.noteId) && visible(warning.relatedNoteId)
       ),
@@ -2014,13 +2221,23 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
         ...neighbors,
       };
     }
+    const servedNodes = await redactExpiredNodes(neighbors.nodes, {
+      tier: request.tier,
+      chatId: caller.chatId,
+      crewVisible,
+    });
+    // ADR-0060: only note nodes whose TEXT was served count as offers — a
+    // redacted node disclosed existence, not content. This closes the gap
+    // where the traversal tools surfaced content with no tracking at all.
     return {
       ...neighbors,
-      nodes: await redactExpiredNodes(neighbors.nodes, {
-        tier: request.tier,
-        chatId: caller.chatId,
-        crewVisible,
-      }),
+      nodes: await serveNoteContent(
+        caller,
+        "neighbors",
+        servedNodes,
+        noteIdsFromTraversalNodes(servedNodes),
+        app.log
+      ),
     };
   });
 
@@ -2080,10 +2297,65 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
         crewVisible,
       }),
     ]);
+    // ADR-0060 via 0088's boundary: text-bearing note nodes in the served
+    // path + contradiction peers are offers (redacted nodes disclosed
+    // existence, not content).
+    const servedExplain = await serveNoteContent(
+      caller,
+      "explain",
+      { pathNodes, contradictions },
+      noteIdsFromTraversalNodes([...pathNodes, ...contradictions]),
+      app.log
+    );
+    // ADR-0060 D4 — the decision-history section of the dossier. Attached
+    // ONLY when the root note passes the caller's own read fence (the same
+    // scope check grounding uses); a fenced or missing note keeps the
+    // response exactly as it was, which discloses nothing the path
+    // machinery above did not already answer. Coordinates only — no text.
+    const ledgerNoteId = noteId.startsWith("note:")
+      ? noteId.slice("note:".length)
+      : noteId;
+    // Fail-open like the offer write: the dossier's primary contract
+    // (path + contradictions) must never become hostage to the history
+    // join. An errored build is logged and omitted — which renders the
+    // same as a fenced note, deliberately (neither is an oracle).
+    const history = await (async () => {
+      try {
+        const historyScope = await memoryNoteGroundingScope(ledgerNoteId, {
+          tier: request.tier,
+          principal: caller.principal,
+          chatId: caller.chatId,
+          workspacePath: caller.workspacePath,
+          crewVisible,
+        });
+        if (historyScope.status !== "ok") {
+          return undefined;
+        }
+        return await decisionHistoryForNote({
+          id: historyScope.note.id,
+          chatId: historyScope.note.chatId,
+          // `createdAt` on the record IS the row's transaction-time
+          // `recordedAt` (memory-ledger.ts keeps that mapping).
+          recordedAt: historyScope.note.createdAt,
+          createdBy: historyScope.note.createdBy,
+          // ADR-0026: the history joins are fenced to the note's OWN
+          // workspace partition, never inherited from the chat coincidence.
+          workspacePath: historyScope.note.workspacePath ?? null,
+          provenanceRawRef: historyScope.note.provenance?.rawRef ?? null,
+        });
+      } catch (error) {
+        app.log.error(
+          { err: error, noteId: ledgerNoteId },
+          "decision-history build failed; the explain answered without it"
+        );
+        return undefined;
+      }
+    })();
     return {
       ...explanation,
-      path: { ...explanation.path, nodes: pathNodes },
-      contradictions,
+      path: { ...explanation.path, nodes: servedExplain.pathNodes },
+      contradictions: servedExplain.contradictions,
+      ...(history ? { history } : {}),
     };
   });
 
@@ -2125,6 +2397,228 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
   // B3: clone an active note into a fresh unconfirmed proposal. Agent callers
   // are same-chat and use the server-owned crew-visible gate for unconfirmed
   // sources. The route never echoes source/clone text.
+  // ── ADR-0058: grounding — a memory claim checked against the repo ────────
+  //
+  // Two halves. The FACTS read (below) hands the caller the note's checkable
+  // coordinates; the anchor-resolution itself happens where the code graph
+  // lives (the MCP server spawns gitnexus locally — the brain does not). The
+  // WRITE (further below) persists the verdict as evidence and, on mismatch,
+  // files the contradiction proposal server-side. Grounding is provenance,
+  // never a trust promotion: nothing here touches `confirmed`, and the
+  // proposal lands UNCONFIRMED like every agent write (ADR-0051).
+
+  app.get("/:noteId/ground-facts", async (request) => {
+    const { noteId } = z
+      .object({ noteId: z.string().min(1).max(200) })
+      .parse(request.params);
+    const query = z
+      .object({ chatId: z.string().min(1).max(200).optional() })
+      .parse(request.query);
+    const caller = await memoryCallerScope(app, request, query.chatId);
+    const crewVisible =
+      request.tier === "agent" && caller.chatId
+        ? await getAutoConfirmAgentMemory()
+        : false;
+    // Read path, so the git-style prefix is honoured (the grounding WRITE
+    // below keeps exact ids — acting on an abbreviation is how the wrong
+    // note gets a stamp).
+    const resolved = await resolveMemoryNoteByIdOrPrefix(noteId);
+    if (!resolved) {
+      throw app.httpErrors.notFound(`No memory note '${noteId}'.`);
+    }
+    // THE SAME PARTITION FENCE the clone takes (review finding: without it,
+    // any known note id let an agent inspect anchors and grounding history
+    // outside its authorized partition). Forbidden reads as missing on this
+    // read path — existence must not be probeable across the boundary.
+    const scoped = await memoryNoteGroundingScope(resolved.id, {
+      tier: request.tier,
+      principal: caller.principal,
+      chatId: caller.chatId,
+      workspacePath: caller.workspacePath,
+      crewVisible,
+    });
+    if (scoped.status !== "ok") {
+      throw app.httpErrors.notFound(`No memory note '${noteId}'.`);
+    }
+    const note = scoped.note;
+    const [lastGrounding, claimRow] = await Promise.all([
+      prisma.memoryGrounding.findFirst({
+        where: { noteId: note.id },
+        orderBy: { at: "desc" },
+      }),
+      // ADR-0063: the stored claim is a checkable coordinate of this note —
+      // parsed defensively (a corrupt row reads as no claim, and the third
+      // check stays honestly not-checkable rather than throwing the read).
+      prisma.memoryNote.findUnique({
+        where: { id: note.id },
+        select: { impactClaim: true },
+      }),
+    ]);
+    return {
+      note: {
+        id: note.id,
+        kind: note.kind,
+        symbols: note.symbols,
+        modules: note.modules,
+        stale: note.stale,
+        staleSince: note.staleSince ?? null,
+        createdAt: note.createdAt,
+        impactClaim: parseStoredImpactClaim(claimRow?.impactClaim),
+      },
+      lastGrounding: lastGrounding
+        ? {
+            verdict: lastGrounding.verdict,
+            at: lastGrounding.at.toISOString(),
+            groundedBy: lastGrounding.groundedBy,
+            proposalNoteId: lastGrounding.proposalNoteId,
+          }
+        : null,
+    };
+  });
+
+  app.post("/:noteId/ground", async (request, reply) => {
+    const { noteId } = z
+      .object({ noteId: z.string().min(1).max(200) })
+      .parse(request.params);
+    // The POSITIVE list of check kinds (ADR-0058 D2) — a fourth kind is a 400
+    // until it is added here deliberately, never a silent accept.
+    const groundCheckSchema = z
+      .object({
+        kind: z.enum(["anchor-existence", "staleness", "impact-agreement"]),
+        verdict: z.enum(["holds", "mismatch", "not-checkable"]),
+        detail: z.string().min(1).max(512),
+      })
+      .strict();
+    const payload = z
+      .object({
+        checks: z.array(groundCheckSchema).min(1).max(3),
+        chatId: z.string().min(1).max(200).optional(),
+      })
+      .strict()
+      .parse(request.body);
+    // One row per kind: two verdicts for the same check is not evidence, it is
+    // a contradiction inside the stamp itself.
+    const kinds = payload.checks.map((check) => check.kind);
+    if (new Set(kinds).size !== kinds.length) {
+      throw app.httpErrors.badRequest(
+        "A grounding carries at most one row per check kind."
+      );
+    }
+    const caller = await memoryCallerScope(app, request, payload.chatId);
+    const crewVisible =
+      request.tier === "agent" && caller.chatId
+        ? await getAutoConfirmAgentMemory()
+        : false;
+    // EXACT id only — this verb writes — and the SAME partition fence the
+    // clone takes: stamping and contradicting a note is acting on it.
+    const scoped = await memoryNoteGroundingScope(noteId, {
+      tier: request.tier,
+      principal: caller.principal,
+      chatId: caller.chatId,
+      workspacePath: caller.workspacePath,
+      crewVisible,
+    });
+    if (scoped.status === "missing") {
+      throw app.httpErrors.notFound(`No memory note '${noteId}'.`);
+    }
+    if (scoped.status === "forbidden") {
+      throw app.httpErrors.forbidden(scoped.reason);
+    }
+    const note = scoped.note;
+    // Overall verdict, derived HERE, not asserted by the caller: any mismatch
+    // wins; else any holds; else nothing was checkable at all — which is a
+    // truthful outcome, never a vacuous pass (ADR-0058 D4).
+    const verdict = payload.checks.some((check) => check.verdict === "mismatch")
+      ? "mismatch"
+      : payload.checks.some((check) => check.verdict === "holds")
+        ? "holds"
+        : "nothing-checkable";
+    const groundedBy = caller.principal;
+
+    let proposalNoteId: string | null = null;
+    if (verdict === "mismatch") {
+      // The contradiction proposal (ADR-0058 D3): composed SERVER-side from
+      // the typed rows, anchored where the target is anchored, and landing
+      // UNCONFIRMED through the same ingest as every agent write — the
+      // confirm gate is the same gate. `proposalOnly` unconditionally: a
+      // grounding mismatch is a machine's claim about a note, whoever ran it,
+      // and machines propose (ADR-0051).
+      const mismatches = payload.checks.filter(
+        (check) => check.verdict === "mismatch"
+      );
+      const text = `Grounding found this note's claims out of date (${mismatches
+        .map((check) => `${check.kind}: ${check.detail}`)
+        .join("; ")}). Review whether the note still holds.`;
+      const result = await ingestMemoryNote({
+        kind: "question",
+        text,
+        modules: note.modules,
+        topics: [],
+        symbols: note.symbols,
+        plannedCoordinates: [],
+        trust: "low",
+        createdBy: groundedBy,
+        proposalOnly: true,
+        ...(caller.chatId ? { chatId: caller.chatId } : {}),
+        ...(caller.workspacePath
+          ? { workspacePath: caller.workspacePath }
+          : {}),
+        provenance: caller.jobId
+          ? { sourceType: "job", rawRef: `job:${caller.jobId}` }
+          : { sourceType: "grounding", rawRef: `note:${note.id}` },
+      });
+      proposalNoteId = result.note.id;
+    }
+
+    // Edge + stamp land ATOMICALLY (review finding: a swallowed edge failure
+    // followed by a successful stamp left the contradiction undiscoverable
+    // from the note it questions). The ingest above owns its own
+    // transactionality; if THIS transaction fails, the route errors honestly
+    // and the proposal remains an unconfirmed, human-reviewable note — noise,
+    // never lost governance. The edge is an upsert so a retried grounding
+    // replays cleanly instead of tripping the @@unique.
+    const stampCreate = prisma.memoryGrounding.create({
+      data: {
+        noteId: note.id,
+        verdict,
+        checks: JSON.stringify(payload.checks),
+        groundedBy,
+        proposalNoteId,
+      },
+    });
+    const [grounding] = proposalNoteId
+      ? (await prisma.$transaction([
+          stampCreate,
+          prisma.memoryEdge.upsert({
+            where: {
+              fromId_toId_kind: {
+                fromId: proposalNoteId,
+                toId: note.id,
+                kind: "contradicts",
+              },
+            },
+            update: {},
+            create: { fromId: proposalNoteId, toId: note.id, kind: "contradicts" },
+          }),
+        ])) as [Awaited<typeof stampCreate>, unknown]
+      : [await stampCreate];
+    if (proposalNoteId) {
+      // ADR-0081 A3: the mirror leg through THE one edge spelling — the
+      // edge itself landed atomically with the stamp above, so the upsert
+      // no-ops and only the graph projection runs. Without this the
+      // grounding's contradiction was ledger-only until a full rebuild
+      // (the pre-existing half of the split-brain the review found).
+      await mintContradictionEdge(proposalNoteId, note.id);
+    }
+    reply.code(201);
+    return {
+      verdict,
+      groundingId: grounding.id,
+      at: grounding.at.toISOString(),
+      proposalNoteId,
+    };
+  });
+
   app.post("/:noteId/clone", async (request) => {
     const { noteId } = z
       .object({ noteId: traversalCoordinateSchema })
@@ -2154,8 +2648,17 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       }
       throw app.httpErrors.forbidden(result.reason);
     }
+    // ADR-0060 via 0088's boundary: the clone this session just minted
+    // joins its offer set (it has read what it wrote — same rule as ingest).
+    const servedCloneId = await serveNoteContent(
+      caller,
+      "clone",
+      result.note.id,
+      [result.note.id],
+      app.log
+    );
     return {
-      noteId: result.note.id,
+      noteId: servedCloneId,
       clonedFromNoteId: result.sourceNoteId,
       confirmed: false as const,
     };
@@ -2553,6 +3056,19 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
     }
   });
 
+  /**
+   * ADR-0091 D3 — the one-time ownership-recast sweep. Operator-invoked,
+   * dry-run by default; apply files unconfirmed recast proposals (idempotent
+   * by provenance — a filed or even rejected recast is never re-proposed).
+   */
+  app.post("/ownership-recast", async (request) => {
+    requireOperator(app, request);
+    const body = z
+      .object({ dryRun: z.boolean().default(true) })
+      .parse(request.body ?? {});
+    return await migrateOwnershipKindRecasts({ dryRun: body.dryRun });
+  });
+
   app.get("/settings/memory-compaction-retention", async (request) => {
     requireOperator(app, request);
     const retentionDays = await getMemoryCompactionRetentionDays();
@@ -2571,6 +3087,73 @@ export async function registerMemoryRoutes(app: FastifyInstance) {
       .parse(request.body);
     return {
       retentionDays: await setMemoryCompactionRetentionDays(retentionDays),
+    };
+  });
+
+  // ── H5: what memory is WAITING ON THE HUMAN, as coordinates ────────────────
+  //
+  // The agent tier has no read that can see its own partition's UNVOUCHED
+  // notes: every recall/search path runs the KG-6 gate, so an unconfirmed note
+  // is invisible there BY DESIGN, and `/library` — the review queue that does
+  // see them — is operator-tier. The result was that the one question an agent
+  // sitting beside a human most needs to answer ("what are you waiting to
+  // confirm?") had no lawful read at all.
+  //
+  // This is that read, and it is deliberately the narrowest thing that answers
+  // the question:
+  //  - IDS AND SHAPE ONLY. No `text`, no anchors, no author, no provenance. The
+  //    confirmed-only CONTENT gate is untouched because no content crosses this
+  //    wire — `kind` is a five-value enum, not prose. (The gate has been
+  //    defeated twice by a content-bearing field riding an "ids only" surface;
+  //    this route adds no field that could carry one.)
+  //  - NO ARGUMENTS. Chat/workspace come from the job capability, so there is
+  //    nothing here to point at another partition and nothing to refuse — a
+  //    foreign id is absent rather than named (ADR-0033 partition honesty).
+  //  - NO AUTHORITY. Reading that a note is pending confers nothing: confirming
+  //    it is a human act on an operator surface, and no agent tier can reach it.
+  //
+  // Sized to be a POINTER, not a page: this answers "how much is waiting and
+  // where", and the human reviews it on a MUON surface that pages properly.
+  const PENDING_MEMORY_LIMIT = 50;
+  app.get("/pending", async (request) => {
+    // The agent branch of `memoryCallerScope` derives chat, task and workspace
+    // from the capability and 403s without one. Called with no claimed chat on
+    // purpose: this route accepts no coordinate to claim.
+    const caller = await memoryCallerScope(app, request);
+    if (!caller.chatId) {
+      // Operator tier (or any caller with no partition). `/library` is the
+      // human's review queue and already answers this with far more; a
+      // partition-free read here would be the cross-workspace view §4 forbids.
+      throw app.httpErrors.forbidden(
+        "The pending-memory read is partition-scoped; it requires an active job capability. The operator review queue is GET /api/memory/library."
+      );
+    }
+    const readWorkspace = await memoryReadWorkspace(app, request, caller, {});
+    const snapshot = await listMemoryLibrary({
+      ...readWorkspace,
+      // Both fences together: `chatId` admits this partition (plus confirmed
+      // globals, which the `unvouched` predicate then drops, so nothing from
+      // another chat can survive both), `workspacePath` is applied in SQL.
+      chatId: caller.chatId,
+      status: "active",
+      // The REVIEW-QUEUE predicate: nobody has vouched, human or coordinator.
+      confirmed: "unvouched",
+      limit: PENDING_MEMORY_LIMIT,
+    });
+    return {
+      notes: snapshot.notes.map((note) => ({
+        id: note.id,
+        kind: note.kind,
+        createdAt: note.createdAt,
+      })),
+      // The ledger's OWN bound reporting, forwarded verbatim rather than
+      // recomputed from the page: a capped queue that claims to be the whole
+      // queue is an inbox that lies by omission, and `total` is a FLOOR when
+      // `totalExact` is false.
+      total: snapshot.total,
+      totalExact: snapshot.totalExact,
+      truncated: snapshot.truncated,
+      limit: PENDING_MEMORY_LIMIT,
     };
   });
 }

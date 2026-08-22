@@ -34,7 +34,7 @@ import {
   CURSOR_AUTH_UNKNOWN,
   CURSOR_INSTALL_HINT,
   CURSOR_WIDENING_FLAGS,
-  CURSOR_READ_ONLY_ROLES,
+  CURSOR_SUPPORTED_ROLES,
   CURSOR_READ_ONLY_SCOPE,
   CursorAdapter,
   cursorSupportsRole,
@@ -99,7 +99,13 @@ describe("CursorAdapter — capability honesty (TODO 2.1)", () => {
 describe("CursorAdapter — write roles are refused", () => {
   it("refuses runTask / startSession / submitTask for every write-class role", async () => {
     const adapter = authed();
-    for (const role of ["implementer", "docs", "orchestrator"] as const) {
+    // `implementer` and `docs` are the only two WRITE-authority roles in the
+    // model. `orchestrator` used to be listed here because the guard read
+    // "not read-only", not "writes" — its authority is `coordinate`, and since
+    // ADR-0057 it is accepted (a seated vendor gets a reserved coordinator
+    // lane, which its own adapter must not refuse). The write ceiling is
+    // unchanged, which is what this test is for.
+    for (const role of ["implementer", "docs"] as const) {
       await expect(
         adapter.runTask(
           { taskId: "t", brief: "b", role },
@@ -118,7 +124,7 @@ describe("CursorAdapter — write roles are refused", () => {
 
   it("accepts every read-only role in the managed slice", async () => {
     const adapter = authed();
-    for (const role of CURSOR_READ_ONLY_ROLES) {
+    for (const role of CURSOR_SUPPORTED_ROLES) {
       expect(cursorSupportsRole(role)).toBe(true);
       await expect(
         adapter.startSession({ taskId: "t", goal: "g", role })

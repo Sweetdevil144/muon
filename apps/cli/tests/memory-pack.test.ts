@@ -503,6 +503,8 @@ describe("muon memory review — vouched crew memory is not a queue", () => {
   function clientWith(notes: MemoryNote[]) {
     return {
       recallMemory: vi.fn(async () => notes),
+      // ADR-0061: `memory recall` reads the disclosed envelope now.
+      recallMemoryDisclosed: vi.fn(async () => ({ notes })),
     } as unknown as MuonApiClient;
   }
 
@@ -543,7 +545,7 @@ describe("muon memory review — vouched crew memory is not a queue", () => {
       createdBy: "agent:job:job-7",
     });
     const client = {
-      recallMemory: vi.fn(async () => [note]),
+      recallMemoryDisclosed: vi.fn(async () => ({ notes: [note] })),
       getAutoConfirmAgentMemory: vi.fn(async () => true),
     } as unknown as MuonApiClient;
     const { out } = await runMemory(client, ["recall"]);

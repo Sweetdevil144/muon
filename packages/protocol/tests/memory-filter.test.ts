@@ -51,7 +51,7 @@ function matches(value: unknown, record: MemoryFilterRecord = note): boolean {
 }
 
 describe("memory filter grammar — operators", () => {
-  it("covers every mem0 operator on the field type it is legal for", () => {
+  it("covers every productM1 operator on the field type it is legal for", () => {
     // Guards against an operator being added to the vocabulary but never wired.
     const exercised = new Set<string>();
     const cases: { filter: unknown; expected: boolean }[] = [

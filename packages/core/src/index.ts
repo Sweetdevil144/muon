@@ -11,6 +11,7 @@ export * from "./loop-evaluator.js";
 export * from "./memory-capture.js";
 export * from "./memory-extract-lane.js";
 export * from "./memory-slice.js";
+export * from "./institutional-pack.js";
 export * from "./memory-window.js";
 export * from "./muon-mcp-injection.js";
 export * from "./plan-builder.js";
@@ -28,6 +29,7 @@ export * from "./stream-recorder.js";
 export * from "./worker-preamble.js";
 export * from "./worker-final-report.js";
 export * from "./workflow-runner.js";
+export * from "./fork-seed.js";
 export * from "./worktree.js";
 export * from "./worktree-prep.js";
 export type {

@@ -65,6 +65,7 @@ const KIND_LABEL: Record<MemoryKind, string> = {
   convention: "Convention",
   attempt: "Attempt",
   question: "Question",
+  ownership: "Ownership",
 };
 
 /**
@@ -86,6 +87,8 @@ const KIND_LABEL: Record<MemoryKind, string> = {
 const COVERAGE_EMPTY_NOTICE: Record<PreEditCoverageEmptyReason, string> = {
   no_anchors:
     "No anchors resolved for this target, so the gate had nothing to look up.",
+  no_module_anchor:
+    "That target named a symbol but no file, and memory is anchored to files — so the gate had nothing to look up. Re-run with the file that defines it.",
   no_notes_on_anchors:
     "The gate looked and found no memory anchored to this radius at all \u2014 nothing is recorded here yet, not even unconfirmed.",
   withheld_no_crew_chat:

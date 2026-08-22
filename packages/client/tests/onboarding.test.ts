@@ -132,15 +132,21 @@ describe("vendorOnboardingStep (readiness → guided step)", () => {
     );
   });
 
-  it("Cursor ready copy names the managed read-only roles it actually holds", () => {
+  it("Cursor ready copy names the managed roles it actually holds", () => {
     const step = vendorOnboardingStep(cursorReady);
     expect(step.step).toBe("ready");
-    // ADR-0020: Cursor is a MANAGED read-only lane, not a "someday" integration.
+    // ADR-0020 + ADR-0057: Cursor is a MANAGED lane, and the copy answers the
+    // question a user is actually asking here — what work will MUON hand this
+    // lane? Read-only work. `orchestrator` is a SEAT, not work handed to a
+    // lane, so it is stated separately (see `summary`) instead of being folded
+    // into this list: folded in, it flipped this line to "a limited set of"
+    // and truncated the roles off the end of a 76-column TUI row.
     expect(step.guidance).toMatch(/managed for read-only crew roles only/i);
     for (const role of ["reviewer", "qa", "architect", "scout"]) {
       expect(step.guidance).toContain(role);
     }
-    expect(step.guidance).not.toMatch(/implementer|docs|orchestrator/);
+    // The write roles stay absent — that is the claim worth guarding.
+    expect(step.guidance).not.toMatch(/implementer|docs/);
     // The stale promise this replaces.
     expect(step.guidance).not.toMatch(
       /Dispatch depth expands|integration lands|takeover/i
@@ -167,9 +173,10 @@ describe("vendorOnboardingStep (readiness → guided step)", () => {
 
     const ready = vendorOnboardingStep(opencodeReady);
     expect(ready.step).toBe("ready");
-    // The scope shown is the ceiling: one role, not a wider read-only slice.
+    // The scope shown is the ceiling. Since ADR-0057 that is `orchestrator`
+    // (the seat) plus `scout` — and the WRITE roles are what must stay absent.
     expect(ready.guidance).toMatch(/scout/);
-    expect(ready.guidance).not.toMatch(/implementer|orchestrator/);
+    expect(ready.guidance).not.toMatch(/implementer|docs/);
   });
 
   it("manual fallback steps name OpenCode's real requirements (install + login, read-only)", () => {
@@ -191,25 +198,41 @@ describe("vendorRoleScope (what a lane is FOR, derived from the role model)", ()
     }
   });
 
-  it("marks Cursor read-only and role-scoped, and never claims it can implement", () => {
+  it("marks Cursor role-scoped and still never claims it can implement", () => {
     const scope = vendorRoleScope("cursor");
+    // ADR-0057 gave Cursor `orchestrator`, whose authority is `coordinate` — a
+    // third thing that is neither reading nor writing. `readOnly` describes the
+    // WORK MUON dispatches into the lane, so it stays TRUE: every worker role
+    // Cursor may hold is read-only, and the seat is reported on its own field.
     expect(scope.readOnly).toBe(true);
+    expect(scope.coordinates).toBe(true);
     expect(scope.scoped).toBe(true);
     expect(scope.takesUnplannedWork).toBe(false);
+    expect(scope.roles).toContain("orchestrator");
+    // The seat is a FIELD, not a clause inside the worker-role sentence: every
+    // surface that renders `summary` gates on `scoped`, so a seat sentence
+    // there would reach only the role-scoped lanes and never the two that have
+    // held a seat all along. The desktop lane row renders `coordinates`.
+    expect(scope.summary).not.toMatch(/coordinator seat/i);
+    expect(scope.managedFor).not.toContain("orchestrator");
+    // THE CEILING THAT MATTERS IS UNCHANGED: coordinating is not doing.
     expect(scope.roles).not.toContain("implementer");
     expect(scope.roles).not.toContain("docs");
-    expect(scope.roles).not.toContain("orchestrator");
   });
 
   it("marks OpenCode role-scoped AND read-only (scout is its whole ceiling)", () => {
     const scope = vendorRoleScope("opencode");
     expect(scope.scoped).toBe(true);
-    // The Ollama lane it replaced was `scoped` but NOT `readOnly`, because its
-    // ceiling included `docs` (a write role). OpenCode holds one read-only role,
-    // so both flags are true — a genuinely narrower lane, not a rename.
+    // ADR-0057 added `orchestrator` FOR THE SEAT. The WORKER ceiling is still
+    // exactly `scout`, which is the narrowness this test was written to guard:
+    // OpenCode can coordinate a crew it could not itself join beyond scout.
     expect(scope.readOnly).toBe(true);
+    expect(scope.coordinates).toBe(true);
+    expect(scope.managedFor).toBe("read-only crew roles only: scout");
     expect(scope.takesUnplannedWork).toBe(false);
-    expect(scope.roles).toEqual(["scout"]);
+    expect(scope.roles).toEqual(["orchestrator", "scout"]);
+    expect(scope.roles).not.toContain("implementer");
+    expect(scope.roles).not.toContain("docs");
   });
 
   it("full-role lanes are unscoped and take un-planned work", () => {
@@ -309,6 +332,8 @@ describe("buildOnboardingState (aggregate machine)", () => {
     expect(state.roleScopedVendors.map((scope) => scope.vendor)).toEqual([
       "cursor",
     ]);
+    // ADR-0057 did not change what WORK this lane can take, so this line does
+    // not change either. The seat it gained is a separate sentence.
     expect(state.subhead).toMatch(/read-only crew roles only/i);
     expect(state.subhead).toMatch(/reviewer, qa, architect, scout/);
     expect(state.subhead).toMatch(/can implement \(Claude Code or Codex\)/);

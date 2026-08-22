@@ -1,4 +1,5 @@
 import {
+  citationProvenanceLine,
   listPeerMessages,
   loadCoordinationSnapshot,
   loadCrewRoles,
@@ -10,6 +11,7 @@ import {
   type CrewRolePlan,
   type CrewRolesView,
   type MuonApiClient,
+  type MessageCitationAudits,
   type PeerMessage,
   type RoleAuthority,
 } from "@muon/client";
@@ -152,6 +154,18 @@ export type CrewMessageRow = {
   body: string;
   /** UNTRUSTED coordinates, sanitized. */
   refs: string[];
+  /** ADR-0086 D2 — one line per CITED note id, each carrying its derived
+   *  offered provenance from the ONE shared classifier
+   *  (`citationProvenanceLine`, @muon/client). Flagged never drops: an
+   *  unoffered citation renders WITH its relay label, and a citation with
+   *  no verdict (unreadable ledger, older server) renders with no
+   *  provenance claim at all — never an accusation. */
+  citations: string[];
+  /** The message's announced finding (`memoryNoteId`), when it carries
+   *  one — a COORDINATE, deliberately not in `citations`: it is the
+   *  sender's own minted note, not an offers question, and a renderer
+   *  must never apply citation provenance to it. Sanitized. */
+  finding?: string;
 };
 
 export type CrewCoordinationSection =
@@ -260,16 +274,41 @@ function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-export function buildMessageRows(messages: PeerMessage[]): CrewMessageRow[] {
-  return messages.map((message) => ({
-    id: terminalSafe(message.id),
-    kind: message.kind,
-    from: `${message.fromRole}/${terminalSafe(message.fromVendor)}`,
-    to: describeAddress(message),
-    subject: clip(terminalSafe(message.subject), SUBJECT_DISPLAY_CHARS),
-    body: clip(terminalSafe(message.body), BODY_DISPLAY_CHARS),
-    refs: [...message.refs.files, ...message.refs.symbols].map(terminalSafe),
-  }));
+export function buildMessageRows(
+  messages: PeerMessage[],
+  citationAudits?: MessageCitationAudits
+): CrewMessageRow[] {
+  return messages.map((message) => {
+    const audit = citationAudits?.find(
+      (entry) => entry.messageId === message.id
+    );
+    // ADR-0086 D2: every cited id yields a line (flagged never DROPS); the
+    // provenance sentence is the shared classifier's, never this desk's.
+    // The announced finding (`memoryNoteId`) is the sender's own minted
+    // note — a coordinate, not an offers question — so it renders as a
+    // plain citation with no provenance claim.
+    const citedIds = message.refs.noteIds ?? [];
+    const citations = citedIds.map((noteId) =>
+      citationProvenanceLine(
+        terminalSafe(noteId),
+        noteId,
+        audit?.citations
+      )
+    );
+    return {
+      id: terminalSafe(message.id),
+      kind: message.kind,
+      from: `${message.fromRole}/${terminalSafe(message.fromVendor)}`,
+      to: describeAddress(message),
+      subject: clip(terminalSafe(message.subject), SUBJECT_DISPLAY_CHARS),
+      body: clip(terminalSafe(message.body), BODY_DISPLAY_CHARS),
+      refs: [...message.refs.files, ...message.refs.symbols].map(terminalSafe),
+      citations,
+      ...(message.memoryNoteId
+        ? { finding: terminalSafe(message.memoryNoteId) }
+        : {}),
+    };
+  });
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -394,7 +433,7 @@ async function loadCoordination(
     missionId,
   };
   try {
-    const [snapshot, messages] = await Promise.all([
+    const [snapshot, transcript] = await Promise.all([
       loadCoordinationSnapshot(shared),
       listPeerMessages({ ...shared, limit: input.limit ?? CREW_MESSAGE_LIMIT }),
     ]);
@@ -403,7 +442,10 @@ async function loadCoordination(
       missionId,
       participants: buildParticipantRows(snapshot),
       conflicts: buildConflictRows(snapshot),
-      messages: buildMessageRows(messages),
+      messages: buildMessageRows(
+        transcript.messages,
+        transcript.citationAudits
+      ),
       messageCount: snapshot.messageCount,
     };
   } catch (error) {

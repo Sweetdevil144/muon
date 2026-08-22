@@ -361,6 +361,17 @@ describe("agent-facing MCP UI contract", () => {
           fixHint: "Cursor is not dispatch-ready",
         },
       ]),
+      // A13: fleet_status now also joins the crew's open blocking questions.
+      // Mocked here as an EMPTY but SUCCESSFUL read, because that is what this
+      // test is about — a mock missing the method is a genuinely unavailable
+      // read, and the tool is required to degrade loudly for it (proved in
+      // dispatch-open-questions.test.ts). Omitting it here would have this
+      // test assert `degradation.active: false` against a payload that could
+      // not see whether anyone was blocked.
+      listCrewOpenQuestions: vi.fn(async () => ({
+        questions: [],
+        truncated: false,
+      })),
     } as unknown as MuonApiClient;
 
     const result = await orchestratorTool(
@@ -384,6 +395,10 @@ describe("agent-facing MCP UI contract", () => {
             // Not connected here, so the boundary is the setup one and the
             // action stays the vendor's own fix hint.
             boundary: "setup-required",
+            // DISPATCHABLE roles only. ADR-0057 put `orchestrator` in Cursor's
+            // ceiling, but the dispatch route refuses it as a task role — and
+            // this row is what the crew planner routes on, so offering it here
+            // would build a plan around a guaranteed 400. No write role either.
             dispatchRoles: ["reviewer", "qa", "architect", "scout"],
             action: "Cursor is not dispatch-ready",
           },

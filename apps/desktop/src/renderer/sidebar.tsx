@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type {
   AgentRecord,
+  DispatchJobRecord,
   GitHubConnectionStatus,
   GitHubDeviceFlowStart,
   OrchestratorChatRecord,
@@ -25,6 +26,7 @@ import {
   FLEET_VENDORS,
   FLEET_VENDOR_LABELS,
   type FleetVendor,
+  isGlobalStandingConsent,
 } from "../lib/fleet.js";
 import {
   buildLaneStatuses,
@@ -49,6 +51,10 @@ import {
 } from "../lib/orchestrator-readiness.js";
 import { DESKTOP_PRESET_EFFORTS } from "../lib/presets.js";
 import type {
+  CliLinkBinStatus,
+  CliLinkResult,
+  CliLinkStatusReport,
+  CliUnlinkResult,
   DesktopState,
   GitHubDeviceFlowUiPoll,
   ListeningPortSnapshot,
@@ -69,7 +75,15 @@ import { LeftNav, type NavFleetLane } from "./left-nav.js";
 import { VendorIcon } from "./vendor-icon.js";
 import { assessMcpDrift, type McpVendorDrift } from "@muon/client/mcp-drift";
 import type { NavTarget } from "./lib/workspace-layout.js";
-import type { WorkspaceReviewsByChat } from "./lib/workspace-review-state.js";
+import {
+  selectWorkspaceReviewTargets,
+  type WorkspaceReviewsByChat,
+} from "./lib/workspace-review-state.js";
+// H10 — the ONE session-slug projection, reached through the renderer-safe
+// subpath. Not the `@muon/client` barrel (it drags `node:fs` into an esbuild
+// browser target) and not a local copy (two implementations is exactly how the
+// rail and the TUI strip would start calling one job by two names).
+import { sessionSlug } from "@muon/client/session-slug";
 import { MissionTokenUsagePanel } from "./mission-usage.js";
 import { MissionCapControl } from "./mission-cap.js";
 import { McpProbeRow } from "./mcp-probe-row.js";
@@ -146,10 +160,17 @@ export function Sidebar(props: SidebarProps) {
   // a soft, non-destructive act — those jobs keep running — but the confirm step
   // escalates its warning when a chat still has live work, so the human makes an
   // explicit second decision (S7 running-jobs guard).
-  // Per-group collapse (spec R2) — session-local chevrons.
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(
-    () => new Set()
-  );
+  // Per-group collapse (spec R2 / H8) — session-local chevrons.
+  //
+  // The DEFAULT is collapsed: a rail that opens every project's session list at
+  // once is the "wall of cards" H8 exists to prevent, and the terminal — not
+  // the rail — is the hero. Only what the human is standing in opens itself.
+  // This map holds EXPLICIT toggles only, so a deliberate open/close is sticky
+  // for the session even after the active chat moves to another project (the
+  // rail must not re-close a group a human opened to watch).
+  const [groupCollapseOverrides, setGroupCollapseOverrides] = useState<
+    Map<string, boolean>
+  >(() => new Map());
   // Blocked-at-gate per chat (spec R7): MUON's extra state, rendered loudest.
   //
   // An ApprovalRequest has NO chatId — it is bound to a task and (since P0.1)
@@ -197,15 +218,47 @@ export function Sidebar(props: SidebarProps) {
     }
   }
 
+  // H9/H10 — the ONE job a session row speaks for: the SAME target the review
+  // dock already reviews (`selectWorkspaceReviewTargets`), so the rail's
+  // worktree badge and the dock's diff can never be about two different runs.
+  // Its `executionPath` is the lease-fenced fact the runner recorded (ADR-0048)
+  // — the row never guesses, and never names a branch.
+  const jobsById = new Map(
+    (props.state?.dispatchJobs ?? []).map((job) => [job.id, job] as const)
+  );
+  const reviewJobByChat = new Map<string, DispatchJobRecord>();
+  for (const target of selectWorkspaceReviewTargets(
+    chats,
+    props.state?.dispatchJobs ?? []
+  )) {
+    const job = jobsById.get(target.jobId);
+    if (job) {
+      reviewJobByChat.set(target.chatId, job);
+    }
+  }
+
+  const groups = groupChatsByWorkspace(chats);
+  // Which group opens itself: the one the human is standing in. When no group
+  // owns the active chat (nothing selected yet), the FIRST one opens instead —
+  // an all-collapsed rail is a blank screen, and a consumer never gets one.
+  const activeGroupKey =
+    groups.find((group) =>
+      group.chats.some((chat) => chat.id === props.activeChatId)
+    )?.key ??
+    groups[0]?.key ??
+    null;
+
   return (
     <aside
       className={"sidebar" + (props.collapsed ? " sidebar-collapsed" : "")}
       inert={props.collapsed ? true : undefined}
     >
-      {/* The scrolling content lives in an inner wrapper so the sidebar's own
-          scrollbar sits INSIDE the right padding — clear of the resize handle at
-          the aside's edge (otherwise the scrollbar swallows the drag). */}
-      <div className="sidebar-scroll">
+      {/* Chrome (nav + New chat + auto-approve) is its own Y-scrollport so a
+          short window can still reach Timeline/Graph/Settings. Sessions scroll
+          in .sidebar-scroll. The scrollbar sits INSIDE the right padding —
+          clear of the resize handle at the aside's edge (otherwise the
+          scrollbar swallows the drag). */}
+      <div className="sidebar-chrome">
       <LeftNav
         active={props.navActive}
         pendingDecisions={props.navPendingDecisions}
@@ -238,14 +291,26 @@ export function Sidebar(props: SidebarProps) {
           onSetVendors={props.onSetFullAutoVendors}
         />
       </section>
+      </div>
+      <div className="sidebar-scroll">
       <section className="side-section">
         {/* Session desk IA (spec R1–R8): PROJECTS → SESSIONS. Group `+` creates in
             THAT workspace (group.key); the rail "New chat" still picks a folder. */}
         {chats.length === 0 ? (
           <div className="side-empty">No sessions yet.</div>
         ) : (
-          groupChatsByWorkspace(chats).map((group) => {
-            const collapsed = collapsedGroups.has(group.key);
+          groups.map((group) => {
+            const collapsed =
+              groupCollapseOverrides.get(group.key) ??
+              group.key !== activeGroupKey;
+            const sessionCount = group.chats.length;
+            // H9 — a gate waiting inside a CLOSED project must still be
+            // visible: collapsing is how a human puts a project away, not how
+            // MUON gets to stop telling them something is stuck. The count is
+            // rolled up onto the header line — no new chrome, the same one row.
+            const blockedInGroup = group.chats.filter(
+              (chat) => (blockedByChat.get(chat.id) ?? 0) > 0
+            ).length;
             return (
               <div
                 className={"rail-group" + (collapsed ? " collapsed" : "")}
@@ -255,11 +320,22 @@ export function Sidebar(props: SidebarProps) {
                   <button
                     className="rail-group-toggle"
                     aria-expanded={!collapsed}
+                    // The accessible name carries BOTH facts a human needs
+                    // before opening a project: which project, and how much is
+                    // in it. `.rail-group-name` stays the leaf alone so the
+                    // visible label never becomes a sentence.
+                    aria-label={`${group.label} — ${sessionCount} session${
+                      sessionCount === 1 ? "" : "s"
+                    }${
+                      blockedInGroup > 0
+                        ? `, ${blockedInGroup} blocked at a gate`
+                        : ""
+                    }`}
+                    title={group.key}
                     onClick={() =>
-                      setCollapsedGroups((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(group.key)) next.delete(group.key);
-                        else next.add(group.key);
+                      setGroupCollapseOverrides((prev) => {
+                        const next = new Map(prev);
+                        next.set(group.key, !collapsed);
                         return next;
                       })
                     }
@@ -270,6 +346,15 @@ export function Sidebar(props: SidebarProps) {
                       </svg>
                     </span>
                     <span className="rail-group-name">{group.label}</span>
+                    {blockedInGroup > 0 ? (
+                      <span className="rail-group-blocked" aria-hidden="true">
+                        <span className="status-glyph" />
+                        {blockedInGroup}
+                      </span>
+                    ) : null}
+                    <span className="rail-group-count" aria-hidden="true">
+                      {sessionCount}
+                    </span>
                   </button>
                   <button
                     className="rail-group-add"
@@ -285,13 +370,24 @@ export function Sidebar(props: SidebarProps) {
                 </div>
                 {collapsed ? null : (
                   <div className="rail-sessions">
-                    {group.chats.map((chat) => (
+                    {orderByAttention(group.chats, (chat) =>
+                      attentionRank({
+                        blockedApprovals: blockedByChat.get(chat.id) ?? 0,
+                        runningJobs: runningJobsByChat.get(chat.id) ?? 0,
+                      })
+                    ).map((chat) => (
                       <ChatRow
                         key={chat.id}
                         chat={chat}
                         active={chat.id === props.activeChatId}
                         runningJobs={runningJobsByChat.get(chat.id) ?? 0}
                         blockedApprovals={blockedByChat.get(chat.id) ?? 0}
+                        sessionTree={sessionTree(reviewJobByChat.get(chat.id))}
+                        sessionName={
+                          reviewJobByChat.has(chat.id)
+                            ? sessionSlug(reviewJobByChat.get(chat.id)!.id)
+                            : null
+                        }
                         workspaceReview={
                           props.workspaceReviews?.[chat.id]?.review ?? null
                         }
@@ -608,12 +704,12 @@ export function CrewPanel(props: {
       </section>
 
       {props.missionEvents ? (
-        <>
+        <div className="crew-meter-grid">
           <MissionTokenUsagePanel events={props.missionEvents} />
           {/* The BRAKE next to the meter: seeing the spend and being unable to
               limit it was the whole of parity item 4. */}
           <MissionCapControl chatId={props.activeChatId ?? null} />
-        </>
+        </div>
       ) : null}
 
       <section className="crew-lanes" aria-label="Fleet lanes">
@@ -713,14 +809,73 @@ function CrewSummary(props: {
   );
 }
 
+/**
+ * ADR-0052 — THE CONSENT MOMENT, wherever it happens.
+ *
+ * This panel is rendered twice: on the full-screen gate and in Settings →
+ * GitHub. Connecting here is what fires `registerDesktopInstall`, so this is the
+ * screen that collects the consent for the install record — and it said nothing
+ * about it. A review found the desktop POSTing an install record from a Settings
+ * connect an operator had made to enable pull-request review, with no sentence
+ * anywhere naming the record. `gateRecordDisclosure` is that sentence, composed
+ * once in `@muon/client` and carried verbatim from main; it arrives only when
+ * the gate is ARMED, which is exactly when connecting records anything.
+ */
+
+/**
+ * Put the device code on the clipboard, reporting whether it actually landed.
+ *
+ * The device flow's one manual step is transcribing an 8-character code into a
+ * browser that is about to steal focus, so copying it is the difference between
+ * "paste" and "read it off a window you can no longer see". Returns a boolean
+ * rather than throwing because a copy failure must NEVER block the sign-in —
+ * the code is still on screen and still typable, so the UI degrades to exactly
+ * what it did before.
+ */
+export async function copyDeviceCode(
+  code: string,
+  clipboard: Pick<Clipboard, "writeText"> | undefined = typeof navigator ===
+  "undefined"
+    ? undefined
+    : navigator.clipboard
+): Promise<boolean> {
+  if (!code || !clipboard?.writeText) return false;
+  try {
+    await clipboard.writeText(code);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function GitHubConnectPanel(props: {
   status: GitHubConnectionStatus | null;
   onStart: () => Promise<GitHubDeviceFlowStart>;
   onPoll: (flowId: string) => Promise<GitHubDeviceFlowUiPoll>;
   onDisconnect: () => Promise<void>;
   onOpenUrl: (url: string) => Promise<void>;
+  /** `state.githubGate?.recordDisclosure` — present ⇒ connecting files a
+   *  record, and this is the sentence that says so. Never composed here. */
+  gateRecordDisclosure?: string;
+  /** `state.githubGate?.registration` — the quiet status line for a record that
+   *  has not landed yet (F3). */
+  gateRegistration?: {
+    state: "open" | "locked" | "locked-unregistered";
+    detail?: string;
+  };
+  /**
+   * Rendered on the GATE SCREEN, where `status.connected` can be TRUE while the
+   * gate stays locked: `muon github login` (or a sign-in whose registration
+   * never landed) connects the LIVE brain without leaving the app a credential.
+   * Founder bug (2026-08-19): the panel showed a green "Connected as X" row —
+   * whose only control was Disconnect — beside a lock that would not open.
+   * When locked, the panel must offer the door (Connect), never a status row
+   * claiming a satisfaction the gate does not recognize.
+   */
+  gateLocked?: boolean;
 }) {
   const [flow, setFlow] = useState<GitHubDeviceFlowStart | null>(null);
+  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -771,7 +926,14 @@ export function GitHubConnectPanel(props: {
     try {
       const next = await props.onStart();
       setFlow(next);
-      setMessage("Enter this code on GitHub to authorize read-only PR checks.");
+      // Copy BEFORE opening the browser: the moment the browser takes focus the
+      // user is looking at GitHub's "enter code" box, and the code they need is
+      // back in a window they can no longer see. The result drives the code
+      // row below — "on your clipboard" is a claim, so it is only made when the
+      // clipboard actually took the code.
+      const autoCopied = await copyDeviceCode(next.userCode);
+      setCopied(autoCopied ? "copied" : "failed");
+      setMessage(null);
       await props.onOpenUrl(next.verificationUri);
     } catch (error) {
       setMessage(
@@ -788,7 +950,18 @@ export function GitHubConnectPanel(props: {
     try {
       await props.onDisconnect();
       setFlow(null);
-      setMessage("GitHub disconnected.");
+      // WHICH SURFACES THIS RE-LOCKS, said out loud — the mirror of `muon
+      // logout`'s copy. Disconnect now clears the shared credential too, so it
+      // signs out the CLI and `muon-mcp` on this machine as well; an operator
+      // who is handing the laptop over needs to know that happened, and one who
+      // only meant to unlink an account needs to know it went further than the
+      // app. Only claimed when the gate is armed, because that is when the
+      // credential file exists at all.
+      setMessage(
+        props.gateRecordDisclosure
+          ? "GitHub disconnected. This also signed out the `muon` CLI and `muon-mcp` on this machine — they re-lock until the next `muon login`."
+          : "GitHub disconnected."
+      );
     } catch (error) {
       setMessage(
         error instanceof Error ? error.message : "Could not disconnect GitHub."
@@ -802,7 +975,7 @@ export function GitHubConnectPanel(props: {
 
   return (
     <div className="github-connect">
-      {props.status?.connected ? (
+      {props.status?.connected && !props.gateLocked ? (
         <div className="github-account-row">
           <div className="github-account-identity">
             <span className="github-mark" aria-hidden="true">
@@ -850,7 +1023,9 @@ export function GitHubConnectPanel(props: {
             <div className="github-account-meta">
               <strong className="github-account-login">GitHub</strong>
               <span className="github-account-sub">
-                Read-only PR checks for this Mac
+                {props.gateLocked
+                  ? "Sign in to unlock this Mac"
+                  : "Read-only PR checks for this Mac"}
               </span>
             </div>
           </div>
@@ -865,23 +1040,82 @@ export function GitHubConnectPanel(props: {
         </div>
       )}
 
+      {/* Locked while the brain reports connected: name the split instead of
+          showing a green row. One sentence, one remedy. */}
+      {props.gateLocked && props.status?.connected ? (
+        <p className="github-connect-note" role="status">
+          GitHub is connected for this machine&apos;s live brain
+          {props.status.login ? ` (as ${props.status.login})` : ""}, but the app
+          has not stored its own sign-in yet — run <code>muon login</code> in a
+          terminal, or click Connect to finish here.
+        </p>
+      ) : null}
+
       {props.status?.configured === false ? (
         <p className="github-connect-note">
           Set MUON_GITHUB_CLIENT_ID to enable device authorization.
         </p>
       ) : null}
 
+      {/* VERBATIM from main. The same three-clause sentence `muon login` prints
+          before the browser opens and every gate refusal ends with. */}
+      {props.gateRecordDisclosure ? (
+        <p className="github-connect-note">{props.gateRecordDisclosure}</p>
+      ) : null}
+
+      {/* F3 — a deferred record, said quietly and completely: what is true, that
+          MUON is handling it, and that the only affected surfaces are the ones
+          that need the record. Never "an error occurred". */}
+      {props.gateRegistration?.state === "locked-unregistered" ? (
+        <p className="github-connect-note" role="status">
+          This install is verified but not recorded with the MUON project yet —
+          MUON retries automatically when online, and nothing here needs doing.
+          Until it lands, the CLI and <code>muon-mcp</code> on this machine stay
+          locked.
+          {props.gateRegistration.detail
+            ? ` (last attempt: ${props.gateRegistration.detail})`
+            : ""}
+        </p>
+      ) : null}
+
       {flow ? (
         <div className="github-device-code" role="status">
-          <span>Device code</span>
+          {/* One code, one sentence, one quiet button (founder, 2026-08-19:
+              the two-ghost-button row "looks really bad"). The code was copied
+              and the browser opened by `start()`; the steady state is a claim
+              — "on your clipboard, paste it on GitHub" — not a control. The
+              copy button returns ONLY when the clipboard refused, because that
+              is the one case with something left to do here. */}
           <code>{flow.userCode}</code>
-          <button
-            className="ghost-btn"
-            onClick={() => void props.onOpenUrl(flow.verificationUri)}
-            type="button"
-          >
-            Open GitHub
-          </button>
+          <span className="github-device-code-hint">
+            {copied === "copied"
+              ? "on your clipboard — paste it on GitHub to authorize"
+              : "enter this code on GitHub to authorize"}
+          </span>
+          <div className="github-device-code-actions">
+            {copied !== "copied" ? (
+              <button
+                className="ghost-btn"
+                onClick={() => {
+                  void copyDeviceCode(flow.userCode).then((ok) =>
+                    setCopied(ok ? "copied" : "failed")
+                  );
+                }}
+                type="button"
+              >
+                {copied === "failed" ? "Copy code" : "Copy"}
+              </button>
+            ) : null}
+            {/* The browser may have been closed by the time the user comes
+                back; re-opening stays available, quietly. */}
+            <button
+              className="ghost-btn"
+              onClick={() => void props.onOpenUrl(flow.verificationUri)}
+              type="button"
+            >
+              Open GitHub
+            </button>
+          </div>
         </div>
       ) : null}
 
@@ -1312,6 +1546,178 @@ export function McpConnectionsPanel(props: {
 }
 
 /**
+ * Settings -> Command Line Tools (founder request, 2026-08-17): the DMG side
+ * of curl<->desktop parity. A DMG-only install carries `muon`/`muon-tui`/
+ * `muon-mcp` inside the app bundle but nothing on PATH — this is the quiet,
+ * per-binary status row (mirrors `McpConnectionsPanel`'s shape) plus a
+ * Link/Unlink pair. Link is idempotent and per-binary: a foreign file at one
+ * target path (say a tarball-installed `muon`) does not block linking the
+ * other two.
+ */
+export function CliLinkPanel(props: {
+  /** null = the first read has not landed yet. */
+  status: CliLinkStatusReport | null;
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  onLink: () => Promise<CliLinkResult>;
+  onUnlink: () => Promise<CliUnlinkResult>;
+}) {
+  const [busy, setBusy] = useState<"link" | "unlink" | null>(null);
+  const [lastMessages, setLastMessages] = useState<string[] | null>(null);
+
+  const runLink = async () => {
+    setBusy("link");
+    setLastMessages(null);
+    try {
+      const result = await props.onLink();
+      setLastMessages(
+        result.kind === "unavailable"
+          ? [result.reason]
+          : result.entries.map((entry) =>
+              entry.action === "written"
+                ? `${entry.bin}: ${entry.detail} ${entry.targetPath}`
+                : entry.action === "already-linked"
+                  ? `${entry.bin}: already linked`
+                  : `${entry.bin}: not linked — ${entry.reason}`
+            )
+      );
+      props.onRefresh();
+    } catch (error) {
+      setLastMessages([
+        error instanceof Error ? error.message : "Could not link the CLI.",
+      ]);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const runUnlink = async () => {
+    setBusy("unlink");
+    setLastMessages(null);
+    try {
+      const result = await props.onUnlink();
+      setLastMessages(
+        result.kind === "unavailable"
+          ? [result.reason]
+          : result.entries.map((entry) =>
+              entry.action === "removed"
+                ? `${entry.bin}: removed ${entry.targetPath}`
+                : entry.action === "absent"
+                  ? `${entry.bin}: nothing to remove`
+                  : `${entry.bin}: left in place — ${entry.reason}`
+            )
+      );
+      props.onRefresh();
+    } catch (error) {
+      setLastMessages([
+        error instanceof Error ? error.message : "Could not unlink the CLI.",
+      ]);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="cli-link-panel">
+      <p className="mcp-lede">
+        {"Make the muon, muon-tui and muon-mcp commands this app carries " +
+          "available in your terminal, as three small scripts in " +
+          "~/.local/bin. No sudo, and nothing written outside that one " +
+          "folder — Unlink removes exactly what Link wrote."}
+      </p>
+
+      {props.error ? (
+        <div className="mcp-error" role="status">
+          <p className="mcp-note mcp-bad">{props.error}</p>
+          <button className="ghost-btn" onClick={props.onRefresh}>
+            Try again
+          </button>
+        </div>
+      ) : props.status === null ? (
+        <p className="mcp-note" role="status">
+          {props.loading ? "Checking ~/.local/bin…" : "Not checked yet."}
+        </p>
+      ) : props.status.kind === "unavailable" ? (
+        <p className="mcp-note">{props.status.reason}</p>
+      ) : (
+        <>
+          {props.status.entries.map((row) => (
+            <div className="mcp-row" key={row.bin}>
+              <div className="mcp-row-head">
+                <span className={`dot ${cliLinkDotClass(row.state)}`} />
+                <strong>{row.bin}</strong>
+                <span className="mcp-row-state">
+                  {cliLinkStateLabel(row.state)}
+                </span>
+              </div>
+              <span className="mcp-mono">{row.targetPath}</span>
+            </div>
+          ))}
+          <div className="mcp-actions">
+            <button
+              className="ghost-btn"
+              disabled={busy !== null}
+              onClick={() => void runLink()}
+            >
+              {busy === "link" ? "Linking…" : "Link"}
+            </button>
+            <button
+              className="ghost-btn"
+              disabled={busy !== null}
+              onClick={() => void runUnlink()}
+            >
+              {busy === "unlink" ? "Unlinking…" : "Unlink"}
+            </button>
+            <span className="mcp-note">
+              {"~/.local/bin must be on your shell's PATH for these to run " +
+                "by name — add it to your shell profile if it is not."}
+            </span>
+          </div>
+          {lastMessages ? (
+            <ul className="mcp-row-facts">
+              {lastMessages.map((message, index) => (
+                // eslint-disable-next-line react/no-array-index-key -- a
+                // fixed-order, non-reorderable status list for one action.
+                <li key={index} className="mcp-note">
+                  {message}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+function cliLinkDotClass(state: CliLinkBinStatus["state"]): string {
+  switch (state) {
+    case "linked-current":
+      return "success";
+    case "linked-stale":
+      return "pending";
+    case "foreign":
+      return "failure";
+    default:
+      return "neutral"; // "absent"
+  }
+}
+
+function cliLinkStateLabel(state: CliLinkBinStatus["state"]): string {
+  switch (state) {
+    case "linked-current":
+      return "linked";
+    case "linked-stale":
+      return "linked, app moved — Link to refresh";
+    case "foreign":
+      return "not MUON's — left alone";
+    default:
+      return "not linked"; // "absent"
+  }
+}
+
+/**
  * One chat row: the selectable chat button plus a hover-revealed archive
  * ("delete") affordance. Archive is a destructive-feeling but SOFT act, so it
  * is never one-click — the first click ARMS the control (turns it into a solid
@@ -1364,12 +1770,74 @@ function workspaceLabel(workspacePath: string): string {
   return normalized.split(/[\\/]/).at(-1) || workspacePath;
 }
 
+/**
+ * H9 — which tree a session's work is actually IN, from the ledger's own field.
+ *
+ * `executionPath` is what the lease-holding runner recorded (ADR-0048): the run
+ * had its own worktree and its changes are NOT in the checkout. Without one the
+ * run edited the workspace directly, which is a different and quieter fact — so
+ * it gets a different, quieter marker rather than a shared label that sends an
+ * operator looking for changes in the wrong directory. No job at all yields
+ * NOTHING: a row that has dispatched no work has no tree to name, and inventing
+ * one (a branch name, a guess from the workspace) is the failure this exists to
+ * prevent.
+ */
+export type SessionTree =
+  | { kind: "worktree"; label: string; path: string }
+  | { kind: "workspace" }
+  | null;
+
+export function sessionTree(
+  job: { executionPath?: string | null } | null | undefined
+): SessionTree {
+  if (!job) {
+    return null;
+  }
+  const path = job.executionPath?.trim();
+  if (!path) {
+    return { kind: "workspace" };
+  }
+  return { kind: "worktree", label: workspaceLabel(path), path };
+}
+
+/**
+ * H9 — attention rank inside a group: blocked-at-gate outranks working, which
+ * outranks idle. Lower sorts first. MUON's extra state is the loudest thing on
+ * the rail because it is the only one that cannot proceed without a human.
+ */
+export function attentionRank(input: {
+  blockedApprovals: number;
+  runningJobs: number;
+}): number {
+  if (input.blockedApprovals > 0) return 0;
+  if (input.runningJobs > 0) return 1;
+  return 2;
+}
+
+/**
+ * Stable rank sort: equal-rank rows keep the list's own order, so a row never
+ * jumps position for a reason the human cannot see.
+ */
+export function orderByAttention<T>(
+  rows: readonly T[],
+  rank: (row: T) => number
+): T[] {
+  return rows
+    .map((row, index) => ({ row, index, rank: rank(row) }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map((entry) => entry.row);
+}
+
 function ChatRow(props: {
   chat: OrchestratorChatRecord;
   active: boolean;
   runningJobs: number;
   /** Pending gates on this chat (spec R7) — blocked-at-gate, rendered loudest. */
   blockedApprovals?: number;
+  /** H9 — the bound worktree, or the quiet "workspace" fact, or nothing. */
+  sessionTree?: SessionTree;
+  /** H10 — the speakable name for this session's review-target job. */
+  sessionName?: string | null;
   workspaceReview: WorkspaceReview | null;
   workspaceReviewLoading: boolean;
   listeningPorts: ListeningPortSnapshot[];
@@ -1423,6 +1891,14 @@ function ChatRow(props: {
               <circle cx="11.5" cy="8" r="1.7" />
               <path d="M4.5 5.7v4.6M9.8 8H8a3.5 3.5 0 0 1-3.5-2.3" />
             </svg>
+            {/* H10: the SPEAKABLE name first (what a human says in a review),
+                the chat coordinate second (what a human pastes). Only the
+                coordinate truncates — the name is the half that must survive a
+                narrow rail. Identity is still the id: the slug is derived from
+                it at render time, stored nowhere. */}
+            {props.sessionName ? (
+              <span className="session-card-name">{props.sessionName}</span>
+            ) : null}
             <span className="slug-text">
               session/{props.chat.id.slice(0, 12)}
             </span>
@@ -1447,6 +1923,28 @@ function ChatRow(props: {
                 : "Idle"}
           </span>
           <span className="workspace-row-meta session-card-meta-row">
+            {/* H9 — WHICH TREE, from `executionPath` and nothing else. The leaf
+                is shown (a full worktree path never fits a rail); the full path
+                is the tooltip and the accessible name. */}
+            {props.sessionTree?.kind === "worktree" ? (
+              <span
+                className="session-tree-badge worktree"
+                title={props.sessionTree.path}
+                aria-label={`Worktree ${props.sessionTree.path}`}
+              >
+                <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                  <path d="M2 4.2h4.2l1.1 1.4H14v6.2H2z" strokeLinejoin="round" />
+                </svg>
+                <span className="tree-text">{props.sessionTree.label}</span>
+              </span>
+            ) : props.sessionTree?.kind === "workspace" ? (
+              <span
+                className="session-tree-badge workspace"
+                title={`No isolated worktree — this session works directly in ${props.chat.workspacePath}`}
+              >
+                workspace
+              </span>
+            ) : null}
             {diff ? (
               <span
                 aria-label={`${diff.additions} additions, ${diff.deletions} deletions`}
@@ -1583,81 +2081,60 @@ function updateStatusLabel(status: UpdateStatus): string {
 }
 
 /**
- * Vendor-scoped Full-Auto ("Auto-approve"): standing operator consent, per
- * lane. A checked lane's approvals resolve automatically through the SAME
- * operator path a human click uses; every other approval — an unchecked lane,
- * or one with no server-resolvable lane at all — stays a fail-closed human
- * gate. Checking every lane reproduces the old "Auto-approve all" exactly,
- * including non-lane gates (chat-level and CLI-filed ones). Egress actions are
- * still withheld BEFORE they are ever filed, and a merge whose review
- * certification is blocked still needs an explicit operator attestation the
- * standing consent cannot supply. Kept in the dangerous visual language
- * (armed = the whole card flips to the AA-safe red fill, the Stop-all idiom)
- * because any selection disables real gates. Reads state.fullAutoVendors;
- * onSetVendors is the parent's real setFullAutoVendors IPC call, never a
- * local-only flag.
+ * Full-Auto ("Auto-approve"): one standing-consent button for every managed
+ * lane. ON is the default posture (Auto mode). Approvals resolve through the
+ * SAME operator path a human click uses, including non-lane gates. Egress is
+ * still withheld before it is filed, and a merge whose review certification
+ * is blocked still needs an explicit operator attestation this cannot supply.
+ * Dangerous visual language (armed = AA-safe red rail) because this disables
+ * real gates. Reads state.fullAutoVendors; onSetVendors is the parent's real
+ * setFullAutoVendors IPC call, never a local-only flag.
  */
 function FullAutoPanel(props: {
   selected: readonly string[];
   onSetVendors: (vendors: string[]) => void;
 }) {
   // `props.selected` is POLLED state: it only catches up after the IPC round
-  // trip AND a full `collectState()` tick. Deriving the next selection from it
-  // meant a second click landing inside that window read a stale array — untick
-  // A then untick B, and B's handler resent A as still-selected. The net effect
-  // of turning two lanes off was one lane staying ARMED, on the most dangerous
-  // control in the app. Pending edits are tracked locally and applied on top.
+  // trip AND a full `collectState()` tick. Pending is the click we already
+  // sent, so a second click inside that window does not read a stale array.
   const [pending, setPending] = useState<string[] | null>(null);
   const selected = pending ?? props.selected;
   useEffect(() => {
-    // The poll caught up: drop the local overlay so main stays authoritative.
     setPending(null);
   }, [props.selected]);
   const armed = selected.length > 0;
-  const allSelected =
-    FLEET_VENDORS.length > 0 &&
-    FLEET_VENDORS.every((vendor) => selected.includes(vendor));
-  const commit = (next: string[]) => {
+  // P0-1: a nonempty SUBSET must not look, speak, or clear as machine-wide.
+  // The pressed state and the danger rail key on ARMED (any lane's gates are
+  // off — that is dangerous); the COPY keys on the one shared global
+  // predicate, so "every lane" is only ever said when it is true. A subset
+  // names its lanes instead. Clicking while armed only NARROWS (to none) —
+  // the palette's rule, for the same reason: widening a subset silently is
+  // the one gesture this button must never own.
+  const global = isGlobalStandingConsent(selected);
+  const toggle = () => {
+    const next = armed ? [] : [...FLEET_VENDORS];
     setPending(next);
     props.onSetVendors(next);
   };
-  const setVendor = (vendor: string, on: boolean) => {
-    commit(
-      on
-        ? FLEET_VENDORS.filter((id) => id === vendor || selected.includes(id))
-        : selected.filter((id) => id !== vendor)
-    );
-  };
+  const subsetNames = selected
+    .map((vendor) => FLEET_VENDOR_LABELS[vendor] ?? vendor)
+    .join(", ");
   return (
     <div className={"full-auto-panel" + (armed ? " armed" : "")}>
-      <label className="full-auto-toggle">
-        <input
-          type="checkbox"
-          checked={allSelected}
-          aria-describedby="full-auto-copy"
-          onChange={(event) =>
-            commit(event.target.checked ? [...FLEET_VENDORS] : [])
-          }
-        />
-        Auto-approve all lanes
-      </label>
-      <div className="full-auto-lanes">
-        {FLEET_VENDORS.map((vendor) => (
-          <label className="full-auto-toggle full-auto-vendor" key={vendor}>
-            <input
-              type="checkbox"
-              checked={selected.includes(vendor)}
-              onChange={(event) => setVendor(vendor, event.target.checked)}
-            />
-            {FLEET_VENDOR_LABELS[vendor] ?? vendor}
-          </label>
-        ))}
-      </div>
+      <button
+        type="button"
+        className="full-auto-btn"
+        aria-pressed={armed}
+        aria-describedby="full-auto-copy"
+        onClick={toggle}
+      >
+        Auto-approve
+      </button>
       <small id="full-auto-copy">
-        {armed && !allSelected
-          ? "Checked lanes approve automatically; every other request still asks you."
+        {global
+          ? "On for every lane. Egress and blocked merge reviews still ask."
           : armed
-            ? "Every approval resolves automatically. Egress and blocked merge reviews still ask."
+            ? `On for ${subsetNames} only — other lanes still ask. Egress and blocked merge reviews still ask.`
             : "Off: every approval waits for you."}
       </small>
     </div>
@@ -1875,12 +2352,16 @@ function VendorBlock(props: {
         // from what the dispatch route will actually accept.
         <div className="vendor-role-note">{scope.summary}</div>
       ) : null}
-      {!lane.coordinatorEligible && lane.known ? (
-        // Only claude-code and codex may hold the coordinator seat. Saying so
-        // on the lane stops the "why isn't Cursor in the Vendor dropdown?"
-        // question before it is asked.
+      {lane.known ? (
+        // THE SEAT, on every lane, either way. It is deliberately not folded
+        // into `scope.summary` above: that line renders only for role-scoped
+        // lanes, so the seat would have been named for the two vendors that
+        // just gained one and never for the two that always had one. Both
+        // answers read from the registry, never from a vendor list here.
         <div className="vendor-role-note">
-          Cannot hold the coordinator seat — it runs as crew only.
+          {lane.coordinatorEligible
+            ? "Can hold MUON's coordinator seat, which coordinates a crew rather than doing the work."
+            : "Cannot hold the coordinator seat — it runs as crew only."}
         </div>
       ) : null}
       {props.laneDefault && props.onLaneDefaultChange ? (

@@ -1,4 +1,5 @@
 import {
+  isDispatchableRole,
   DELEGATION_MAX_CHILDREN,
   FLEET_MAX_AGENTS_PER_VENDOR,
   publicVendorIds,
@@ -163,7 +164,12 @@ export type PreflightVendor = {
   ready: boolean;
   /** ready && this lane may hold the role in question (see `role` on the input). */
   dispatchReady: boolean;
-  /** Crew roles this lane may be dispatched for (all of them when unscoped). */
+  /**
+   * Crew roles this lane may be DISPATCHED for (all of them when unscoped).
+   * The coordinator seat is not among them at any width: it is a chat's root
+   * job, not work handed to a lane, and the dispatch route refuses it as a
+   * task role.
+   */
   dispatchRoles: AgentRole[];
   boundary:
     | "dispatch-ready"
@@ -390,7 +396,15 @@ function projectVendor(
   // With no role named, the question is "can it take un-planned work?".
   // FAIL-CLOSED: a lane MUON does not name holds no role, so it is reported
   // role-scoped and never dispatch-ready. (Was `?? AGENT_ROLES`.)
-  const dispatchRoles = VENDOR_DISPATCH_ROLES[entry.vendor] ?? [];
+  const ceiling = VENDOR_DISPATCH_ROLES[entry.vendor] ?? [];
+  // The FIELD, not just the prose that renders from it. `orchestrator` is in
+  // two more ceilings since ADR-0057 and `POST /api/dispatch` refuses it as a
+  // task role, so an agent routing off the machine-readable field named
+  // `dispatchRoles` would dispatch straight into a 400 — and the payload would
+  // contradict itself, the reason naming four roles and the field five.
+  const dispatchRoles = ceiling.filter(
+    (role) => isDispatchableRole(role)
+  );
   const holdsRole = dispatchRoles.includes(role ?? UNPLANNED_DISPATCH_ROLE);
   const dispatchReady = ready && holdsRole;
   const boundary: PreflightVendor["boundary"] =
@@ -480,7 +494,12 @@ function vendorDegradation(
       ...base,
       code: "VENDOR_ROLE_SCOPED",
       severity: "info",
-      reason: `${row.label} is connected and managed for these crew roles only: ${row.dispatchRoles.join(", ")}.`,
+      // `row.dispatchRoles` is already seat-free (see where it is built), so
+      // this renders it directly — one filter, at the source, rather than one
+      // per reader.
+      reason: `${row.label} is connected and managed for these crew roles only: ${row.dispatchRoles.join(
+        ", "
+      )}.`,
       nextAction: `Dispatch ${row.label} under one of those roles; send other work to a lane that can hold it.`,
     };
   }

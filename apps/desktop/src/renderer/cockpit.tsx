@@ -14,6 +14,7 @@ import {
 } from "@muon/client/crew-liveness";
 import { DESCENDANT_POOL_CEILING_MS } from "@muon/client/budget-view";
 import type {
+  BlockingQuestion,
   ManualReviewAttestation,
   ReviewCoverageCertification,
 } from "@muon/client";
@@ -30,9 +31,10 @@ import type { ReadinessSnapshotMeta, WorkspaceReview } from "../shared/ipc.js";
 import { agentCodename } from "../lib/agent-codename.js";
 import { freshnessLabel } from "./lib/lane-status.js";
 import {
-  REMEMBER_ACTION_TTL_MS,
+  REMEMBER_ACTION_CHOICE,
   ReviewGateActions,
   useGateDecision,
+  type GateDurableChoice,
   type GateResolve,
 } from "./review-gate.js";
 import type {
@@ -692,13 +694,14 @@ function ApprovalReviewDialog(props: {
   onClose: () => void;
   onLoadMergeReview?: () => Promise<ReviewCoverageCertification>;
   /**
-   * Resolves the decision. `receiptTtlMs` rides ONLY when the operator pressed
-   * "Approve, don't ask again"; a rejected promise keeps the dialog open and
-   * surfaces the server's reason (the approval stays pending).
+   * Resolves the decision. `durable` rides ONLY when the operator pressed one
+   * of the two remembering approves — and it is ONE value, so "a receipt and a
+   * grade" is not a state this call site can reach. A rejected promise keeps
+   * the dialog open and surfaces the server's reason (approval stays pending).
    */
   onResolve: (
     status: "approved" | "rejected",
-    receiptTtlMs?: number,
+    durable?: GateDurableChoice,
     manualReview?: ManualReviewAttestation
   ) => void | Promise<void>;
 }) {
@@ -725,7 +728,7 @@ function ApprovalReviewDialog(props: {
 
   const resolve = (
     status: "approved" | "rejected",
-    receiptTtlMs?: number
+    durable?: GateDurableChoice
   ) => {
     if (resolving) return;
     setResolveError(null);
@@ -743,8 +746,8 @@ function ApprovalReviewDialog(props: {
                 blindFiles: mergeReview.blindFiles ?? [],
               }
             : undefined;
-        if (status === "approved" && receiptTtlMs !== undefined) {
-          await props.onResolve(status, receiptTtlMs, manualReview);
+        if (status === "approved" && durable !== undefined) {
+          await props.onResolve(status, durable, manualReview);
         } else if (manualReview) {
           await props.onResolve(status, undefined, manualReview);
         } else {
@@ -867,7 +870,7 @@ function ApprovalReviewDialog(props: {
               // outright for actions that can never be remembered.
               if (approvable && review.receiptEligible && !resolving) {
                 event.preventDefault();
-                resolve("approved", REMEMBER_ACTION_TTL_MS);
+                resolve("approved", REMEMBER_ACTION_CHOICE);
                 return;
               }
             }
@@ -881,7 +884,10 @@ function ApprovalReviewDialog(props: {
             if (
               (event.key === "r" || event.key === "R") &&
               focusedAction !== "approve" &&
-              focusedAction !== "approve-remember"
+              focusedAction !== "approve-remember" &&
+              // ADR-0056's third approve joins the same fence: focusing ANY
+              // approve and pressing 'r' must never reject.
+              focusedAction !== "approve-always"
             ) {
               if (!resolving) {
                 event.preventDefault();
@@ -1534,6 +1540,23 @@ export function ControlRail(props: {
    * render nothing (never a dead/broken block).
    */
   workspaceReview?: WorkspaceReview | null;
+  /**
+   * H15 — OPEN blocking questions in scope (ADR-0043), already chat-scoped by
+   * the caller. A blocked agent is a pending human decision exactly like a
+   * gate, and the "needs you" count said otherwise: a mission whose only
+   * outstanding item was a question rendered "You're clear" over a worker
+   * sitting still. Counting them here is the whole fix; ANSWERING stays in
+   * QuestionsInbox, which is the powerless surface (ADR-0043 — answering
+   * confers no authority, and no answer path is added to this rail).
+   */
+  questions?: readonly BlockingQuestion[];
+  /**
+   * The questions read FAILED. Distinct from "no questions", and the reason
+   * the rail may not claim you are clear: an unread inbox is not an empty one.
+   */
+  questionsUnavailable?: boolean;
+  /** Reveals the QuestionsInbox (dock Review tab) and scrolls it into view. */
+  onFocusQuestions?: () => void;
   focusApprovalId?: string | null;
   onReviewApproval?: (approvalId: string | null) => void;
   onLoadMergeReview?: (
@@ -1542,7 +1565,7 @@ export function ControlRail(props: {
   onResolveApproval: (
     approvalId: string,
     status: "approved" | "rejected",
-    receiptTtlMs?: number,
+    durable?: GateDurableChoice,
     manualReview?: ManualReviewAttestation
   ) => void | Promise<void>;
   onApplyProposal: (runId: string) => void;
@@ -1569,6 +1592,15 @@ export function ControlRail(props: {
     props.approvals,
     props.focusApprovalId
   );
+  // H15 — a blocked agent counts. The badge is "what needs you", and a
+  // question needs you in exactly the way a gate does: nothing moves until a
+  // human types an answer.
+  const openQuestions = props.questions ?? [];
+  const needsYou =
+    (inbox.primary ? 1 : 0) +
+    inbox.queued.length +
+    props.proposals.length +
+    openQuestions.length;
 
   return (
     <>
@@ -1577,17 +1609,48 @@ export function ControlRail(props: {
       <section>
         <header>
           <span>Review</span>
-          <b>
-            {(inbox.primary ? 1 : 0) +
-              inbox.queued.length +
-              props.proposals.length}
-          </b>
+          <b>{needsYou}</b>
         </header>
-        {!inbox.primary && props.proposals.length === 0 ? (
+        {/* "You're clear" is a CLAIM about the whole inbox, so every kind of
+            waiting item has to be absent before it may be made — including a
+            questions read that FAILED, which is not a zero. */}
+        {needsYou === 0 && !props.questionsUnavailable ? (
           <div className="rail-empty saas-empty">
             <strong>You&apos;re clear</strong>
             <span>Nothing needs you right now.</span>
           </div>
+        ) : null}
+        {props.questionsUnavailable ? (
+          <div className="rail-question-line unavailable" role="alert">
+            The questions inbox could not be read — an empty count here would
+            be a lie.
+          </div>
+        ) : null}
+        {openQuestions.length > 0 ? (
+          // ONE LINE, and a route — never a second answer surface. Answering is
+          // powerless (ADR-0043) and stays in QuestionsInbox, so this rail
+          // gains no authority it did not have.
+          <button
+            type="button"
+            className="rail-question-line"
+            data-rail-action="focus-questions"
+            onClick={() => props.onFocusQuestions?.()}
+          >
+            <span className="inbox-kicker">Agent is blocked</span>
+            <strong>
+              {openQuestions.length} question
+              {openQuestions.length === 1 ? "" : "s"} waiting on you
+            </strong>
+            {/* AGENT-PRODUCED UNTRUSTED TEXT, rendered as a text node (React
+                escaping) and bounded so one agent's essay cannot push the rail
+                around. Never interpreted, never a directive. */}
+            <span>
+              {openQuestions[0]!.subject.length > 80
+                ? `${openQuestions[0]!.subject.slice(0, 79)}…`
+                : openQuestions[0]!.subject}{" "}
+              — answer in Questions from agents
+            </span>
+          </button>
         ) : null}
         {activeReceipts.length > 0 || lastAutoApproval ? (
           <div className="receipt-status">
@@ -1617,14 +1680,10 @@ export function ControlRail(props: {
             // Two-arg call when nothing is being remembered keeps the governed
             // decision payload (and the pinned call-shape tests) byte-identical
             // to the plain approve path.
-            onResolve={(status, receiptTtlMs) =>
-              receiptTtlMs === undefined
+            onResolve={(status, durable) =>
+              durable === undefined
                 ? props.onResolveApproval(inbox.primary!.id, status)
-                : props.onResolveApproval(
-                    inbox.primary!.id,
-                    status,
-                    receiptTtlMs
-                  )
+                : props.onResolveApproval(inbox.primary!.id, status, durable)
             }
           />
         ) : null}
@@ -1765,22 +1824,18 @@ export function ControlRail(props: {
               : undefined
           }
           onClose={() => props.onReviewApproval?.(null)}
-          onResolve={async (status, receiptTtlMs, manualReview) => {
+          onResolve={async (status, durable, manualReview) => {
             // Two-arg call when no opt-in keeps the decision payload (and the
             // pinned call-shape tests) byte-identical to today.
             if (manualReview) {
               await props.onResolveApproval(
                 reviewApproval.id,
                 status,
-                receiptTtlMs,
+                durable,
                 manualReview
               );
-            } else if (receiptTtlMs !== undefined) {
-              await props.onResolveApproval(
-                reviewApproval.id,
-                status,
-                receiptTtlMs
-              );
+            } else if (durable !== undefined) {
+              await props.onResolveApproval(reviewApproval.id, status, durable);
             } else {
               await props.onResolveApproval(reviewApproval.id, status);
             }

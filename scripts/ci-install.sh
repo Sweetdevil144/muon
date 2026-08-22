@@ -8,7 +8,8 @@
 # dist/ must exist before a downstream is type-checked / built.
 #
 # Dependency order:
-#   protocol -> adapters -> client -> core -> graph -> codegraph -> mcp ->
+#   protocol -> adapters -> client -> core -> graph -> codegraph -> docgraph ->
+#   mcp ->
 #   orchestrator -> runner -> backend -> apps/{cli,tui,desktop}
 # (core imports @muon/client/paths for the shared data-dir resolver; client has
 #  no dependency on core, so client must be built first on a clean checkout.)
@@ -66,6 +67,7 @@ for dir in \
   packages/core \
   packages/graph \
   packages/codegraph \
+  packages/docgraph \
   packages/mcp \
   packages/orchestrator \
   packages/runner; do

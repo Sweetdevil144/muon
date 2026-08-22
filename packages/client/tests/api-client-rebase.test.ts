@@ -178,6 +178,142 @@ describe("it does not loop, and does not retry what may have landed", () => {
   });
 });
 
+/**
+ * THE BRAIN CAN ALSO STAY PUT AND ROTATE ITS TOKEN.
+ *
+ * The embedded port is stable, so an externally restarted brain (a CLI
+ * `muon shutdown` + auto-start) usually rebinds the SAME port with a fresh
+ * token. Nothing throws, /health passes because it is unauthenticated, and the
+ * connection-failure lane above never runs — so a long-lived host 401s forever
+ * against a brain that is sitting right there, healthy.
+ */
+describe("a 401 from a brain that never moved re-reads the lockfile once", () => {
+  const UNAUTHORIZED = (): Response =>
+    new Response(JSON.stringify({ message: "unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+
+  it("adopts the rotated token and the retry succeeds", async () => {
+    const seen: (string | null)[] = [];
+    const client = new MuonApiClient(
+      "http://127.0.0.1:10777",
+      async (_input, init) => {
+        const token = new Headers(init?.headers).get("Authorization");
+        seen.push(token);
+        return token === "Bearer new-token" ? OK.clone() : UNAUTHORIZED();
+      },
+      "stale-token",
+      0,
+      // Same base, new token: the signature of a same-port restart.
+      () => ({ baseUrl: "http://127.0.0.1:10777", apiToken: "new-token" })
+    );
+
+    await expect(client.health()).resolves.toBeTruthy();
+    expect(seen).toEqual(["Bearer stale-token", "Bearer new-token"]);
+  });
+
+  it("does not retry when the lockfile hands back the SAME token", async () => {
+    // Then the credential is genuinely refused, and a retry is just a loop.
+    let calls = 0;
+    const client = new MuonApiClient(
+      "http://127.0.0.1:10777",
+      async () => {
+        calls += 1;
+        return UNAUTHORIZED();
+      },
+      "held-token",
+      0,
+      () => ({ baseUrl: "http://127.0.0.1:10777", apiToken: "held-token" })
+    );
+
+    await expect(client.health()).rejects.toThrow(/401/);
+    expect(calls).toBe(1);
+  });
+
+  it("does not treat a 403 as a rotation", async () => {
+    // 403 is authority, not identity: no token in any lockfile fixes it.
+    let calls = 0;
+    const client = new MuonApiClient(
+      "http://127.0.0.1:10777",
+      async () => {
+        calls += 1;
+        return new Response("{}", {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+      "held-token",
+      0,
+      () => ({ baseUrl: "http://127.0.0.1:10777", apiToken: "rotated" })
+    );
+
+    await expect(client.health()).rejects.toThrow(/403/);
+    expect(calls).toBe(1);
+  });
+
+  it("a second consecutive 401 surfaces instead of looping", async () => {
+    // The rotated token is ALSO refused. One retry, then the truth.
+    let calls = 0;
+    const client = new MuonApiClient(
+      "http://127.0.0.1:10777",
+      async () => {
+        calls += 1;
+        return UNAUTHORIZED();
+      },
+      "stale-token",
+      0,
+      () => ({
+        baseUrl: "http://127.0.0.1:10777",
+        apiToken: `rotated-${calls}`,
+      })
+    );
+
+    await expect(client.health()).rejects.toThrow(/401/);
+    expect(calls, "exactly one retry, never a loop").toBe(2);
+  });
+
+  it("rate-limits the lockfile read so a 401 storm cannot storm the disk", async () => {
+    let calls = 0;
+    let reads = 0;
+    const client = new MuonApiClient(
+      "http://127.0.0.1:10777",
+      async () => {
+        calls += 1;
+        return UNAUTHORIZED();
+      },
+      "stale-token",
+      0,
+      () => {
+        reads += 1;
+        // A resolver that "rotates" on every read would otherwise re-arm the
+        // retry for every request the host makes.
+        return {
+          baseUrl: "http://127.0.0.1:10777",
+          apiToken: `rotated-${reads}`,
+        };
+      }
+    );
+
+    for (let i = 0; i < 5; i += 1) {
+      await expect(client.health()).rejects.toThrow(/401/);
+    }
+    expect(reads, "one lockfile read per 30s window, not per 401").toBe(1);
+    // 5 first attempts + the single retry the one allowed rebase earned.
+    expect(calls).toBe(6);
+  });
+
+  it("leaves callers without a resolver exactly as they were", async () => {
+    let calls = 0;
+    const client = new MuonApiClient("http://127.0.0.1:10777", async () => {
+      calls += 1;
+      return UNAUTHORIZED();
+    });
+    await expect(client.health()).rejects.toThrow(/401/);
+    expect(calls).toBe(1);
+  });
+});
+
 describe("without a resolver, nothing changes", () => {
   it("behaves exactly as before for callers that do not supply one", async () => {
     // The CLI is a new process per command and re-reads the lockfile anyway.

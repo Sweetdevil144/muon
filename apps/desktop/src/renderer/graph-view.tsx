@@ -22,6 +22,7 @@ import {
   type SigmaNodeAttributes,
 } from "./lib/graph-adapter.js";
 import { defaultRepoPath, GraphRepoTabs } from "./graph-repo-tabs.js";
+import { useDeskTokens } from "./desk-tokens.js";
 
 // The Knowledge Graph center workspace tab (panel:graph): renders the workspace's
 // LOCAL knowledge graph with the same sigma + @sigma/edge-curve stack GitNexus uses.
@@ -63,6 +64,11 @@ export function GraphView(props: {
   const repos = props.status?.repos ?? [];
   const showTabs = repos.length > 1;
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // Canvas colours cannot come from the stylesheet; these follow the same
+  // tokens the CSS uses, and update when the desk theme flips.
+  const deskTokens = useDeskTokens(containerRef);
+  const deskTokensRef = useRef(deskTokens);
+  deskTokensRef.current = deskTokens;
   const sigmaRef = useRef<SigmaType<
     SigmaNodeAttributes,
     SigmaEdgeAttributes
@@ -311,7 +317,7 @@ export function GraphView(props: {
         await Promise.all([import("sigma"), import("@sigma/edge-curve")]);
       const container = containerRef.current;
       if (cancelled || !container) return;
-      const graph = buildGraph(data);
+      const graph = buildGraph(data, deskTokensRef.current.bg);
       // The factory (vs. the untyped default export) returns a program typed
       // for OUR exact node/edge attributes — the untyped default is what
       // produced the pre-existing sigma.js EdgeProgramType mismatch here.
@@ -324,10 +330,9 @@ export function GraphView(props: {
         container,
         {
           renderLabels: true,
-          // Quiet `--text-primary`. GitNexus OSS (useSigma.ts) uses the near-
-          // identical `#e4e4ed` on its own near-black canvas; MUON ties this to
-          // the actual design-token value instead of a one-off hex.
-          labelColor: { color: "#F3F4F6" },
+          // Quiet `--text-primary`, read from the live token rather than
+          // pinned to a hex — a near-white label is invisible on the light desk.
+          labelColor: { color: deskTokensRef.current.textPrimary },
           labelFont: "JetBrains Mono, ui-monospace, monospace",
           labelSize: 11,
           labelWeight: "500",
@@ -337,8 +342,8 @@ export function GraphView(props: {
           // OSS's Sigma-level fallbacks (useSigma.ts) — practically unreachable
           // since buildGraph always sets an explicit per-node/edge color, but
           // matched for fidelity.
-          defaultNodeColor: "#6b7280",
-          defaultEdgeColor: "#2a2a3a",
+          defaultNodeColor: deskTokensRef.current.textTertiary,
+          defaultEdgeColor: deskTokensRef.current.border,
           defaultEdgeType: "curved",
           edgeProgramClasses: { curved: EdgeCurveProgram },
           // Custom hover renderer — a dark pill + node-colored ring, ported
@@ -359,20 +364,20 @@ export function GraphView(props: {
             const paddingY = 5;
             const height = size + paddingY * 2;
             const width = textWidth + paddingX * 2;
-            context.fillStyle = "#1A1A1A"; // --panel
+            context.fillStyle = deskTokensRef.current.panel;
             context.beginPath();
             context.roundRect(x - width / 2, y - height / 2, width, height, 4);
             context.fill();
-            context.strokeStyle = hoverData.color || "#6366f1";
+            context.strokeStyle = hoverData.color || deskTokensRef.current.accent;
             context.lineWidth = 2;
             context.stroke();
-            context.fillStyle = "#F3F4F6"; // --text-primary
+            context.fillStyle = deskTokensRef.current.textPrimary;
             context.textAlign = "center";
             context.textBaseline = "middle";
             context.fillText(label, x, y);
             context.beginPath();
             context.arc(hoverData.x, hoverData.y, nodeRadius + 4, 0, Math.PI * 2);
-            context.strokeStyle = hoverData.color || "#6366f1";
+            context.strokeStyle = hoverData.color || deskTokensRef.current.accent;
             context.lineWidth = 2;
             context.globalAlpha = 0.5;
             context.stroke();
@@ -464,6 +469,19 @@ export function GraphView(props: {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, activeRepoPath, teardown, reloadNonce, startLayout]);
+  // A graph that is already open must repaint when the desk theme flips —
+  // sigma is constructed once, so the construction-time colours above would
+  // otherwise persist until the tab is closed and rebuilt (which would also
+  // discard the viewer's camera).
+  useEffect(() => {
+    const sigma = sigmaRef.current;
+    if (!sigma) return;
+    sigma.setSetting("labelColor", { color: deskTokens.textPrimary });
+    sigma.setSetting("defaultNodeColor", deskTokens.textTertiary);
+    sigma.setSetting("defaultEdgeColor", deskTokens.border);
+    sigma.refresh();
+  }, [deskTokens]);
+
 
   const zoomIn = useCallback(() => {
     sigmaRef.current?.getCamera().animatedZoom({ duration: 200 });

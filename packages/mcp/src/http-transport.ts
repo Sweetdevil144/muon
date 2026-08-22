@@ -36,7 +36,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { MuonApiClient } from "@muon/client";
 import { createToolDefinitions, type ToolDefinition } from "./handlers.js";
-import { buildMuonServer } from "./server-factory.js";
+import { resolveMcpIdentityGate } from "./identity-gate.js";
+import { createMcpObservatoryTaps } from "./observatory.js";
+import { buildMuonServer, type McpIdentityGate } from "./server-factory.js";
 
 /** The only ADDRESSES this transport will ever bind. Positive list — never a
  *  "reject known-bad" filter, which a new hostname alias could slip past.
@@ -181,6 +183,13 @@ export type LoopbackMcpHttpServerOptions = {
    * production callers must never widen it (see the file header).
    */
   createTools?: (client: MuonApiClient) => ToolDefinition[];
+  /**
+   * ADR-0052 identity gate. Defaults to `resolveMcpIdentityGate()` — the same
+   * verdict the stdio binary reaches — so this transport can never be the
+   * ungated sibling of a gated one. Injectable for tests only; `undefined`
+   * means ungated, which is every dev run.
+   */
+  identityGate?: McpIdentityGate;
 };
 
 export type LoopbackMcpHttpServer = {
@@ -210,7 +219,14 @@ function sessionTokenMatches(session: McpSession, token: string): boolean {
   );
 }
 
-type AuthProbeResult = "agent" | "operator" | "invalid" | "unavailable";
+type AuthProbeResult =
+  | "agent"
+  | "operator"
+  /** Valid token, no active job: a SCOPE refusal, distinct from a bad
+   *  credential and from an outage. */
+  | "unscoped"
+  | "invalid"
+  | "unavailable";
 
 async function probeAgentBearer(
   apiBase: string,
@@ -228,6 +244,14 @@ async function probeAgentBearer(
   }
   if (response.status === 401) {
     return "invalid";
+  }
+  // 403 IS A SCOPE REFUSAL, AND ITS OWN OUTCOME. Not `unavailable` — the brain
+  // answered, precisely, so reporting it as down would send the operator
+  // hunting a connectivity fault. And not `invalid` either: that path answers
+  // 401 "Missing or invalid API token", which is the very misdiagnosis the
+  // 401/403 split exists to end, just one layer further out.
+  if (response.status === 403) {
+    return "unscoped";
   }
   if (!response.ok) {
     return "unavailable";
@@ -251,7 +275,10 @@ async function handleRequest(
   res: ServerResponse,
   registry: McpSessionRegistry,
   options: Required<Pick<LoopbackMcpHttpServerOptions, "apiBase" | "path">> &
-    Pick<LoopbackMcpHttpServerOptions, "fetchImpl" | "createTools">
+    Pick<
+      LoopbackMcpHttpServerOptions,
+      "fetchImpl" | "createTools" | "identityGate"
+    >
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
   if (url.pathname !== options.path) {
@@ -273,6 +300,16 @@ async function handleRequest(
   );
   if (auth === "invalid") {
     unauthorized(res);
+    return;
+  }
+  if (auth === "unscoped") {
+    // Passed through as 403 with the phrase `remedyFor()` matches, so the agent
+    // is told it has no job rather than that its credential is wrong.
+    sendJson(res, 403, {
+      error: "forbidden",
+      message:
+        "This route requires the exact active job capability. The token is valid but this session has no active job. This transport refuses the whole tool surface without one — including the code-graph tools, which need no job when reached over stdio.",
+    });
     return;
   }
   if (auth === "operator") {
@@ -390,7 +427,18 @@ async function handleRequest(
     try {
       const client = new MuonApiClient(options.apiBase, options.fetchImpl ?? fetch, token);
       const tools = (options.createTools ?? ((c) => createToolDefinitions(c, {})))(client);
-      const server = buildMuonServer(tools);
+      // ADR-0095 — the loopback sessions record through the SAME taps as the
+      // stdio entries; a transport is not a consent boundary. (cubic's finding
+      // on the first draft: this caller was the one hole in MCP telemetry.)
+      let serverRef: ReturnType<typeof buildMuonServer> | undefined;
+      const server = buildMuonServer(tools, {
+        ...(options.identityGate ? { identityGate: options.identityGate } : {}),
+        telemetry: createMcpObservatoryTaps({
+          identityGate: options.identityGate,
+          clientName: () => serverRef?.getClientVersion()?.name,
+        }),
+      });
+      serverRef = server;
       const digest = tokenDigest(token);
 
       const transport = new StreamableHTTPServerTransport({
@@ -449,12 +497,18 @@ export async function startLoopbackMcpHttpServer(
     now: options.now ?? Date.now,
   };
 
+  // ADR-0052: resolved ONCE per listener (the manifest bake and the env flag
+  // cannot change under a running process); SATISFACTION is still read per
+  // call, inside the gate object.
+  const identityGate = options.identityGate ?? resolveMcpIdentityGate();
+
   const server = createNodeHttpServer((req, res) => {
     void handleRequest(req, res, registry, {
       apiBase: options.apiBase,
       path,
       fetchImpl: options.fetchImpl,
       createTools: options.createTools,
+      identityGate,
     });
   });
   server.headersTimeout = 10_000;

@@ -1,6 +1,6 @@
-// ── Bounded memory filter grammar (R5, mem0 §6 parity) ──────────────────────
+// ── Bounded memory filter grammar (R5, productM1 §6 parity) ──────────────────────
 //
-// mem0 exposes `eq ne gt gte lt lte in nin contains icontains` plus AND/OR/NOT
+// productM1 exposes `eq ne gt gte lt lte in nin contains icontains` plus AND/OR/NOT
 // over its memory reads. Ours was fixed-shape, so this module is the ONE typed,
 // bounded grammar every MUON surface shares: the backend routes, the MCP tools,
 // the client, and the CLI all import THIS validator and THIS evaluator. A second
@@ -27,7 +27,7 @@
 //
 // Everything here is PURE: no I/O, no clock, no ambient state.
 
-/** Every leaf comparison operator, mem0's exact set. */
+/** Every leaf comparison operator, productM1's exact set. */
 export const MEMORY_FILTER_OPERATORS = [
   "eq",
   "ne",

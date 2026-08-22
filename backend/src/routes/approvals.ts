@@ -7,7 +7,11 @@ import {
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import {
+  APPROVAL_GRANT_DURATION_TTL_MS,
   RECEIPT_ALLOWED_CLASSES,
+  approvalGrantDurationSchema,
+  isDurableApprovalGrantDuration,
+  isGrantableApprovalKind,
   WORKFLOW_AMENDABLE_STATUSES,
   WORKFLOW_AMENDED_EVENT_KIND,
   WORKFLOW_AMENDMENT_PROPOSED_EVENT_KIND,
@@ -45,6 +49,7 @@ import {
 } from "@muon/core";
 import { projectSetupConfirmationRequest } from "@muon/protocol/project-setup";
 import { checkExecutionContainment } from "../lib/approval-containment.js";
+import { validateWorkspacePath } from "../lib/workspace.js";
 import {
   OPERATOR_PRINCIPAL,
   agentJobPrincipal,
@@ -66,6 +71,7 @@ import {
   renewStandingApproverLease,
 } from "../lib/operator-settings.js";
 import { mirrorToGraph } from "../lib/graph.js";
+import { fingerprintEffectivePolicy } from "../lib/policy-profile.js";
 import { fingerprintManifest, renderCheckCommand } from "../lib/receipt.js";
 import { certifyWorktreeReviewCoverage } from "../lib/review-certification.js";
 
@@ -143,6 +149,12 @@ const resolveApprovalSchema = z.object({
   receipt: z
     .object({ ttlMs: z.number().int().min(60_000).max(3_600_000) })
     .optional(),
+  // ADR-0056: the GRADED form of the same opt-in. The operator picks one of
+  // three durations and the TTL is computed server-side from a fixed table, so
+  // this body carries no authority-bearing quantity at all. `once` is the
+  // default and mints nothing. Mutually exclusive with `receipt` above — two
+  // authorities on one decision is how a bounded surface stops being bounded.
+  grant: z.object({ duration: approvalGrantDurationSchema }).optional(),
   // Explicit operator-only REVIEW BLIND attestation. Both coordinates and the
   // digest must exactly match a fresh server recomputation. It cannot bypass
   // stale/missing graph evidence and full-auto never supplies it.
@@ -1468,6 +1480,19 @@ export async function registerApprovalRoutes(app: FastifyInstance) {
         "Merge review attestation and remembered-action receipts cannot be combined."
       );
     }
+    // ADR-0056: one decision carries at most ONE durable authority. The graded
+    // opt-in and the raw-TTL opt-in describe the same act with two different
+    // expiries, and a merge attestation is never rememberable at all.
+    if (payload.grant && payload.receipt) {
+      throw app.httpErrors.badRequest(
+        "Send either `grant.duration` or `receipt.ttlMs`, never both — one decision grants one durable authority."
+      );
+    }
+    if (payload.manualReview && payload.grant) {
+      throw app.httpErrors.badRequest(
+        "Merge review attestation and durable approval grants cannot be combined."
+      );
+    }
 
     const pending = await prisma.approvalRequest.findUnique({
       where: { id: params.approvalId },
@@ -1476,6 +1501,19 @@ export async function registerApprovalRoutes(app: FastifyInstance) {
       throw app.httpErrors.notFound(`Unknown approval '${params.approvalId}'.`);
     }
     if (pending.kind === "merge") {
+      // ADR-0056 D6: merge is always human-decided. Refuse the DURABLE grades
+      // here, before the decision, rather than landing the merge and quietly
+      // dropping the grade — an operator told "always" who got "once" is the
+      // failure this whole design is arranged around. `once` is the ordinary
+      // path and passes through untouched.
+      if (
+        payload.grant &&
+        isDurableApprovalGrantDuration(payload.grant.duration)
+      ) {
+        throw app.httpErrors.badRequest(
+          'A merge is decided by a human every time and can never be remembered; approve it with grant.duration "once".'
+        );
+      }
       return resolveMergeApproval(pending, payload);
     }
     if (payload.manualReview) {
@@ -1563,6 +1601,7 @@ export async function registerApprovalRoutes(app: FastifyInstance) {
 
     let approval: ApprovalRow;
     let receipt;
+    let grant;
     // True only when THIS request won the pending→terminal claim. A lost race
     // must not write a duplicate audit row attributing a decision it did not make.
     let claimedByThisRequest = false;
@@ -1574,9 +1613,36 @@ export async function registerApprovalRoutes(app: FastifyInstance) {
     // minting. Minting for eligible actions is unchanged (decision + mint land
     // atomically).
     let receiptSkippedReason: string | undefined;
-    if (payload.status === "approved" && payload.receipt) {
-      const receiptTtlMs = payload.receipt.ttlMs;
+    // ADR-0056: resolve the ONE durable authority this decision carries, stated
+    // positively. `once` (and an omitted field) mints nothing and is the
+    // default; `session` is the P0.4 receipt at the graded TTL; `always` is the
+    // chat-scoped grant. The TTL never comes from the graded body.
+    const durable = payload.grant
+      ? isDurableApprovalGrantDuration(payload.grant.duration)
+        ? {
+            target:
+              payload.grant.duration === "always"
+                ? ("grant" as const)
+                : ("receipt" as const),
+            ttlMs: APPROVAL_GRANT_DURATION_TTL_MS[payload.grant.duration],
+          }
+        : undefined
+      : payload.receipt
+        ? { target: "receipt" as const, ttlMs: payload.receipt.ttlMs }
+        : undefined;
+    if (payload.status === "approved" && durable) {
+      const durableTtlMs = durable.ttlMs;
+      // ONE eligibility derivation for BOTH grades, so `always` can never cover
+      // something `session` could not. The grant adds the policy fingerprint on
+      // top; it never relaxes a clause.
       const derived = await deriveReceiptBinding(params.approvalId);
+      const policyFingerprint =
+        derived.ok && durable.target === "grant"
+          ? await fingerprintEffectivePolicy({
+              workspacePath: derived.binding.workspacePath,
+              taskId: derived.binding.taskId,
+            })
+          : null;
       if (derived.ok) {
         const outcome = await prisma.$transaction(async (tx) => {
           const claim = await tx.approvalRequest.updateMany({
@@ -1586,20 +1652,42 @@ export async function registerApprovalRoutes(app: FastifyInstance) {
           if (claim.count !== 1) {
             return { claimed: false as const };
           }
+          const expiresAt = new Date(Date.now() + durableTtlMs);
+          if (durable.target === "grant") {
+            const {
+              jobId: originJobId,
+              sessionId: _sessionId,
+              manifestFingerprint: _manifestFingerprint,
+              ...chatBinding
+            } = derived.binding;
+            const minted = await tx.approvalGrant.create({
+              data: {
+                approvalId: params.approvalId,
+                ...chatBinding,
+                // Provenance only — never matched at redemption. Crossing the
+                // run boundary is the entire point of this grade.
+                originJobId,
+                policyFingerprint: policyFingerprint as string,
+                expiresAt,
+              },
+            });
+            return { claimed: true as const, grant: minted, receipt: undefined };
+          }
           const minted = await tx.approvalReceipt.create({
             data: {
               approvalId: params.approvalId,
               ...derived.binding,
-              expiresAt: new Date(Date.now() + receiptTtlMs),
+              expiresAt,
             },
           });
-          return { claimed: true as const, receipt: minted };
+          return { claimed: true as const, receipt: minted, grant: undefined };
         });
         if (!outcome.claimed) {
           approval = await resolveLostDecision();
         } else {
           approval = decidedApproval;
           receipt = outcome.receipt;
+          grant = outcome.grant;
           claimedByThisRequest = true;
         }
       } else {
@@ -1665,7 +1753,48 @@ export async function registerApprovalRoutes(app: FastifyInstance) {
           ?.details ?? {};
       const repoRoot = details.repoRoot;
       const setupHash = details.setupHash;
-      if (repoRoot && setupHash && `project-setup:${setupHash}` === approval.gateTag) {
+      // The evidence's repoRoot is AGENT-authored: filed by the runner in the
+      // honest case, but nothing stopped any agent-tier caller from filing a
+      // `project-setup:` gate naming an arbitrary path — so the human's
+      // approval would have bound to a subject the server never derived.
+      // Two fences before anything is read off that path:
+      //  1. it must sit inside the operator's allowed workspace roots, and
+      //  2. it must be the repo that CONTAINS the approval's own task
+      //     workspace — consent to "this task's repo" cannot be re-aimed.
+      let repoRootFenced = false;
+      if (repoRoot) {
+        const rootCheck = validateWorkspacePath(repoRoot);
+        if (rootCheck.ok) {
+          const task = approval.taskId
+            ? await prisma.task.findUnique({
+                where: { id: approval.taskId },
+                select: { workspacePath: true },
+              })
+            : null;
+          const taskWorkspace = task?.workspacePath ?? null;
+          repoRootFenced =
+            taskWorkspace != null &&
+            (taskWorkspace === rootCheck.path ||
+              taskWorkspace.startsWith(`${rootCheck.path}/`));
+          if (!repoRootFenced) {
+            console.error(
+              `[t5] project-setup gate ${approval.id} names repoRoot '${repoRoot}' ` +
+                `but its task's workspace is '${taskWorkspace ?? "unset"}'; ` +
+                `confirmation NOT recorded — consent binds to the task's own repo`
+            );
+          }
+        } else {
+          console.error(
+            `[t5] project-setup gate ${approval.id} repoRoot refused: ${rootCheck.reason}; confirmation NOT recorded`
+          );
+        }
+      }
+      if (
+        repoRoot &&
+        repoRootFenced &&
+        setupHash &&
+        `project-setup:${setupHash}` === approval.gateTag
+      ) {
         try {
           // Review finding 2 — the gate's reason/evidence are AGENT-authored
           // text; the human's consent must bind to what the REPO actually
@@ -1696,6 +1825,9 @@ export async function registerApprovalRoutes(app: FastifyInstance) {
       }
     }
 
+    if (grant) {
+      return { approval, grant };
+    }
     if (receipt) {
       return { approval, receipt };
     }
@@ -1753,7 +1885,12 @@ export async function registerApprovalRoutes(app: FastifyInstance) {
       // 404, not a best-effort skip.
       throw app.httpErrors.notFound(`Unknown approval '${approvalId}'.`);
     }
-    if (approval.kind !== "command") {
+    // ADR-0056 D6: an ALLOW-LIST, never "every kind except merge". `merge`,
+    // `deploy`, `dangerous_action` and `gate` are authority-shaped rather than
+    // content-shaped — there is no tool, digest or target to bind — so they stay
+    // human-decided every time, and an approval kind added tomorrow is
+    // human-decided by default because it is not on the list.
+    if (!isGrantableApprovalKind(approval.kind)) {
       return skip("Only a session command approval can mint a receipt.");
     }
     const evidenceParsed = approvalEvidenceSchema.safeParse(approval.evidence);

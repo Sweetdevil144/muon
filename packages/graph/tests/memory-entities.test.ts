@@ -18,7 +18,7 @@ import {
 import { MuonGraph } from "../src/muon-graph.js";
 
 /**
- * R2 entity extraction + linking (mem0 §5.3, ported signal / MUON fusion).
+ * R2 entity extraction + linking (productM1 §5.3, ported signal / MUON fusion).
  *
  * The extractor runs on UNTRUSTED agent-authored note text, and its output
  * becomes a retrieval join key, so the tests below are weighted towards the two
@@ -172,7 +172,7 @@ describe("rankByEntityMentions", () => {
 /**
  * A FLAT corpus: every key equally rare, so `entityIdf` is the same constant for
  * all of them. These three cases are about distinct-counting, query filtering and
- * total ordering — NOT about the D-mem0-1 popularity discount, which has its own
+ * total ordering — NOT about the D-productM1-1 popularity discount, which has its own
  * file (`memory-entity-idf.test.ts`). Holding df flat keeps each test measuring
  * the one property it was written for.
  */

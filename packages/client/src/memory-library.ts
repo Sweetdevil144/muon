@@ -10,7 +10,9 @@ import {
 
 const noteSchema = z.object({
   id: z.string(),
-  kind: z.enum(["decision", "constraint", "convention", "attempt", "question"]),
+  kind: z.enum(["decision", "constraint", "convention", "attempt", "question", "ownership"]),
+  // ADR-0091: present on ownership notes; tolerated absent (older backends).
+  owners: z.array(z.string()).nullable().optional(),
   text: z.string(),
   taskId: z.string().nullable().optional(),
   laneId: z.string().nullable().optional(),
@@ -208,7 +210,7 @@ export type MemoryLibraryQuery = {
   kind?: MemoryLibraryNote["kind"];
   trust?: MemoryLibraryNote["trust"];
   limit?: number;
-  /** R3, mem0's `show_expired`: include notes past their TTL. Default false. */
+  /** R3, productM1's `show_expired`: include notes past their TTL. Default false. */
   showExpired?: boolean;
   /** R5 bounded filter grammar. Validated server-side by the SAME @muon/protocol
    *  validator this type comes from, so the client cannot express a filter the

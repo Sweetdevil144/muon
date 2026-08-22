@@ -3,7 +3,8 @@ export type MemoryKind =
   | "constraint"
   | "convention"
   | "attempt"
-  | "question";
+  | "question"
+  | "ownership";
 
 /** Substrate §3.4 — structured result of an attempt note. */
 export type AttemptOutcome = "worked" | "abandoned" | "superseded" | "unknown";
@@ -79,6 +80,9 @@ export type MemoryNoteInput = {
   plannedCoordinates?: string[];
   /** Substrate §3.4: structured attempt result. Ignored unless `kind === "attempt"`. */
   outcome?: AttemptOutcome | null;
+  /** ADR-0091: principal strings naming who owns the note's surface —
+   *  orientation, never authority (D2). Ignored unless `kind === "ownership"`. */
+  owners?: string[] | null;
   /** TODO 4.8 / D7: reserved for derived notes; defaults to NULL (authored). */
   derivation?: NoteDerivation | null;
 };
@@ -137,13 +141,16 @@ export type MemoryNoteRecord = {
   expiresAt?: string | null;
   /** Substrate §3.4: null/absent = legacy attempt with no structured outcome. */
   outcome?: AttemptOutcome | null;
+  /** ADR-0091: null/absent on every non-ownership kind and on prose-only
+   *  ownership notes. Orientation, never authority. */
+  owners?: string[] | null;
   /** TODO 4.8 / D7: null/absent = legacy authored statement. */
   derivation?: NoteDerivation | null;
   /** Operator review stamp; null/absent = no stamp yet. */
   reviewStatus?: NoteReviewStatus | null;
 };
 
-/** How a deduped write resolved (mem0-inspired op vocabulary, governed). */
+/** How a deduped write resolved (productM1-inspired op vocabulary, governed). */
 export type MemoryWriteAction =
   | "inserted"
   | "duplicate"
@@ -284,7 +291,7 @@ export type MemoryRecallFilter = {
    *  chatId ONLY; it can never widen beyond a single chat. Ignored unless
    *  `governedOnly` is set; absent → the pre-#133 confirmed-only gate. */
   crewChatId?: string;
-  /** R3 TTL (mem0's `show_expired`): include notes past their `expiresAt`. Default
+  /** R3 TTL (productM1's `show_expired`): include notes past their `expiresAt`. Default
    *  false, i.e. an unconfirmed, low/medium-trust, agent-authored note stops being
    *  recalled once its deadline passes. SERVER-OWNED, like `crewVisible`: it is an
    *  operator opt-in and must never be accepted from an agent body. */

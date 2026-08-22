@@ -168,12 +168,25 @@ describe("startLoopbackMcpHttpServer", () => {
     expect(seenTokens).toEqual(["Bearer token-one", "Bearer token-two"]);
   });
 
-  it("refuses invalid and operator-tier bearers before allocating an MCP session", async () => {
+  it("refuses invalid, operator-tier and UNSCOPED bearers before allocating a session", async () => {
     const fetchImpl = vi.fn(async (input: string | URL, init?: RequestInit) => {
       expect(isAuthProbe(input)).toBe(true);
       const token = (init?.headers as Record<string, string>).Authorization;
       if (token === "Bearer operator-token") {
         return mockResponse({ authenticated: true, tier: "operator" });
+      }
+      if (token === "Bearer unscoped-token") {
+        // A token MUON issued whose job is over. Mapping this to `invalid`
+        // would answer 401 "Missing or invalid API token" — the misdiagnosis
+        // the 401/403 split exists to end, one layer out — and mapping it to
+        // `unavailable` would report a healthy brain as down.
+        return mockResponse(
+          {
+            error: "forbidden",
+            message: "This route requires the exact active job capability.",
+          },
+          403
+        );
       }
       return mockResponse({ error: "unauthorized" }, 401);
     });
@@ -185,6 +198,7 @@ describe("startLoopbackMcpHttpServer", () => {
     for (const [token, status] of [
       ["invalid-token", 401],
       ["operator-token", 403],
+      ["unscoped-token", 403],
     ] as const) {
       const response = await fetch(running.url, {
         method: "POST",

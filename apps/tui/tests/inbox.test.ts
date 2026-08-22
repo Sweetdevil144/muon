@@ -374,3 +374,114 @@ describe("agents' blocking questions reach the rail (parity item 1)", () => {
     expect(inbox.render(60)[0]).toContain("1 need");
   });
 });
+
+// ── ADR-0086 D3: the brain's pre-answer renders AT the decision point ───────
+describe("the question row tells its whole story (ADR-0086 D3)", () => {
+  const baseQuestion = {
+    id: "q-pre-1",
+    taskId: "task-1",
+    jobId: "job-1",
+    askedByVendor: "codex",
+    subject: "What is the retry budget?",
+    body: "The brief names none.",
+    status: "open" as const,
+    askedAt: "2026-08-22T10:00:00.000Z",
+  };
+
+  it("renders the first confirmed note's coordinate + excerpt beneath the question, with an honest count of the rest", () => {
+    const out = plain(
+      new Inbox({
+        rows: [],
+        cursor: 0,
+        focused: false,
+        questions: [
+          {
+            ...baseQuestion,
+            memoryPreAnswer: {
+              disclosedAt: "2026-08-22T10:00:01.000Z",
+              notes: [
+                {
+                  noteId: "mem-1a2b3c4d5e6f",
+                  kind: "constraint",
+                  excerpt:
+                    "The retry budget is capped at three attempts per lane.",
+                },
+                {
+                  noteId: "mem-second",
+                  kind: "decision",
+                  excerpt: "Related decision.",
+                },
+              ],
+            },
+          },
+        ],
+      }).render(100)
+    );
+    expect(out).toContain("brain: constraint mem-1a2b3c4d");
+    expect(out).toContain('"The retry budget is capped at three');
+    expect(out).toContain("(+1 more)");
+  });
+
+  it("a question with no pre-answer renders no brain line — absence is the honest answer", () => {
+    const out = plain(
+      new Inbox({
+        rows: [],
+        cursor: 0,
+        focused: false,
+        questions: [baseQuestion],
+      }).render(100)
+    );
+    expect(out).toContain("codex: What is the retry budget?");
+    expect(out).not.toContain("brain:");
+  });
+
+  it("ADR-0086 D3 (via 0082): the CREW's context block renders beneath the pre-answer, standing verbatim, with an honest count", () => {
+    const out = plain(
+      new Inbox({
+        rows: [],
+        cursor: 0,
+        focused: false,
+        questions: [
+          {
+            ...baseQuestion,
+            crewContext: {
+              disclosedAt: "2026-08-22T10:00:02.000Z",
+              items: [
+                {
+                  kind: "packet",
+                  id: "handoff-9f8e7d6c5b4a",
+                  standing: "typed_degraded packet",
+                  excerpt: "Reviewer wrapped with two failing checks noted.",
+                },
+                {
+                  kind: "note",
+                  id: "mem-crew-2",
+                  standing: "unconfirmed proposal",
+                  excerpt: "A sibling proposed the cap is four.",
+                },
+              ],
+            },
+          },
+        ],
+      }).render(100)
+    );
+    // The standing string is the CONTRACT ("what your crew currently
+    // believes") — rendered verbatim, vouching for nothing.
+    expect(out).toContain("crew: packet handoff-9f8e");
+    expect(out).toContain("[typed_degraded packet]");
+    expect(out).toContain('"Reviewer wrapped with two failing');
+    expect(out).toContain("(+1 more)");
+  });
+
+  it("no crew context renders no crew line — absence stays honest", () => {
+    const out = plain(
+      new Inbox({
+        rows: [],
+        cursor: 0,
+        focused: false,
+        questions: [baseQuestion],
+      }).render(100)
+    );
+    expect(out).not.toContain("crew:");
+  });
+});

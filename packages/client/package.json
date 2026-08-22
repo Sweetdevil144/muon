@@ -101,6 +101,11 @@
       "import": "./dist/crew-liveness.js",
       "default": "./dist/crew-liveness.js"
     },
+    "./session-slug": {
+      "types": "./dist/session-slug.d.ts",
+      "import": "./dist/session-slug.js",
+      "default": "./dist/session-slug.js"
+    },
     "./types": {
       "types": "./dist/types.d.ts",
       "import": "./dist/types.js",
@@ -141,6 +146,26 @@
       "import": "./dist/gitnexus-index-lock.js",
       "default": "./dist/gitnexus-index-lock.js"
     },
+    "./github-identity-gate": {
+      "types": "./dist/github-identity-gate.d.ts",
+      "import": "./dist/github-identity-gate.js",
+      "default": "./dist/github-identity-gate.js"
+    },
+    "./gitnexus-freshness": {
+      "types": "./dist/gitnexus-freshness.d.ts",
+      "import": "./dist/gitnexus-freshness.js",
+      "default": "./dist/gitnexus-freshness.js"
+    },
+    "./gitnexus-reindex": {
+      "types": "./dist/gitnexus-reindex.d.ts",
+      "import": "./dist/gitnexus-reindex.js",
+      "default": "./dist/gitnexus-reindex.js"
+    },
+    "./download-host": {
+      "types": "./dist/download-host.d.ts",
+      "import": "./dist/download-host.js",
+      "default": "./dist/download-host.js"
+    },
     "./vendors": {
       "types": "./dist/vendors.d.ts",
       "import": "./dist/vendors.js",
@@ -160,6 +185,21 @@
       "types": "./dist/mcp-probe.d.ts",
       "import": "./dist/mcp-probe.js",
       "default": "./dist/mcp-probe.js"
+    },
+    "./observatory": {
+      "types": "./dist/observatory.d.ts",
+      "import": "./dist/observatory.js",
+      "default": "./dist/observatory.js"
+    },
+    "./observatory-upload": {
+      "types": "./dist/observatory-upload.d.ts",
+      "import": "./dist/observatory-upload.js",
+      "default": "./dist/observatory-upload.js"
+    },
+    "./citation-view": {
+      "types": "./dist/citation-view.d.ts",
+      "import": "./dist/citation-view.js",
+      "default": "./dist/citation-view.js"
     },
     "./handoff-view": {
       "types": "./dist/handoff-view.d.ts",

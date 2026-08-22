@@ -23,6 +23,10 @@ const eslintConfig = defineConfig([
     // The publishable CLI bundle (bundle-release.mjs output).
     "apps/cli/release/**",
     ".muon/**",
+    // The local GitNexus index: generated artifacts (a CJS runner among them),
+    // gitignored, and not MUON source. Linting a tool's own output reports
+    // errors no MUON change can fix.
+    ".gitnexus/**",
   ]),
   {
     rules: {

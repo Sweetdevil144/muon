@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { MuonApiClient } from "@muon/client";
+import { MUON_ATTACHED_COORDINATOR_CONTROL_REMAINDER } from "@muon/protocol";
+import { MUON_EXCHANGE_CONTRACTS } from "@muon/protocol";
 import { createToolDefinitions, type ToolDefinition } from "../src/handlers.js";
 import { createObserverModeToolDefinitions } from "../src/observer-tools.js";
 import { buildMuonServer } from "../src/server-factory.js";
@@ -40,6 +42,16 @@ describe("the grant it reports is the one the server registered", () => {
     expect(body.grant.toolCount).toBe(composed.length);
     expect(body.grant.tools).toContain("fleet_status");
     expect(body.grant.mode).toBe("observer");
+  });
+
+  it("discloses the exchange contracts this install speaks (ADR-0070)", async () => {
+    const api = client();
+    const tools = createToolDefinitions(api, {});
+    const body = await answer(whoamiOf(tools));
+    expect(body.contracts).toEqual({
+      packetFamily: MUON_EXCHANGE_CONTRACTS.packetFamily,
+      memoryPack: MUON_EXCHANGE_CONTRACTS.memoryPack,
+    });
   });
 
   it("understates rather than overstates when nothing bound the surface", async () => {
@@ -176,6 +188,122 @@ describe("an unknown coordinate is reported unknown, never guessed", () => {
   });
 });
 
+// ── H14: the seat, its lease, and what it deliberately cannot do ─────────────
+//
+// "What may I do, and what must I not" has to be answerable in ONE call. The
+// failure these pin is the confident wrong answer in either direction: a
+// hand-launched session describing itself as MUON's coordinator, or a real
+// attached seat unable to say when its lease runs out or which verbs are absent.
+describe("whoami names the seat, its lease, and its remainder", () => {
+  const attachedScope = {
+    seat: "attached-coordinator" as const,
+    jobId: "attached-root-job",
+    chatId: "attached-chat",
+    attached: {
+      expiresAt: "2026-08-17T09:30:00.000Z",
+      bootstrap: true,
+      vendor: "claude-code",
+    },
+  };
+
+  it("an ATTACHED seat reports chat, job, lease expiry, bootstrap state and vendor", async () => {
+    const tools = createToolDefinitions(client(), attachedScope);
+    buildMuonServer(tools, { mode: "attached-coordinator" });
+    const body = await answer(whoamiOf(tools));
+    expect(body.seat.kind).toBe("attached-coordinator");
+    expect(body.seat.chatId).toBe("attached-chat");
+    expect(body.seat.jobId).toBe("attached-root-job");
+    expect(body.seat.leaseExpiresAt).toBe("2026-08-17T09:30:00.000Z");
+    // ADR-0049: the pre-first-heartbeat window is a DIFFERENT horizon, and a
+    // seat that cannot tell the two apart mis-reads how long it has.
+    expect(body.seat.bootstrap).toBe(true);
+    expect(body.seat.vendor).toBe("claude-code");
+  });
+
+  it("an ATTACHED seat names the three control verbs it does NOT hold, and where they are answered", async () => {
+    const tools = createToolDefinitions(client(), attachedScope);
+    buildMuonServer(tools, { mode: "attached-coordinator" });
+    const body = await answer(whoamiOf(tools));
+    // Pinned against the protocol constant, not a literal: if the remainder
+    // ever changes, this must change with it rather than quietly disagree.
+    expect(body.seat.remainder).toEqual([
+      ...MUON_ATTACHED_COORDINATOR_CONTROL_REMAINDER,
+    ]);
+    expect(body.seat.remainder).toEqual([
+      "set_fleet",
+      "raise_budget",
+      "apply_workflow",
+    ]);
+    // ABSENT, not withheld: a seat told a verb is withheld tries it anyway and
+    // routes around the refusal. It must also learn where the verb IS answered,
+    // or "absent" reads as "impossible".
+    expect(body.seat.remainderNote).toMatch(/absent/i);
+    expect(body.seat.remainderNote).toMatch(/operator surface/i);
+  });
+
+  it("a seat whose lease facts never arrived says UNKNOWN rather than inventing an expiry", async () => {
+    // The failure this prevents: a composed-but-unwired seat answering with a
+    // reassuring default. A missing expiry must read as missing.
+    const tools = createToolDefinitions(client(), {
+      seat: "attached-coordinator",
+      jobId: "attached-root-job",
+      chatId: "attached-chat",
+    });
+    buildMuonServer(tools, { mode: "attached-coordinator" });
+    const body = await answer(whoamiOf(tools));
+    expect(body.seat.kind).toBe("attached-coordinator");
+    expect(body.seat.leaseExpiresAt).toBeNull();
+    expect(body.seat.bootstrap).toBeNull();
+    expect(body.seat.vendor).toBeNull();
+  });
+
+  it("a plain base install is told plainly that it is NOT a coordinator", async () => {
+    // The H14 acceptance criterion: a human Claude session without attach must
+    // not be described as a coordinator, and must not have seat facts invented
+    // for it. Silence would read as yes.
+    const tools = createToolDefinitions(client(), {});
+    buildMuonServer(tools, {});
+    const body = await answer(whoamiOf(tools));
+    expect(body.seat.kind).toBe("not-a-coordinator");
+    expect(body.seat.leaseExpiresAt).toBeNull();
+    expect(body.seat.vendor).toBeNull();
+    expect(body.seat.remainder).toEqual([]);
+    expect(body.seat.leaseNote).toMatch(/NO coordinator seat/);
+    // It must name the HUMAN action that mints one, and say the session cannot.
+    expect(body.seat.leaseNote).toMatch(/muon mcp attach/);
+    expect(body.seat.leaseNote).toMatch(/cannot mint one for yourself/);
+  });
+
+  it("a DISPATCHED orchestrator is neither an attached seat nor a non-coordinator", async () => {
+    // The two wrong answers this rules out: quoting an attach lease it never
+    // had, and telling a real coordinator it holds no seat.
+    const tools = createToolDefinitions(client(), {
+      jobId: "orchestrator-job",
+      chatId: "chat-a",
+    });
+    buildMuonServer(tools, { mode: "orchestrator" });
+    const body = await answer(whoamiOf(tools));
+    expect(body.seat.kind).toBe("dispatched-orchestrator");
+    expect(body.seat.jobId).toBe("orchestrator-job");
+    expect(body.seat.leaseExpiresAt).toBeNull();
+    expect(body.seat.remainder).toEqual([]);
+    expect(body.seat.leaseNote).toMatch(/no lease expiry to report/);
+  });
+
+  it("answers the whole seat question without a network call", async () => {
+    // The lease is read from the session's own scope, never fetched: whoami's
+    // value is being answerable exactly when the brain is not.
+    const fetcher = vi.fn();
+    const tools = createToolDefinitions(
+      new MuonApiClient("http://127.0.0.1:4000", fetcher),
+      attachedScope
+    );
+    buildMuonServer(tools, { mode: "attached-coordinator" });
+    await whoamiOf(tools).handler({});
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+});
+
 describe("it reads, and only reads", () => {
   it("makes no network call", async () => {
     // Its whole value is being answerable when everything else is failing.
@@ -197,6 +325,29 @@ describe("it reads, and only reads", () => {
       destructive: false,
       idempotent: true,
     });
+  });
+
+  it("never returns the attached seat's capability token, only its coordinates", async () => {
+    // H14 threaded the ATTACHED CAPABILITY's facts into whoami. The capability
+    // file also holds the exact-job bearer and the delegation token, and both
+    // sit on the same scope object this handler reads — so the one thing that
+    // must be proved is that widening whoami's answer did not widen its
+    // disclosure. The lease is a coordinate; the bearer is not.
+    const tools = createToolDefinitions(client(), {
+      seat: "attached-coordinator",
+      jobId: "attached-root-job",
+      chatId: "attached-chat",
+      apiToken: "attached-capability-bearer",
+      attached: {
+        expiresAt: "2026-08-17T12:00:00.000Z",
+        bootstrap: false,
+        vendor: "claude-code",
+      },
+    });
+    buildMuonServer(tools, { mode: "attached-coordinator" });
+    const serialized = JSON.stringify(await whoamiOf(tools).handler({}));
+    expect(serialized).not.toContain("attached-capability-bearer");
+    expect(serialized).toContain("2026-08-17T12:00:00.000Z");
   });
 
   it("never returns the session's bearer token or preflight nonce", async () => {

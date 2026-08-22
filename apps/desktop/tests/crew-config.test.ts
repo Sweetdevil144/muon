@@ -46,9 +46,24 @@ describe("crew-config — the registry projections", () => {
 
   it("an ineligible vendor is never normalized into the orchestrator seat", () => {
     // The type is `VendorId` now; the RUNTIME projection is what refuses.
-    const crew = normalizeCrewConfig({ orchestratorVendor: "cursor" });
-    expect(crew.orchestratorVendor).not.toBe("cursor");
+    // ADR-0057 opened the seat to every PUBLIC vendor, so the witness here is
+    // `fake` — registered, and deliberately seatless. That keeps the guard
+    // testing what it claims to: normalization keys on the coordinator seat,
+    // not on "is this a vendor MUON has heard of".
+    const crew = normalizeCrewConfig({ orchestratorVendor: "fake" });
+    expect(crew.orchestratorVendor).not.toBe("fake");
     expect(ORCHESTRATOR_VENDORS).toContain(crew.orchestratorVendor);
+  });
+
+  it("ADR-0057: cursor and opencode ARE eligible now, and survive normalizing", () => {
+    // The positive control for the test above — a projection that refused
+    // everything would pass it, and would silently strand the new seats.
+    for (const vendor of ["cursor", "opencode"] as const) {
+      expect(ORCHESTRATOR_VENDORS).toContain(vendor);
+      expect(normalizeCrewConfig({ orchestratorVendor: vendor }).orchestratorVendor).toBe(
+        vendor
+      );
+    }
   });
 });
 
@@ -80,7 +95,9 @@ describe("crew-config", () => {
 
   it("rejects unknown orchestrator vendors and bad models", () => {
     const crew = normalizeCrewConfig({
-      orchestratorVendor: "cursor",
+      // An id outside the registry entirely (see the seat test above for why
+      // `cursor` is no longer the right witness).
+      orchestratorVendor: "kiro",
       orchestratorModel: "not-a-real-model!!!!",
       orchestratorEffort: "extreme",
     });

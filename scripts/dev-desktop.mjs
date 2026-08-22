@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -96,6 +96,51 @@ export function buildCommandPlan(options) {
     longRunning: true,
   });
   return commands;
+}
+
+/**
+ * Load the repo-root `.env` into this process BEFORE the steps spawn.
+ *
+ * ADR-0052 arms the desktop's GitHub identity gate — and enables the device
+ * flow the Settings panel offers — from `MUON_GITHUB_CLIENT_ID`. In a packaged
+ * build that value is baked at release; in DEVELOPMENT there is no bake, so the
+ * Electron main process reads it from the environment it inherits. Without this,
+ * `npm run dev:desktop:fresh` only ever saw the client id if the founder had
+ * exported it in the shell they happened to launch from — so GitHub connect was
+ * silently unavailable in one terminal and available in another, which is the
+ * kind of difference nobody attributes to a shell.
+ *
+ * Deliberately narrow: it never OVERWRITES a value already in the environment
+ * (an explicit export still wins), it only reads the root file the brain's own
+ * dotenv would read from this CWD, and it parses `KEY=value` without executing
+ * anything. Not dotenv itself — this script is dependency-free by design and
+ * runs before any workspace install has necessarily happened.
+ */
+export function loadRepoEnv(
+  file = path.join(REPO_ROOT, ".env"),
+  env = process.env
+) {
+  if (!existsSync(file)) return [];
+  const applied = [];
+  for (const raw of readFileSync(file, "utf8").split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    if (env[key] !== undefined && env[key] !== "") continue;
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"') && value.length > 1) ||
+      (value.startsWith("'") && value.endsWith("'") && value.length > 1)
+    ) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
+    applied.push(key);
+  }
+  return applied;
 }
 
 function verifyRepository() {
@@ -246,6 +291,14 @@ async function main() {
   }
   const options = parseArgs(process.argv.slice(2));
   verifyRepository();
+  // Before ANY step spawns: every child inherits this process's environment.
+  loadRepoEnv();
+  if (!process.env.MUON_GITHUB_CLIENT_ID?.trim()) {
+    console.log(
+      "[MUON dev] No MUON_GITHUB_CLIENT_ID (checked the environment and .env) — " +
+        "GitHub connect and the identity gate stay unavailable this run."
+    );
+  }
   if (options.buildMode === "fast") {
     verifyFastArtifacts();
   }

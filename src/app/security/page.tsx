@@ -1,98 +1,101 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { MarketingShell } from "@/components/marketing/marketing-shell";
-import { PageIntro } from "@/components/marketing/page-intro";
+
+import { SiteShell } from "@/components/muon/SiteShell";
+import { PageHero } from "@/components/muon/PageHero";
+
+const TITLE = "Security — custody, authority and evidence | MUON";
+const DESCRIPTION =
+  "Plain-language summary of how MUON treats custody, authority and evidence: local by default, people approve what matters, and an inspectable trail.";
 
 export const metadata: Metadata = {
-  title: "Security, MUON",
-  description:
-    "How MUON handles local custody, human approval, audit evidence, and vulnerability disclosure.",
+  title: TITLE,
+  description: DESCRIPTION,
+  openGraph: {
+    title: TITLE,
+    description: DESCRIPTION,
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+  },
 };
 
-const sections = [
+
+const POSTURE = [
   {
     title: "Local by default",
-    copy:
-      "MUON runs on your machine. Mission data, memory, and activity stay local unless you choose to export them. MUON does not take custody of your Claude, Codex, Cursor, or OpenCode logins. Those stay with their own vendors.",
+    body: "MUON runs on your machine. Mission data, memory and activity stay local unless you choose to export them. MUON does not take custody of your Claude, Codex, Cursor or OpenCode logins.",
   },
   {
     title: "People approve what matters",
-    copy:
-      "Sensitive edits, shell commands, and shipping wait for a person by default. Full Auto is an explicit, per-agent standing consent you can revoke at any time, and every automatic approval is recorded with its subject and risk. Nothing auto-approves unless you switched that on.",
+    body: "Sensitive edits, shell commands and shipping wait for a person by default. Full Auto is an explicit, per-agent standing consent you can revoke at any time, and every automatic approval is recorded.",
   },
   {
     title: "A trail you can inspect",
-    copy:
-      "Approvals and key decisions keep identity and request context where the product supports it. Activity history is append-only. A full enterprise audit export surface is still being completed.",
+    body: "Approvals and key decisions keep identity and request context where the product supports it. Activity history is append-only. A full enterprise audit export surface is still being completed.",
   },
   {
     title: "Secrets stay out of logs",
-    copy:
-      "Diagnostic paths scrub tokens and key-shaped strings before they hit logs or CI. Builds fail if secret-handling code logs the wrong way.",
+    body: "Diagnostic paths scrub tokens and key-shaped strings before they hit logs or CI. Builds fail if secret-handling code logs the wrong way.",
   },
   {
     title: "What is not claimed yet",
-    copy:
-      "MUON does not claim SOC 2, ISO 27001, or a finished third-party penetration test for the current early releases. Internal adversarial tests cover refusal paths and containment. Those are not a substitute for external attestation.",
+    body: "MUON does not claim SOC 2, ISO 27001 or a finished third-party penetration test for current early releases. Internal adversarial tests cover refusal paths and containment; they are not a substitute for external attestation.",
   },
   {
     title: "Shared responsibility",
-    copy:
-      "You keep AI tools updated, protect the machine and operator access, review approvals, and avoid committing secrets into projects MUON works on. MUON is responsible for narrow permissions, memory boundaries, and failing closed when authority cannot be verified.",
+    body: "You keep AI tools updated, protect operator access and review approvals. MUON is responsible for narrow permissions, memory boundaries and failing closed when authority cannot be verified.",
   },
   {
     title: "Vulnerability disclosure",
-    copy:
-      "Report security issues to security@muonlabs.dev. We aim to acknowledge reports within 3 business days and share a remediation timeline within 14 days for confirmed issues that affect confidentiality, integrity, or availability of governed actions.",
+    body: "Report security issues to security@muonlabs.dev. We aim to acknowledge within 3 business days and share a remediation timeline within 14 days for confirmed issues.",
   },
-] as const;
+];
 
-export default function SecurityPage() {
+function SecurityPage() {
   return (
-    <MarketingShell>
-      <PageIntro
-        action={{ label: "Talk to us about enterprise fit", href: "/enterprise" }}
+    <SiteShell>
+      <PageHero
         eyebrow="Security"
-        intro="Plain-language summary of how MUON treats custody, authority, and evidence, including what is shipped today and what is still open."
         title="Security and trust boundaries"
+        intro="A plain-language summary of how MUON treats custody, authority and evidence, including what is shipped today and what is still open."
+        cta={{ label: "Talk to us about enterprise fit", to: "/enterprise" }}
       />
-      <section className="mx-auto max-w-5xl px-4 py-20 sm:px-6 sm:py-28">
-        <p className="mb-10 max-w-3xl text-sm leading-7 text-black/55">
-          Last updated 2026-08-01. This page describes product posture, not a
-          certification.
+
+      <section className="py-20 lg:py-28">
+        <p className="mb-6 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+          This page describes product posture, not a certification.
         </p>
-        <div className="border-t-2 border-[var(--bauhaus-ink)]">
-          {sections.map((section, index) => (
-            <div
-              className="grid gap-3 border-b-2 border-[var(--bauhaus-ink)] py-8 sm:grid-cols-[4rem_1fr] sm:gap-8 sm:py-10"
-              key={section.title}
-            >
-              <p className="text-sm font-black text-[var(--bauhaus-red)]">
-                {String(index + 1).padStart(2, "0")}
-              </p>
-              <div>
-                <h2 className="text-xl font-black uppercase tracking-[-0.03em] sm:text-2xl">
-                  {section.title}
+        <ol className="panel divide-y divide-border">
+          {POSTURE.map((item, i) => (
+            <li key={item.title} className="grid grid-cols-12 gap-4 p-6">
+              <div className="col-span-12 font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground lg:col-span-2">
+                {String(i + 1).padStart(2, "0")}
+              </div>
+              <div className="col-span-12 lg:col-span-10">
+                <h2 className="mb-2 font-sans text-lg font-semibold tracking-[-0.01em]">
+                  {item.title}
                 </h2>
-                <p className="mt-4 max-w-3xl text-lg leading-8 text-black/60">
-                  {section.copy}
+                <p className="max-w-[80ch] text-[0.9375rem] leading-relaxed text-muted-foreground">
+                  {item.body}
                 </p>
               </div>
-            </div>
+            </li>
           ))}
-        </div>
-        <div className="mt-14 flex flex-col gap-6 bg-[var(--bauhaus-paper)] p-8 sm:flex-row sm:items-center sm:justify-between">
-          <p className="text-2xl font-black uppercase tracking-[-0.03em]">
+        </ol>
+
+        <div className="panel mt-10 flex flex-col items-start justify-between gap-6 p-8 lg:flex-row lg:items-center">
+          <h2 className="font-sans text-[1.75rem] font-semibold tracking-[-0.02em]">
             Need a deeper security conversation?
-          </p>
-          <Link
-            className="shrink-0 border-2 border-[var(--bauhaus-ink)] bg-[var(--bauhaus-ink)] px-5 py-4 text-center text-sm font-black uppercase tracking-[0.1em] text-white"
-            href="/enterprise"
-          >
+          </h2>
+          <Link href="/enterprise" className="btn-primary">
             Contact enterprise
           </Link>
         </div>
       </section>
-    </MarketingShell>
+    </SiteShell>
   );
 }
+
+export default SecurityPage;

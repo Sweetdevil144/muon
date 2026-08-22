@@ -1,6 +1,13 @@
 import { buildMemoryDecision, type MemoryAction } from "@muon/client";
-import { buildApprovalDecision } from "@muon/client";
-import type { MuonApiClient } from "@muon/client";
+import { buildApprovalDecision,
+  REMEMBER_ACTION_TTL_MS,
+  REMEMBER_ACTION_INELIGIBLE_SENTENCE,
+} from "@muon/client";
+import type {
+  DeskDigest, MuonApiClient,
+  ManualReviewAttestation,
+  ApprovalRequest,
+} from "@muon/client";
 import type { BrainSnapshot } from "../lib/brain-store.js";
 import { Shell } from "./shell.js";
 import { sidebarFromSnapshot, tabsFromState } from "./from-snapshot.js";
@@ -12,6 +19,7 @@ import { GovernedPane } from "./governed-pane.js";
 import { FrozenPane } from "./frozen-pane.js";
 import { MemoryPane, type MemoryPaneState } from "./memory-pane.js";
 import { openReview, ReviewPane, type ReviewState } from "./review-pane.js";
+import { mergeApproveRefusal, resolveAttest } from "./merge-review.js";
 import {
   buildSpawnMenuState,
   resolveSpawnSelection,
@@ -26,6 +34,16 @@ import {
 } from "./keys.js";
 import { IMPLEMENTED_DESTINATIONS, Nav, navDestinationAt } from "./nav.js";
 import { HelpPane } from "./help-pane.js";
+import { DigestPane } from "./digest-pane.js";
+import { TasksPane, type TasksPaneState } from "./tasks-pane.js";
+import { WorkflowsPane, type WorkflowsPaneState } from "./workflows-pane.js";
+import {
+  CrewDetailPane,
+  type CrewDetailState,
+} from "./crew-detail-pane.js";
+import type { CrewPanelLoad } from "../lib/crew-view.js";
+import { ContextPane, type ContextPaneState } from "./context-pane.js";
+import { buildPreEditView, parseEditTarget } from "@muon/client";
 import {
   noteReveal,
   topSurface,
@@ -128,6 +146,13 @@ export type DeskDeps = {
    * extraction dropped this call and the commit claimed no behaviour change.
    */
   readonly refresh?: () => Promise<unknown> | void;
+  /**
+   * ADR-0087 M7: resolve this workspace's chat and load its crew panel
+   * (roles + coordination) through the SHARED `loadCrewPanel` seam. The
+   * entry composes it with the store's credentials; tests inject a stub.
+   * Null = this workspace has no active chat yet — stated, not an error.
+   */
+  readonly loadCrewDetail?: () => Promise<CrewPanelLoad | null>;
 };
 
 /**
@@ -141,6 +166,10 @@ const ZONE_BLOCKING_SURFACES = [
   "destinations",
   "timeline",
   "settings",
+  "tasks",
+  "workflows",
+  "crew-detail",
+  "context",
 ] as const satisfies readonly Surface[];
 
 /**
@@ -148,6 +177,9 @@ const ZONE_BLOCKING_SURFACES = [
  * from a live tab without a second lookup, and so the two id spaces can never
  * collide (a session id is a cuid).
  */
+/** The inbox rows type the registry's verbs receive. */
+type InboxRows = ReturnType<typeof buildInboxRows>;
+
 const FROZEN_TAB_PREFIX = "frozen:";
 function frozenTabId(index: number): string {
   return `${FROZEN_TAB_PREFIX}${index}`;
@@ -168,8 +200,52 @@ export class Desk {
   private inboxCursor = 0;
   private inboxFocused = false;
   private spawnMenu: SpawnMenuState | null = null;
-  private review: ReviewState | null = null;
-  private memory: MemoryPaneState | null = null;
+  /**
+   * ADR-0087 D3 — THE GATE, discriminated. The three gate surfaces used to
+   * be three independent nullable fields, so "composer AND review both
+   * open" was representable (unreachable by keys, resolved by precedence —
+   * exactly the state class the refactor exists to delete). ONE field
+   * holds at most one gate; the named accessors below keep every call
+   * site reading `this.review` etc. while the invariant is structural.
+   */
+  private gate:
+    | { kind: "composer"; state: ComposerState }
+    | { kind: "review"; state: ReviewState }
+    | { kind: "memory"; state: MemoryPaneState }
+    | null = null;
+  /** Monotonic per-opening stamp for the certification fetch race. */
+  private reviewOpenSeq = 0;
+
+  private get review(): ReviewState | null {
+    return this.gate?.kind === "review" ? this.gate.state : null;
+  }
+  private set review(value: ReviewState | null) {
+    if (value === null) {
+      if (this.gate?.kind === "review") this.gate = null;
+    } else {
+      this.gate = { kind: "review", state: value };
+    }
+  }
+  private get memory(): MemoryPaneState | null {
+    return this.gate?.kind === "memory" ? this.gate.state : null;
+  }
+  private set memory(value: MemoryPaneState | null) {
+    if (value === null) {
+      if (this.gate?.kind === "memory") this.gate = null;
+    } else {
+      this.gate = { kind: "memory", state: value };
+    }
+  }
+  private get composer(): ComposerState | null {
+    return this.gate?.kind === "composer" ? this.gate.state : null;
+  }
+  private set composer(value: ComposerState | null) {
+    if (value === null) {
+      if (this.gate?.kind === "composer") this.gate = null;
+    } else {
+      this.gate = { kind: "composer", state: value };
+    }
+  }
   private governed: GovernedSession | null = null;
   private frozen: RestoreEntry[];
   /**
@@ -216,8 +292,6 @@ export class Desk {
    * too — the release, and any drag between them. Cleared by the release.
    */
   private chromeHoldsMouse = false;
-  /** The composer — the desk's way to CREATE work, not only watch it. */
-  private composer: ComposerState | null = null;
   private navCursor = 0;
   private destination: NavDestination = "mission";
   /**
@@ -227,11 +301,291 @@ export class Desk {
    * The rows themselves are rebuilt from the snapshot on every render.
    */
   private timeline: { cursor: number } | null = null;
+  /** ADR-0085 D2: the since-you-last-looked frame; null when dismissed. */
+  private digestView: DeskDigest | null = null;
   /** SETTINGS — read-only, cursor over the vendor rows only. */
   private settings: { cursor: number } | null = null;
+  /** ADR-0087 M10/M11: the task ledger + packets pane family. */
+  private tasks: TasksPaneState | null = null;
+  /** Per-OPENING stamp for the detail fetch race (the certification
+   *  guard's pattern): a stale response must not populate a reopened pane. */
+  private tasksSeq = 0;
+  /** ADR-0087 M3: the workflow-runs consent surface. */
+  private workflows: WorkflowsPaneState | null = null;
+  private workflowsSeq = 0;
+  /** ADR-0087 M7: roles + coordination detail. */
+  private crewDetail: CrewDetailState | null = null;
+  private crewDetailSeq = 0;
+  /** ADR-0087 M6: the pre-edit context result surface. */
+  private contextView: ContextPaneState | null = null;
+  private contextSeq = 0;
 
   /** One page of the library — matches the pane's own viewport arithmetic. */
   private static readonly MEMORY_PAGE = 200;
+
+  /**
+   * ADR-0087 D3 — PER-SURFACE REGISTRATION. Every surface declares its four
+   * verbs in ONE compile-checked entry: openness (the single truth
+   * `surfaceFlags`/`top()` derive from), close, cursor movement, and
+   * activation. The four per-surface switches this replaces
+   * (`closeSurface`, `moveFocused`, `activateFocused`, `surfaceFlags`)
+   * drifted independently — the digest shipped with two of the four
+   * missing, caught by review — and `Record<Surface, …>` makes a missing
+   * verb a TYPE ERROR the day the next surface lands.
+   *
+   * `move: null` = the surface takes no cursor movement (a gate or a
+   * static frame). `activate` returns an EXPLICIT outcome: "handled"
+   * consumes Enter, "pass" falls through to the desk tail (frozen-tab
+   * revive → governed attach) — the pre-registry behavior for exactly the
+   * surfaces that return it, preserved and now stated.
+   */
+  private readonly surfaceDefs: Record<
+    Surface,
+    {
+      isOpen: () => boolean;
+      close: () => void;
+      /** null = the surface takes no cursor movement (a gate or a static
+       *  frame) — never a fall-through to another list. */
+      move: ((delta: number, rows: InboxRows) => void) | null;
+      /** EXPLICIT routing (review finding: null-vs-noop encoded two
+       *  different behaviors by convention): "handled" consumes Enter;
+       *  "pass" falls through to the desk tail (frozen-tab revive →
+       *  governed attach). */
+      activate: (rows: InboxRows) => "handled" | "pass";
+    }
+  > = {
+    composer: {
+      isOpen: () => this.composer !== null,
+      close: () => {
+        this.composer = null;
+      },
+      move: (delta) => {
+        this.composer = composerMove(this.composer!, delta);
+      },
+      activate: () => {
+        this.activateComposer();
+        return "handled";
+      },
+    },
+    review: {
+      isOpen: () => this.review !== null,
+      close: () => {
+        this.review = null;
+      },
+      move: null,
+      activate: () => "pass",
+    },
+    memory: {
+      isOpen: () => this.memory !== null,
+      close: () => {
+        this.memory = null;
+      },
+      move: (delta) => {
+        this.memory = {
+          ...this.memory!,
+          cursor: clampCursor(
+            this.memory!.cursor + delta,
+            this.memory!.notes.length - 1
+          ),
+        };
+      },
+      activate: () => "pass",
+    },
+    help: {
+      isOpen: () => this.helpOpen,
+      close: () => {
+        this.helpOpen = false;
+      },
+      move: null,
+      activate: () => "pass",
+    },
+    "spawn-menu": {
+      isOpen: () => this.spawnMenu !== null,
+      close: () => {
+        this.spawnMenu = null;
+      },
+      move: (delta) => {
+        this.spawnMenu = {
+          ...this.spawnMenu!,
+          cursor: clampCursor(
+            this.spawnMenu!.cursor + delta,
+            this.spawnMenu!.entries.length - 1
+          ),
+        };
+      },
+      activate: () => {
+        this.activateSpawnMenu();
+        return "handled";
+      },
+    },
+    destinations: {
+      isOpen: () => this.navOpen,
+      close: () => {
+        this.navOpen = false;
+      },
+      move: (delta) => {
+        this.navCursor = clampCursor(
+          this.navCursor + delta,
+          NAV_DESTINATIONS.length - 1
+        );
+      },
+      activate: () => {
+        this.activateDestination();
+        return "handled";
+      },
+    },
+    crew: {
+      isOpen: () => this.crewOpen,
+      close: () => {
+        this.crewOpen = false;
+      },
+      move: (delta) => {
+        this.crewCursor = clampCursor(
+          this.crewCursor + delta,
+          this.crewLanes().length - 1
+        );
+      },
+      activate: () => {
+        this.activateCrewLane();
+        return "handled";
+      },
+    },
+    timeline: {
+      isOpen: () => this.timeline !== null,
+      close: () => {
+        this.timeline = null;
+      },
+      move: (delta) => {
+        // Clamped against the LIVE row count, not a remembered one: the
+        // brain poll lands underneath a human who is scrolling, and a
+        // cursor held past the end would silently select nothing.
+        this.timeline = {
+          cursor: clampCursor(
+            this.timeline!.cursor + delta,
+            buildTimelineRows(
+              this.deps.getSnapshot().events ?? [],
+              Date.now()
+            ).rows.length - 1
+          ),
+        };
+      },
+      activate: () => {
+        this.activateTimelineRow();
+        return "handled";
+      },
+    },
+    settings: {
+      isOpen: () => this.settings !== null,
+      close: () => {
+        this.settings = null;
+      },
+      move: (delta) => {
+        this.settings = {
+          cursor: clampCursor(
+            this.settings!.cursor + delta,
+            this.settingsState().selectable.length - 1
+          ),
+        };
+      },
+      activate: () => {
+        this.activateSettingsRow();
+        return "handled";
+      },
+    },
+    digest: {
+      isOpen: () => this.digestView !== null,
+      close: () => {
+        this.digestView = null;
+      },
+      move: null,
+      // Navigation-only frame: Enter is consumed and does nothing — esc
+      // dismisses.
+      activate: () => "handled",
+    },
+    tasks: {
+      isOpen: () => this.tasks !== null,
+      close: () => {
+        this.tasks = null;
+      },
+      move: (delta) => {
+        if (!this.tasks || this.tasks.phase !== "list") return;
+        this.tasks = {
+          ...this.tasks,
+          cursor: clampCursor(
+            this.tasks.cursor + delta,
+            this.tasks.tasks.length - 1
+          ),
+        };
+      },
+      activate: () => {
+        if (!this.tasks) return "handled";
+        if (this.tasks.phase === "detail") {
+          // ⏎ in the detail returns to the list, selection restored.
+          this.tasks = {
+            phase: "list",
+            tasks: this.tasks.tasks,
+            cursor: this.tasks.cursor,
+          };
+          return "handled";
+        }
+        if (this.tasks.phase === "list") {
+          const task = this.tasks.tasks[this.tasks.cursor];
+          if (task) void this.openTaskDetail(task.id);
+        }
+        return "handled";
+      },
+    },
+    workflows: {
+      isOpen: () => this.workflows !== null,
+      close: () => {
+        this.workflows = null;
+      },
+      move: (delta) => {
+        if (!this.workflows || this.workflows.busy) return;
+        this.workflows = {
+          ...this.workflows,
+          cursor: clampCursor(
+            this.workflows.cursor + delta,
+            this.workflows.runs.length - 1
+          ),
+        };
+      },
+      // The verbs are a/x (routed by the consent branch); Enter is not one
+      // of them — an easy key must not be a consent key.
+      activate: () => "handled",
+    },
+    "crew-detail": {
+      isOpen: () => this.crewDetail !== null,
+      close: () => {
+        this.crewDetail = null;
+      },
+      move: null,
+      activate: () => "handled",
+    },
+    context: {
+      isOpen: () => this.contextView !== null,
+      close: () => {
+        this.contextView = null;
+      },
+      move: null,
+      activate: () => "handled",
+    },
+    inbox: {
+      isOpen: () => this.inboxFocused,
+      close: () => {
+        this.inboxFocused = false;
+      },
+      move: (delta, rows) => {
+        this.inboxCursor = clampCursor(this.inboxCursor + delta, rows.length - 1);
+      },
+      activate: (rows) => {
+        // EVIDENCE-FIRST: opens the review; the DECISION is a second press.
+        const row = rows[this.inboxCursor];
+        if (row) this.openReviewGate(row.approval);
+        return "handled";
+      },
+    },
+  };
 
   constructor(deps: DeskDeps) {
     this.deps = deps;
@@ -328,6 +682,17 @@ export class Desk {
     };
   }
 
+  /**
+   * ADR-0085 D2 — the desk LEADS with the digest: the boot path calls this
+   * after fetching, and only when the digest has content. Esc dismisses to
+   * the ordinary desk; the frame is navigation, not a gate.
+   */
+  showDigest(digest: DeskDigest): void {
+    this.digestView = digest;
+    this.noteReveal("digest");
+    this.deps.onChange();
+  }
+
   /** Record (or forget) a reveal so `Esc` pops in the order things opened. */
   private noteReveal(layer: RevealSurface): void {
     this.revealStack = noteReveal(
@@ -342,46 +707,18 @@ export class Desk {
    * "what closes" can never disagree with `top()`'s "what is on top".
    */
   private closeSurface(surface: Surface | null): void {
-    switch (surface) {
-      case "composer":
-        this.composer = null;
-        return;
-      case "review":
-        this.review = null;
-        return;
-      case "memory":
-        this.memory = null;
-        return;
-      case "help":
-        this.helpOpen = false;
-        break;
-      case "spawn-menu":
-        this.spawnMenu = null;
-        break;
-      case "destinations":
-        this.navOpen = false;
-        break;
-      case "crew":
-        this.crewOpen = false;
-        break;
-      case "timeline":
-        this.timeline = null;
-        break;
-      case "settings":
-        this.settings = null;
-        break;
-      case "inbox":
-        this.inboxFocused = false;
-        break;
-      default:
-        // Nothing revealed: a governed ATTACH is the last thing Esc closes,
-        // because it is a VIEW rather than a surface that owns keys.
-        if (this.governed) {
-          this.governed.dispose();
-          this.governed = null;
-        }
-        return;
+    if (surface === null) {
+      // Nothing revealed: a governed ATTACH is the last thing Esc closes,
+      // because it is a VIEW rather than a surface that owns keys.
+      if (this.governed) {
+        this.governed.dispose();
+        this.governed = null;
+      }
+      return;
     }
+    this.surfaceDefs[surface].close();
+    // Gates never sit on the reveal stack; filtering is a no-op for them
+    // and the bookkeeping for every reveal.
     this.revealStack = this.revealStack.filter((entry) => entry !== surface);
   }
 
@@ -393,6 +730,13 @@ export class Desk {
    * keeps winning `centreKind()` and the click appears to do nothing.
    */
   private selectTab(id: string): void {
+    // Switching tabs IS moving on — the digest dismisses rather than
+    // sitting over one tab while the strip changes state underneath it
+    // (review finding).
+    if (this.digestView !== null) {
+      this.digestView = null;
+      this.revealStack = this.revealStack.filter((e) => e !== "digest");
+    }
     const frozen = frozenTabIndex(id);
     if (frozen !== null) {
       if (this.frozen[frozen]) this.frozenIndex = frozen;
@@ -536,18 +880,12 @@ export class Desk {
   }
 
   private surfaceFlags(): SurfaceFlags {
-    return {
-      composer: this.composer !== null,
-      review: this.review !== null,
-      memory: this.memory !== null,
-      help: this.helpOpen,
-      "spawn-menu": this.spawnMenu !== null,
-      destinations: this.navOpen,
-      crew: this.crewOpen,
-      timeline: this.timeline !== null,
-      settings: this.settings !== null,
-      inbox: this.inboxFocused,
-    };
+    // DERIVED from the registry's own openness — the one truth (D3).
+    const flags = {} as Record<Surface, boolean>;
+    for (const surface of Object.keys(this.surfaceDefs) as Surface[]) {
+      flags[surface] = this.surfaceDefs[surface].isOpen();
+    }
+    return flags;
   }
 
   /** The surface that owns the keyboard right now, or null for the desk. */
@@ -565,6 +903,11 @@ export class Desk {
     | "memory"
     | "review"
     | "spawn-menu"
+    | "digest"
+    | "tasks"
+    | "workflows"
+    | "crew-detail"
+    | "context"
     | "pty"
     | "governed"
     | "frozen"
@@ -589,6 +932,16 @@ export class Desk {
         return "timeline";
       case "settings":
         return "settings";
+      case "digest":
+        return "digest";
+      case "tasks":
+        return "tasks";
+      case "workflows":
+        return "workflows";
+      case "crew-detail":
+        return "crew-detail";
+      case "context":
+        return "context";
       case "inbox":
         break; // the inbox is a RAIL, not a centre pane — fall through
       default:
@@ -666,6 +1019,35 @@ export class Desk {
         break;
       case "help":
         this.shell.setCentre(new HelpPane());
+        break;
+      case "digest":
+        this.shell.setCentre(new DigestPane(this.digestView!));
+        break;
+      case "tasks": {
+        // REBUILT AND WRITTEN BACK (the spawn-menu rule): the desk keeps
+        // polling while the pane is open, and a list frozen at open time
+        // silently diverges from the ledger it claims to show. The detail
+        // phase keeps its fetched packets — ⏎ re-fetches.
+        const state = this.tasks!;
+        if (state.phase === "list" || state.phase === "loading") {
+          const live = this.deps.getSnapshot().tasks ?? [];
+          this.tasks = {
+            ...state,
+            tasks: live,
+            cursor: clampCursor(state.cursor, live.length - 1),
+          };
+        }
+        this.shell.setCentre(new TasksPane(this.tasks!));
+        break;
+      }
+      case "workflows":
+        this.shell.setCentre(new WorkflowsPane(this.workflows!));
+        break;
+      case "crew-detail":
+        this.shell.setCentre(new CrewDetailPane(this.crewDetail!));
+        break;
+      case "context":
+        this.shell.setCentre(new ContextPane(this.contextView!));
         break;
       case "nav":
         this.shell.setCentre(
@@ -918,6 +1300,13 @@ export class Desk {
       crewOpen: this.crewOpen,
       timelineOpen: this.timeline !== null,
       settingsOpen: this.settings !== null,
+      digestOpen: this.digestView !== null,
+      tasksOpen: this.tasks !== null,
+      workflowsOpen: this.workflows !== null,
+      workflowsBusy: this.workflows?.busy != null,
+      crewDetailOpen: this.crewDetail !== null,
+      contextOpen: this.contextView !== null,
+      topSurface: this.top(),
       sidebarOpen: this.sidebarOpen,
       inboxFocused: this.inboxFocused,
       inboxHasRows: this.inboxState().rows.length > 0,
@@ -1249,6 +1638,96 @@ export class Desk {
         void this.openMemory();
         break;
 
+      case "open-context": {
+        // The INPUT rides the composer (the one text-input surface); the
+        // submit intercept below opens the result pane. Two keystrokes to
+        // evidence, no second text-field machinery.
+        const form = buildActionForm("context", this.actionContext());
+        if (form) this.composer = openComposer(form);
+        break;
+      }
+
+      case "open-crew-detail": {
+        if (!this.deps.loadCrewDetail) {
+          this.status(
+            "✗ crew detail is not wired on this desk build — `muon crew roles` and `muon crew coord` answer the same reads"
+          );
+          break;
+        }
+        this.crewDetailSeq += 1;
+        const seq = this.crewDetailSeq;
+        this.crewDetail = { phase: "loading" };
+        this.noteReveal("crew-detail");
+        void this.deps
+          .loadCrewDetail()
+          .then((load) => {
+            if (!this.crewDetail || this.crewDetailSeq !== seq) return;
+            this.crewDetail = load
+              ? { phase: "ready", load }
+              : {
+                  phase: "unavailable",
+                  reason:
+                    "no active chat for this workspace yet — a mission creates one",
+                };
+            this.syncCentre();
+            this.deps.onChange();
+          })
+          .catch((error) => {
+            if (!this.crewDetail || this.crewDetailSeq !== seq) return;
+            this.crewDetail = {
+              phase: "unavailable",
+              reason: `crew detail unavailable: ${message(error)}`,
+            };
+            this.syncCentre();
+            this.deps.onChange();
+          });
+        break;
+      }
+
+      case "open-workflows":
+        this.workflowsSeq += 1;
+        this.workflows = {
+          phase: "loading",
+          runs: [],
+          cursor: 0,
+          busy: null,
+          withheldForeign: 0,
+        };
+        this.noteReveal("workflows");
+        void this.loadWorkflows();
+        break;
+
+      case "workflow-act": {
+        const state = this.workflows;
+        if (!state || state.phase !== "list" || state.busy) break;
+        const run = state.runs[state.cursor];
+        if (!run) break;
+        if (run.status !== "proposed") {
+          this.status(
+            `✗ this run is ${run.status} — only a proposed plan can be ${
+              intent.action === "apply" ? "applied" : "dismissed"
+            }`
+          );
+          break;
+        }
+        void this.actOnWorkflow(run.id, intent.action);
+        break;
+      }
+
+      case "open-tasks":
+        // SYNCHRONOUS open from the snapshot the desk already polls — the
+        // packets detail is the async read, fetched on ⏎ per task. The
+        // list itself is REBUILT from the live snapshot at every render
+        // (see syncCentre), so the poll keeps it honest while it is open.
+        this.tasksSeq += 1;
+        this.tasks = {
+          phase: "list",
+          tasks: this.deps.getSnapshot().tasks ?? [],
+          cursor: 0,
+        };
+        this.noteReveal("tasks");
+        break;
+
       case "new-tab":
         this.openNewTab();
         break;
@@ -1284,11 +1763,11 @@ export class Desk {
           this.status(
             pending.length === 0
               ? "no gate is waiting"
-              : `✗ ${pending.length} gate(s) pending, none answerable here — desktop, or \`npm run tui:ink\``
+              : `✗ ${pending.length} gate(s) pending, none answerable here — decide them on the desktop app`
           );
           break;
         }
-        this.review = openReview(gate.next);
+        this.openReviewGate(gate.next);
         break;
       }
 
@@ -1299,9 +1778,17 @@ export class Desk {
         // status. The list is DERIVED from the action registry, so it can only
         // ever offer commands that have an executor, and no form is built here
         // at all: choosing has nothing to do with one.
-        this.composer = openComposerPicker(
-          EXECUTABLE_ACTIONS.map((id) => ({ id, label: actionLabel(id) }))
-        );
+        this.composer = openComposerPicker([
+          ...EXECUTABLE_ACTIONS.map((id) => ({ id, label: actionLabel(id) })),
+          // M15 rides the picker but not the registry: its runner needs the
+          // DESK (a pty spawn), so its submit is intercepted below exactly
+          // like the context form's.
+          {
+            id: "take-over",
+            label:
+              "take-over — resume a dispatched vendor session in its worktree (yours until returned)",
+          },
+        ]);
         break;
       }
 
@@ -1396,8 +1883,28 @@ export class Desk {
       case "review-decide": {
         if (!this.review) break;
         const approvalId = this.review.approval.id;
+        // I2: remember is offered where a receipt can exist — the SAME
+        // eligibility the desktop desk reads, so the surfaces
+        // refuse the same approvals for the same reason.
+        if (intent.remember && !this.review.review.receiptEligible) {
+          this.status(`✗ ${REMEMBER_ACTION_INELIGIBLE_SENTENCE}`);
+          break;
+        }
+        // I6 shell side: a merge is approved only against loaded,
+        // non-blocked coverage evidence (reject stays live regardless).
+        if (intent.status === "approved") {
+          const refusal = this.review ? mergeApproveRefusal(this.review) : null;
+          if (refusal) {
+            this.status(`✗ ${refusal}`);
+            break;
+          }
+        }
         this.review = { ...this.review, resolving: true };
-        void this.decide(approvalId, intent.status).then((ok) => {
+        void this.decide(
+          approvalId,
+          intent.status,
+          intent.remember ? { receiptTtlMs: REMEMBER_ACTION_TTL_MS } : {}
+        ).then((ok) => {
           // CLOSE ONLY ON SUCCESS. `decide` catches its own errors, so the
           // promise always resolves — an unconditional close threw away the
           // evidence on a 409 or a transient failure and made the operator
@@ -1405,6 +1912,31 @@ export class Desk {
           // the reason in the footer, until the decision actually lands.
           if (ok) this.review = null;
           else if (this.review) this.review = { ...this.review, resolving: false };
+          this.syncCentre();
+          this.deps.onChange();
+        });
+        break;
+      }
+
+      case "review-attest": {
+        // I5: attest-and-approve a review-blind merge — every guard lives
+        // in the merge-review POLICY module (D3's controller extraction),
+        // so a second surface adopts the classic desk's rules verbatim.
+        const state = this.review;
+        if (!state) break;
+        const resolution = resolveAttest(state);
+        if (!resolution.ok) {
+          this.status(resolution.refusal);
+          break;
+        }
+        const approvalId = state.approval.id;
+        this.review = { ...state, resolving: true };
+        void this.decide(approvalId, "approved", {
+          manualReview: resolution.manualReview,
+        }).then((ok) => {
+          if (ok) this.review = null;
+          else if (this.review)
+            this.review = { ...this.review, resolving: false };
           this.syncCentre();
           this.deps.onChange();
         });
@@ -1463,75 +1995,25 @@ export class Desk {
     this.deps.onChange();
   }
 
-  /** Move the selection in whatever surface is on top. */
+  /** Move the selection in whatever surface is on top (D3: the registry). */
   private moveFocused(
     delta: number,
     rows: ReturnType<Desk["inboxState"]>["rows"]
   ): void {
-    const clamp = (value: number, max: number) =>
-      Math.min(Math.max(0, max), Math.max(0, value));
-    // ONE precedence rule — this used to be its own if-chain, and a chain
-    // that disagrees with what is DRAWN moves a cursor the human cannot see.
-    switch (this.top()) {
-      case "composer":
-        this.composer = composerMove(this.composer!, delta);
-        return;
-      case "memory":
-        this.memory = {
-          ...this.memory!,
-          cursor: clamp(this.memory!.cursor + delta, this.memory!.notes.length - 1),
-        };
-        return;
-      case "spawn-menu":
-        this.spawnMenu = {
-          ...this.spawnMenu!,
-          cursor: clamp(
-            this.spawnMenu!.cursor + delta,
-            this.spawnMenu!.entries.length - 1
-          ),
-        };
-        return;
-      case "destinations":
-        this.navCursor = clamp(this.navCursor + delta, NAV_DESTINATIONS.length - 1);
-        return;
-      case "crew":
-        this.crewCursor = clamp(this.crewCursor + delta, this.crewLanes().length - 1);
-        return;
-      case "settings":
-        this.settings = {
-          cursor: clamp(
-            this.settings!.cursor + delta,
-            this.settingsState().selectable.length - 1
-          ),
-        };
-        return;
-      case "timeline":
-        // Clamped against the LIVE row count, not a remembered one: the brain
-        // poll lands underneath a human who is scrolling, and a cursor held
-        // past the end would silently select nothing.
-        this.timeline = {
-          cursor: clamp(
-            this.timeline!.cursor + delta,
-            buildTimelineRows(this.deps.getSnapshot().events ?? [], Date.now())
-              .rows.length - 1
-          ),
-        };
-        return;
-      case "inbox":
-        this.inboxCursor = clamp(this.inboxCursor + delta, rows.length - 1);
-        return;
-      case "review":
-      case "help":
-        // A gate and the help list take no cursor movement.
-        return;
-      default:
-        break;
+    const top = this.top();
+    if (top !== null) {
+      // A registered `null` move means the surface takes no cursor
+      // movement — a gate or a static frame — and the fall-through below
+      // must NOT move a hidden crew cursor underneath it.
+      this.surfaceDefs[top].move?.(delta, rows);
+      return;
     }
-    // The SAME ordering the drawer renders (blocked-first). This used to fall
-    // back to the snapshot's raw order, so moving the cursor in the drawer,
-    // closing it and pressing Enter attached to a DIFFERENT agent than the
-    // one that had been highlighted.
-    this.crewCursor = clamp(this.crewCursor + delta, this.crewLanes().length - 1);
+    // Nothing on top: the crew rail keeps its cursor, in the SAME ordering
+    // the drawer renders (blocked-first).
+    this.crewCursor = clampCursor(
+      this.crewCursor + delta,
+      this.crewLanes().length - 1
+    );
   }
 
   /** Tab: cycle the reveal zones. Live in every scope, including overlays. */
@@ -1576,168 +2058,162 @@ export class Desk {
     this.sidebarOpen = next === "sidebar";
   }
 
-  /** Enter: act on whatever surface is on top. */
-  private activateFocused(rows: ReturnType<Desk["inboxState"]>["rows"]): void {
-    switch (this.top()) {
-      case "composer": {
-        // Enter means CHOOSE while picking and SUBMIT once a form is up. The
-        // two are one surface on purpose (see `ComposerState.choices`), so the
-        // Esc stack and the centre pane still see exactly one composer.
-        const choice = composerChoice(this.composer!);
-        if (choice) {
-          // The context is REAL now: `/answer` numbers the open questions the
-          // inbox is already showing, so the human picks the one they can see.
-          const form = buildActionForm(choice, this.actionContext());
-          if (!form) {
-            this.composer = { ...this.composer!, result: { ok: false, message: `'${choice}' has no form` } };
-            return;
-          }
-          this.composer = openComposer(form);
-          return;
-        }
-        void this.submitComposer();
+  /**
+   * Enter means CHOOSE while picking and SUBMIT once a form is up. The
+   * two are one surface on purpose (see `ComposerState.choices`), so the
+   * Esc stack and the centre pane still see exactly one composer.
+   */
+  private activateComposer(): void {
+    const choice = composerChoice(this.composer!);
+    if (choice) {
+      // The context is REAL now: `/answer` numbers the open questions the
+      // inbox is already showing, so the human picks the one they can see.
+      const form = buildActionForm(choice, this.actionContext());
+      if (!form) {
+        this.composer = {
+          ...this.composer!,
+          result: { ok: false, message: `'${choice}' has no form` },
+        };
         return;
       }
+      this.composer = openComposer(form);
+      return;
+    }
+    void this.submitComposer();
+  }
 
-      case "settings": {
-        // READ-ONLY, so Enter cannot change anything — it restates the
-        // selected lane's fix hint in full, which is the one line a human
-        // stuck on "why can't I dispatch to codex" actually needs and which
-        // the frame may have clipped.
-        const vendor = selectedVendor(this.settingsState());
-        if (vendor) {
-          this.status(
-            vendor.step === "ready"
-              ? `${vendor.label}: ${vendor.guidance}`
-              : `${vendor.label}: ${vendor.fixHint ?? vendor.guidance}`
-          );
-        }
-        return;
+  /** READ-ONLY, so Enter restates the selected lane's fix hint in full —
+   *  the one line a human stuck on "why can't I dispatch" needs, which the
+   *  frame may have clipped. */
+  private activateSettingsRow(): void {
+    const vendor = selectedVendor(this.settingsState());
+    if (vendor) {
+      this.status(
+        vendor.step === "ready"
+          ? `${vendor.label}: ${vendor.guidance}`
+          : `${vendor.label}: ${vendor.fixHint ?? vendor.guidance}`
+      );
+    }
+  }
+
+  /** A LONG MESSAGE IS CLIPPED BY THE FRAME, so Enter re-states the
+   *  selected row in full on the status line. */
+  private activateTimelineRow(): void {
+    const built = buildTimelineRows(
+      this.deps.getSnapshot().events ?? [],
+      Date.now()
+    );
+    const row = built.rows[this.timeline!.cursor];
+    if (row) this.status(`${row.kind} · ${row.who} · ${row.message}`);
+  }
+
+  private activateSpawnMenu(): void {
+    const resolved = resolveSpawnSelection(this.spawnMenu!);
+    if ("kind" in resolved) {
+      const parentId = this.spawnMenu!.intoSplitOf;
+      this.spawnMenu = null;
+      this.revealStack = this.revealStack.filter((e) => e !== "spawn-menu");
+      const opened = this.sessions.open(
+        resolved.kind,
+        parentId === undefined ? undefined : { parentId }
+      );
+      // A NEW SESSION IS THE TAB YOU ARE ON. Without this the corpse layer
+      // still won `centreKind()`, so starting a session while looking at a
+      // restored one appeared to do nothing at all.
+      if (!("reason" in opened)) this.frozenIndex = null;
+      if ("reason" in opened) this.status(`✗ ${opened.reason}`);
+      else if (parentId !== undefined) {
+        // ORDER MATTERS, and it was wrong. `sessions.open` emits its
+        // change SYNCHRONOUSLY, so the frame was rendered — and the new
+        // pty created — while `focusedPane` was still 0: the split opened
+        // showing the LEFT half focused, and the right child was sized as
+        // if it had the whole centre. Nothing resized afterwards, so it
+        // stayed wrong until some unrelated repaint.
+        this.focusedPane = 1;
+        // Publish the focus, so the shell knows there are two panes and
+        // which one has the caret…
+        this.render();
+        // …and only THEN measure, because each half's width depends on
+        // the shell knowing it is split.
+        this.resize();
+        this.deps.onChange();
       }
+    } else {
+      this.status(`✗ ${resolved.refused}`);
+    }
+  }
 
-      case "timeline": {
-        // A LONG MESSAGE IS CLIPPED BY THE FRAME, so Enter re-states the
-        // selected row in full on the status line. Small, and the difference
-        // between an audit trail you can read and one you can only skim.
-        const built = buildTimelineRows(
-          this.deps.getSnapshot().events ?? [],
-          Date.now()
-        );
-        const row = built.rows[this.timeline!.cursor];
-        if (row) this.status(`${row.kind} · ${row.who} · ${row.message}`);
-        return;
-      }
-
-      case "spawn-menu": {
-        const resolved = resolveSpawnSelection(this.spawnMenu!);
-        if ("kind" in resolved) {
-          const parentId = this.spawnMenu!.intoSplitOf;
-          this.spawnMenu = null;
-          this.revealStack = this.revealStack.filter((e) => e !== "spawn-menu");
-          const opened = this.sessions.open(
-            resolved.kind,
-            parentId === undefined ? undefined : { parentId }
-          );
-          // A NEW SESSION IS THE TAB YOU ARE ON. Without this the corpse layer
-          // still won `centreKind()`, so starting a session while looking at a
-          // restored one appeared to do nothing at all.
-          if (!("reason" in opened)) this.frozenIndex = null;
-          if ("reason" in opened) this.status(`✗ ${opened.reason}`);
-          else if (parentId !== undefined) {
-            // ORDER MATTERS, and it was wrong. `sessions.open` emits its
-            // change SYNCHRONOUSLY, so the frame was rendered — and the new
-            // pty created — while `focusedPane` was still 0: the split opened
-            // showing the LEFT half focused, and the right child was sized as
-            // if it had the whole centre. Nothing resized afterwards, so it
-            // stayed wrong until some unrelated repaint.
-            this.focusedPane = 1;
-            // Publish the focus, so the shell knows there are two panes and
-            // which one has the caret…
-            this.render();
-            // …and only THEN measure, because each half's width depends on
-            // the shell knowing it is split.
-            this.resize();
-            this.deps.onChange();
-          }
-        } else {
-          this.status(`✗ ${resolved.refused}`);
-        }
-        return;
-      }
-
-      case "destinations": {
-        const target = navDestinationAt(this.navCursor);
-        this.closeSurface("destinations");
-        if (!IMPLEMENTED_DESTINATIONS.has(target)) {
-          this.status(
-            `✗ ${target} is not on this desk yet — desktop app, or \`npm run tui:ink\``
-          );
-          return;
-        }
-        this.destination = target;
-        switch (target) {
-          case "memory":
-            void this.openMemory();
-            break;
-          case "control":
-            this.inboxFocused = true;
-            this.inboxCursor = 0;
-            this.noteReveal("inbox");
-            break;
-          case "crew":
-            this.crewOpen = true;
-            this.crewCursor = 0;
-            this.noteReveal("crew");
-            break;
-          case "timeline":
-            this.timeline = { cursor: 0 };
-            this.noteReveal("timeline");
-            break;
-          case "settings":
-            this.settings = { cursor: 0 };
-            this.noteReveal("settings");
-            break;
-          case "mission":
-            this.inboxFocused = false;
-            this.crewOpen = false;
-            this.timeline = null;
-            this.settings = null;
-            this.helpOpen = false;
-            this.revealStack = [];
-            break;
-          default:
-            break;
-        }
-        return;
-      }
-
-      case "crew": {
-        // Enter on a BLOCKED lane opens the gate holding it — evidence-first,
-        // so the DECISION is still a second press.
-        const lane = this.crewLanes()[this.crewCursor];
-        if (lane?.blockedBy) {
-          const approval = (this.deps.getSnapshot().approvals ?? []).find(
-            (candidate) => candidate.id === lane.blockedBy
-          );
-          if (approval) {
-            this.closeSurface("crew");
-            this.review = openReview(approval);
-          }
-          return;
-        }
-        if (lane) this.status(`${lane.agent.name ?? lane.agent.id} is ${lane.state}`);
-        return;
-      }
-
-      case "inbox": {
-        // EVIDENCE-FIRST: opens the review; the DECISION is a second press.
-        const row = rows[this.inboxCursor];
-        if (row) this.review = openReview(row.approval);
-        return;
-      }
-
+  private activateDestination(): void {
+    const target = navDestinationAt(this.navCursor);
+    this.closeSurface("destinations");
+    if (!IMPLEMENTED_DESTINATIONS.has(target)) {
+      this.status(
+        `✗ ${target} is not on this desk yet — desktop app`
+      );
+      return;
+    }
+    this.destination = target;
+    switch (target) {
+      case "memory":
+        void this.openMemory();
+        break;
+      case "control":
+        this.inboxFocused = true;
+        this.inboxCursor = 0;
+        this.noteReveal("inbox");
+        break;
+      case "crew":
+        this.crewOpen = true;
+        this.crewCursor = 0;
+        this.noteReveal("crew");
+        break;
+      case "timeline":
+        this.timeline = { cursor: 0 };
+        this.noteReveal("timeline");
+        break;
+      case "settings":
+        this.settings = { cursor: 0 };
+        this.noteReveal("settings");
+        break;
+      case "mission":
+        this.inboxFocused = false;
+        this.crewOpen = false;
+        this.timeline = null;
+        this.settings = null;
+        this.helpOpen = false;
+        this.revealStack = [];
+        break;
       default:
         break;
+    }
+  }
+
+  /** Enter on a BLOCKED lane opens the gate holding it — evidence-first,
+   *  so the DECISION is still a second press. */
+  private activateCrewLane(): void {
+    const lane = this.crewLanes()[this.crewCursor];
+    if (lane?.blockedBy) {
+      const approval = (this.deps.getSnapshot().approvals ?? []).find(
+        (candidate) => candidate.id === lane.blockedBy
+      );
+      if (approval) {
+        this.closeSurface("crew");
+        this.openReviewGate(approval);
+      }
+      return;
+    }
+    if (lane) this.status(`${lane.agent.name ?? lane.agent.id} is ${lane.state}`);
+  }
+
+  /**
+   * Enter: act on whatever surface is on top (D3: the registry). A surface
+   * whose activate returns "pass" falls through to the desk tail —
+   * frozen-tab revive, then governed attach.
+   */
+  private activateFocused(rows: ReturnType<Desk["inboxState"]>["rows"]): void {
+    const top = this.top();
+    if (top !== null && this.surfaceDefs[top].activate(rows) === "handled") {
+      return;
     }
 
     if (this.centreKind() === "frozen") {
@@ -1791,18 +2267,83 @@ export class Desk {
   }
 
   /**
+   * THE one place a review opens (I4 shell side): a merge gate's coverage
+   * certification is fetched with it, so approve can wait on evidence
+   * rather than deciding review-blind. Every open path routes here.
+   *
+   * The eligibility guards and the attest payload live in
+   * `merge-review.ts` (the D62-named extraction, landed with D3); this
+   * method owns only the fetch LIFECYCLE — the per-opening race guard is
+   * wiring, not policy.
+   */
+  private openReviewGate(approval: ApprovalRequest): void {
+    this.review = openReview(approval);
+    if (approval.kind !== "merge") return;
+    // Per-OPENING sequence, not just the id (review finding): reopening
+    // the same approval must not let the first opening's slower fetch
+    // overwrite the newer state with stale coverage evidence.
+    this.reviewOpenSeq += 1;
+    const openedSeq = this.reviewOpenSeq;
+    const openedId = approval.id;
+    void this.deps.client
+      .getApprovalReviewCertification(approval.id)
+      .then((value) => {
+        const current = this.review;
+        if (current?.approval.id !== openedId) return;
+        if (this.reviewOpenSeq !== openedSeq) return;
+        this.review = {
+          ...current,
+          certification: { phase: "loaded", value },
+        };
+        this.syncCentre();
+        this.deps.onChange();
+      })
+      .catch((error) => {
+        const current = this.review;
+        if (current?.approval.id !== openedId) return;
+        if (this.reviewOpenSeq !== openedSeq) return;
+        this.review = {
+          ...current,
+          certification: {
+            phase: "error",
+            message:
+              error instanceof Error
+                ? error.message
+                : "Could not load merge review evidence.",
+          },
+        };
+        this.syncCentre();
+        this.deps.onChange();
+      });
+  }
+
+  /**
    * Answer an approval — through the SHARED payload builder, so this desk
    * cannot develop a dialect of a governed write.
    */
   private async decide(
     approvalId: string,
-    status: "approved" | "rejected"
+    status: "approved" | "rejected",
+    options: {
+      receiptTtlMs?: number;
+      manualReview?: ManualReviewAttestation;
+    } = {}
   ): Promise<boolean> {
     this.status(`… ${status} ${approvalId}`);
     this.deps.onChange();
     try {
       await this.deps.client.resolveApproval(
-        buildApprovalDecision({ approvalId, status, surface: "MUON TUI" })
+        buildApprovalDecision({
+          approvalId,
+          status,
+          surface: "MUON TUI",
+          ...(options.receiptTtlMs === undefined
+            ? {}
+            : { receiptTtlMs: options.receiptTtlMs }),
+          ...(options.manualReview === undefined
+            ? {}
+            : { manualReview: options.manualReview }),
+        })
       );
       this.status(`${status === "approved" ? "✓" : "✗"} ${status} ${approvalId}`);
       await this.deps.refresh?.();
@@ -1855,6 +2396,13 @@ export class Desk {
         // FAILS CLOSED to strict: an unreadable posture must not silently
         // mark crew notes settled — that is the direction that hides work.
         .catch(() => false);
+      // ANOTHER GATE OPENED DURING THE LOAD (the discriminated gate made
+      // this visible): a review the human opened while memory was loading
+      // must not be dismissed by the load completing underneath it — the
+      // same rule as "esc during a write must not re-open the pane over
+      // what the human moved to". The loaded page is dropped; the human
+      // reopens memory when they want it.
+      if (this.gate !== null && this.gate.kind !== "memory") return;
       this.memory = {
         notes: snapshot.notes,
         cursor: Math.min(cursor, Math.max(0, snapshot.notes.length - 1)),
@@ -1865,11 +2413,281 @@ export class Desk {
         total: snapshot.total,
       };
     } catch (error) {
-      this.memory = null;
-      this.status(`✗ memory unavailable: ${message(error)}`);
+      if (this.gate === null || this.gate.kind === "memory") {
+        this.memory = null;
+        this.status(`✗ memory unavailable: ${message(error)}`);
+      }
     }
     this.syncCentre();
     this.deps.onChange();
+  }
+
+  /**
+   * ⏎ on a task: fetch its detail — the packets zone with classification,
+   * receipt (0086 D1) and delivery verdicts (0080 D3). The list stays on
+   * screen with a loading line; a failed read keeps the list and says why
+   * (the memory pane's own posture).
+   */
+  private async openTaskDetail(taskId: string): Promise<void> {
+    if (!this.tasks) return;
+    const seq = this.tasksSeq;
+    this.tasks = {
+      phase: "loading",
+      tasks: this.tasks.tasks,
+      cursor: this.tasks.cursor,
+    };
+    this.syncCentre();
+    this.deps.onChange();
+    try {
+      const detail = await this.deps.client.getTaskDetail(taskId);
+      // Dismissed OR reopened during the load (review finding): a stale
+      // response must not populate whatever pane opening replaced this one.
+      if (!this.tasks || this.tasksSeq !== seq) return;
+      this.tasks = {
+        phase: "detail",
+        tasks: this.tasks.tasks,
+        cursor: this.tasks.cursor,
+        detail,
+      };
+    } catch (error) {
+      if (!this.tasks || this.tasksSeq !== seq) return;
+      this.tasks = {
+        phase: "list",
+        tasks: this.tasks.tasks,
+        cursor: this.tasks.cursor,
+      };
+      this.status(`✗ task detail unavailable: ${message(error)}`);
+    }
+    this.syncCentre();
+    this.deps.onChange();
+  }
+
+  /**
+   * ADR-0087 M15 — take over a dispatched vendor session: the governed
+   * ownership flip FIRST (the record says the human holds it), then the
+   * vendor's own resume argv in the JOB'S worktree as an ungoverned pty —
+   * taking over IS assuming the keyboard (D5). Every refusal is a
+   * sentence; nothing spawns unless the governed half landed.
+   */
+  private async takeOverSession(requestedId: string): Promise<void> {
+    try {
+      const { takeOverCommand, latestTakeOver } = await import(
+        "../lib/take-over.js"
+      );
+      const sessions = await this.deps.client.listSessions();
+      let sessionId = requestedId;
+      let command: string | null = null;
+      if (!sessionId) {
+        // LIVE sessions only for the default pick (review finding + the
+        // route's own rule: an ended session has nothing to take over —
+        // it reopens with the vendor's own resume command directly).
+        const live = sessions.filter(
+          (session) =>
+            session.status !== "ended" && session.status !== "failed"
+        );
+        const latest = latestTakeOver(live);
+        if (!latest) {
+          this.status(
+            "✗ no LIVE vendor session to take over — an ended session reopens with the vendor's own resume command (`muon session take-over` prints it)"
+          );
+          return;
+        }
+        sessionId = latest.session.id;
+        command = latest.command;
+      } else {
+        const found = sessions.find((session) => session.id === sessionId);
+        if (!found) {
+          this.status(`✗ no session '${sessionId.slice(0, 12)}'`);
+          return;
+        }
+        command = takeOverCommand(found);
+        if (!command) {
+          this.status(
+            "✗ this session has no native resume — its vendor's CLI cannot reopen it"
+          );
+          return;
+        }
+      }
+      const session = sessions.find((entry) => entry.id === sessionId)!;
+      // The WORKTREE: where the job actually ran wins over where it was
+      // configured to run (the workspace resolver's own precedence).
+      const job = session.jobId
+        ? await this.deps.client.getDispatchJob(session.jobId)
+        : null;
+      const cwd = job?.executionPath ?? job?.workspacePath ?? null;
+      if (!cwd) {
+        this.status(
+          "✗ no recorded worktree for this session's job — there is nowhere to resume it"
+        );
+        return;
+      }
+      // The path is RUNNER-STAMPED data, not an operator claim — but a
+      // login shell sources profile hooks in its cwd, so the bound is:
+      // absolute, and actually a directory that exists (review finding:
+      // never launch into a coordinate nobody can inspect).
+      const { statSync } = await import("node:fs");
+      let isDirectory = false;
+      try {
+        isDirectory = cwd.startsWith("/") && statSync(cwd).isDirectory();
+      } catch {
+        isDirectory = false;
+      }
+      if (!isDirectory) {
+        this.status(
+          `✗ the recorded worktree '${cwd}' is not an existing directory — the worktree may have been pruned; \`muon session take-over\` prints the manual command`
+        );
+        return;
+      }
+      // SHELL-SAFETY FENCE (review finding: the vendor session id is a
+      // STORED string a runner stamped — interpolated into shell text, a
+      // crafted id is command injection at the operator's own keyboard).
+      // Session ids are vendor-generated slugs; anything outside the safe
+      // class refuses rather than reaching a shell.
+      const vendorSessionId = session.vendorSessionId ?? "";
+      if (!/^[A-Za-z0-9._:\/-]+$/.test(vendorSessionId)) {
+        this.status(
+          "✗ this session's recorded id contains characters MUON will not pass to a shell — inspect it with `muon session show` before resuming by hand"
+        );
+        return;
+      }
+      // GOVERNED HALF FIRST: the ownership flip is the record.
+      const taken = await this.deps.client.takeOverSession(sessionId);
+      // The command is SHELL TEXT (what a human would type — env prefixes
+      // and quoting included), so it runs through the shell (review
+      // finding: argv-splitting made Codex's `CODEX_HOME=…` prefix the
+      // executable).
+      const opened = this.sessions.openCustom({
+        kind: "take-over",
+        file: process.env.SHELL || "/bin/sh",
+        args: ["-lc", command],
+        cwd,
+        labelBase: `take-over ${session.lane?.name ?? session.laneId}`,
+      });
+      if ("reason" in opened) {
+        this.status(
+          `✗ ownership is yours but the pane could not open: ${opened.reason} — run \`${command}\` in ${cwd} yourself, or return-session to hand it back`
+        );
+        return;
+      }
+      this.frozenIndex = null;
+      this.status(
+        `✓ took over ${sessionId.slice(0, 8)}${
+          taken.alreadyOwned ? " (already yours)" : ""
+        } — your edits land in ${cwd}; hand it back with return-session`
+      );
+    } catch (error) {
+      this.status(`✗ take-over failed: ${message(error)}`);
+    }
+    this.syncCentre();
+    this.deps.onChange();
+  }
+
+  /**
+   * ADR-0087 M6: one governed preEditContext read → the shared view
+   * builder → the result surface. The target classifies through THE
+   * shared `parseEditTarget` (review finding: an ad-hoc `#` split sent a
+   * bare symbol as a module, missing its symbol-anchored memory and
+   * disagreeing with the CLI). The workspace fence rides the read
+   * (ADR-0026 §9).
+   */
+  private async openContext(target: string): Promise<void> {
+    this.contextSeq += 1;
+    const seq = this.contextSeq;
+    this.contextView = { phase: "loading", targetLabel: target };
+    this.noteReveal("context");
+    this.syncCentre();
+    this.deps.onChange();
+    try {
+      const context = await this.deps.client.preEditContext({
+        ...parseEditTarget(target),
+        workspace: this.deps.cwd(),
+      });
+      if (!this.contextView || this.contextSeq !== seq) return;
+      this.contextView = { phase: "ready", view: buildPreEditView(context) };
+    } catch (error) {
+      if (!this.contextView || this.contextSeq !== seq) return;
+      this.contextView = {
+        phase: "error",
+        targetLabel: target,
+        reason: message(error),
+      };
+    }
+    this.syncCentre();
+    this.deps.onChange();
+  }
+
+  /** ADR-0087 M3: load the runs — proposed first, so the consent queue
+   *  leads; a failed read closes with the reason (never a dead pane). */
+  private async loadWorkflows(): Promise<void> {
+    const seq = this.workflowsSeq;
+    try {
+      const runs = await this.deps.client.listWorkflowRuns();
+      if (!this.workflows || this.workflowsSeq !== seq) return;
+      // THE WORKSPACE FENCE, stated (review finding): a desk opened in one
+      // repo must not present — let alone apply — another workspace's
+      // plan. A run with no workspace (legacy) stays visible; foreign ones
+      // are withheld and COUNTED, never silently dropped.
+      const here = this.deps.cwd().replace(/\/+$/, "");
+      const mine = runs.filter(
+        (run) =>
+          !run.workspacePath ||
+          run.workspacePath.replace(/\/+$/, "") === here
+      );
+      const ordered = [...mine].sort((a, b) =>
+        a.status === b.status ? 0 : a.status === "proposed" ? -1 : 1
+      );
+      this.workflows = {
+        phase: "list",
+        runs: ordered,
+        cursor: 0,
+        busy: null,
+        withheldForeign: runs.length - mine.length,
+      };
+    } catch (error) {
+      if (!this.workflows || this.workflowsSeq !== seq) return;
+      this.workflows = null;
+      this.status(`✗ workflow runs unavailable: ${message(error)}`);
+    }
+    this.syncCentre();
+    this.deps.onChange();
+  }
+
+  /**
+   * Apply files the plan's tasks EXACTLY as the table showed; dismiss
+   * abandons the proposal. Both re-read the list, and the confirmation
+   * says "filed" — nothing runs from this surface (the D43 rule).
+   */
+  private async actOnWorkflow(
+    runId: string,
+    action: "apply" | "dismiss"
+  ): Promise<void> {
+    if (!this.workflows || this.workflows.phase !== "list") return;
+    const seq = this.workflowsSeq;
+    this.workflows = { ...this.workflows, busy: action };
+    this.syncCentre();
+    this.deps.onChange();
+    try {
+      if (action === "apply") {
+        const applied = await this.deps.client.applyWorkflowRun(
+          runId,
+          "human:tui"
+        );
+        this.status(
+          `✓ plan applied — ${applied.tasks.length} task(s) filed (nothing ran; dispatch them from the crew)`
+        );
+      } else {
+        await this.deps.client.updateWorkflowRun({
+          runId,
+          status: "abandoned",
+        });
+        this.status(`✓ proposal dismissed`);
+      }
+      await this.deps.refresh?.();
+    } catch (error) {
+      this.status(`✗ could not ${action}: ${message(error)}`);
+    }
+    if (!this.workflows || this.workflowsSeq !== seq) return;
+    await this.loadWorkflows();
   }
 
   /**
@@ -1885,6 +2703,30 @@ export class Desk {
     // handled by `activateFocused`, which swaps the phase.
     if (this.composer.phase !== "editing") return;
     const { form, values } = this.composer;
+    // ADR-0087 M6: the context form's submit is a READ that opens a result
+    // SURFACE — a one-line composer result cannot carry a blast radius
+    // (the D61 reclassification's own reason), so it never reaches
+    // executeAction at all.
+    if (form.commandId === "take-over") {
+      this.composer = null;
+      void this.takeOverSession((values.sessionId ?? "").trim());
+      return;
+    }
+    if (form.commandId === "context") {
+      const target = (values.target ?? "").trim();
+      if (!target) {
+        this.composer = {
+          ...this.composer,
+          result: { ok: false, message: "name a symbol or file/module" },
+        };
+        this.syncCentre();
+        this.deps.onChange();
+        return;
+      }
+      this.composer = null;
+      void this.openContext(target);
+      return;
+    }
     this.composer = { ...this.composer, busy: true, result: null };
     this.syncCentre();
     this.deps.onChange();
@@ -1900,8 +2742,12 @@ export class Desk {
     this.composer = { ...this.composer, busy: false, result };
     if (result.ok) {
       this.status(`✓ ${result.message}`);
-      await this.deps.refresh?.();
     }
+    // Refresh on EVERY completed action, not only success (review finding):
+    // a refused action may still have created durable records — specialist's
+    // KEPT task is the live case — and a snapshot that omits them makes the
+    // refusal's own advice unfollowable.
+    await this.deps.refresh?.();
     this.syncCentre();
     this.deps.onChange();
   }
@@ -1991,6 +2837,11 @@ export class Desk {
     this.governed?.dispose();
     this.sessions.disposeAll();
   }
+}
+
+/** Shared cursor clamp for the registry's move verbs. */
+function clampCursor(value: number, max: number): number {
+  return Math.min(Math.max(0, max), Math.max(0, value));
 }
 
 function message(error: unknown): string {

@@ -11,7 +11,7 @@ import {
   FLEET_MAX_AGENTS_PER_VENDOR,
   fleetGateTag,
   fleetVendorIds,
-  isReadOnlyRole,
+  isDispatchableRole,
   vendorsWhere,
   type VendorId,
 } from "@muon/protocol";
@@ -65,8 +65,9 @@ export const COORDINATOR_ORDINAL = 0;
 /**
  * Managed vendors that may seat the super-orchestrator (reserved ordinal 0),
  * projected from the registry's `authority.coordinatorSeat` column (ADR-0022
- * C3). Cursor and OpenCode stay out of the seat because they say `false` there,
- * not because this file remembers to omit them.
+ * C3). WHICH vendors those are is the registry's answer, never this file's —
+ * ADR-0057 opened the seat to all four public vendors and this line needed no
+ * edit, which is the property the projection exists for.
  *
  * Seat CAPACITY only (G4). The refusal that actually keeps a lane out of the
  * seat is the role ceiling — `assertVendorMayHoldRole(app, vendor,
@@ -191,6 +192,14 @@ async function fleetSnapshot() {
   }
   return { counts, agents };
 }
+
+/**
+ * The role an UNSCOPED fleet claim resolves to — `resolveDispatchRole`'s last
+ * resort. Named here so the admission guard below asks the question that
+ * actually matters ("can this vendor hold what this claim becomes?") instead
+ * of inferring it from the shape of the ceiling.
+ */
+const UNSCOPED_CLAIM_ROLE = "implementer" as const;
 
 export async function registerFleetRoutes(app: FastifyInstance) {
   app.get("/", async (request) => {
@@ -424,6 +433,31 @@ export async function registerFleetRoutes(app: FastifyInstance) {
     const ceiling = vendorRoleCeiling(payload.vendor);
     if (payload.role) {
       assertVendorMayHoldRole(app, payload.vendor, payload.role);
+      // …AND THE ROLE MUST BE ONE THIS ROUTE CAN ACTUALLY SEAT.
+      //
+      // `assertVendorMayHoldRole` answers "is this role in the ceiling?", and
+      // since ADR-0057 `orchestrator` is — for all four public vendors. But the
+      // claim loop below only ever selects `ordinal: WORKER_ORDINAL`; the
+      // coordinator seat is reserved at `COORDINATOR_ORDINAL` and is never
+      // handed out here. Without this guard the request returned 201 with a
+      // plain worker agent labelled `orchestrator`: the caller believes it holds
+      // the seat, and nothing it does will behave like one.
+      if (!isDispatchableRole(payload.role)) {
+        // The attach remedy is only offered to a vendor that HOLDS a seat.
+        // `fake` declares every role (so `orchestrator` is in its ceiling) with
+        // `coordinatorSeat: false`, and would have been told to run a command
+        // `coordinatorVendorIds()` refuses — a remedy that cannot succeed.
+        const canAttach = (coordinatorVendorIds() as readonly string[]).includes(
+          payload.vendor
+        );
+        throw app.httpErrors.badRequest(
+          `The '${payload.role}' role is a chat's root coordinator seat, not work a fleet claim can be seated for. Claim a worker role${
+            canAttach
+              ? `, or attach a coordinator with 'muon mcp attach ${payload.vendor}'`
+              : ""
+          }.`
+        );
+      }
     } else if (ceiling.length === 0) {
       // Reachable only for a vendor that is claimable but declares no role at
       // all. `[].every()` is `true`, so without this branch the refusal below
@@ -431,9 +465,39 @@ export async function registerFleetRoutes(app: FastifyInstance) {
       throw app.httpErrors.badRequest(
         `Vendor '${payload.vendor}' holds no crew role in MUON, so no seat can be claimed for it.`
       );
-    } else if (ceiling.every(isReadOnlyRole)) {
+    } else if (!ceiling.includes(UNSCOPED_CLAIM_ROLE)) {
+      // KEYED ON THE ROLE AN UNSCOPED CLAIM ACTUALLY RESOLVES TO, not on
+      // "every role here is read-only".
+      //
+      // The old predicate was `ceiling.every(isReadOnlyRole)`, and ADR-0057
+      // broke it silently: adding `orchestrator` (authority `coordinate`, a
+      // third value that is neither read-only nor write) made `.every()` false
+      // for Cursor and OpenCode, so this refusal stopped firing and an
+      // UNSCOPED claim was admitted — defaulting into exactly the wider slice
+      // the comment above says it must not.
+      //
+      // `resolveDispatchRole`'s last resort is `implementer`, so the honest
+      // question is simply "can this vendor hold the role this claim would
+      // become?". A vendor that cannot must name one. That is immune to future
+      // authority kinds, which is the property the previous version lacked.
+      // The HINT is the worker half of the ceiling, not the whole thing: this
+      // route only ever hands out `WORKER_ORDINAL` seats, so naming
+      // `orchestrator` here would send the caller back with a role it can pass
+      // admission for and still never be seated as. Derived, not restated, so
+      // it cannot drift from the registry.
+      // `claimableRoles`, NOT `claimable`: `claimableVendors()` already owns
+      // that name in this handler, and both are interpolated into 400 messages
+      // a few lines apart.
+      const claimableRoles = ceiling.filter(
+        (role) => isDispatchableRole(role)
+      );
+      // A coordinate-only ceiling would leave this list EMPTY and render
+      // "(one of: )" — the same degenerate message the `ceiling.length === 0`
+      // branch above exists to avoid, so it gets the same treatment.
       throw app.httpErrors.badRequest(
-        `Vendor '${payload.vendor}' is managed for read-only crew roles only, so a claim must name the role it is for (role: reviewer | qa | architect | scout).`
+        claimableRoles.length === 0
+          ? `Vendor '${payload.vendor}' holds no role a fleet claim can be made for, so no seat can be claimed for it.`
+          : `Vendor '${payload.vendor}' cannot hold the '${UNSCOPED_CLAIM_ROLE}' role an unscoped claim resolves to, so a claim must name the role it is for (one of: ${claimableRoles.join(" | ")}).`
       );
     }
 

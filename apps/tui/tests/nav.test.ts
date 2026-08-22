@@ -70,7 +70,7 @@ describe("the nav lists the PRODUCT, not this desk's subset", () => {
     );
     const out = plain(new Nav({ ...BASE, cursor: unbuilt }).render(80));
     expect(out).toContain("not on this desk yet");
-    expect(out).toContain("tui:ink");
+    expect(out).toContain("desktop app");
   });
 
   it("selecting an unbuilt destination REFUSES and does not change where we are", () => {

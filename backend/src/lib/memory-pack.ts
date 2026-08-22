@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { MemoryNote as MemoryNoteRow } from "@prisma/client";
+import { MEMORY_PACK_VERSION } from "@muon/protocol";
 import { redactForPack } from "@muon/client";
 import { resolveDataDir } from "@muon/client/paths";
 import { isHumanPrincipal } from "./auth.js";
@@ -67,7 +68,11 @@ import { computeMemoryTextHash } from "./memory-ledger.js";
 // Import (Slice 2) NEVER trusts any of this: every field is re-verified
 // server-side and an imported record lands as an unconfirmed proposal.
 
-export const MEMORY_PACK_VERSION = 1 as const;
+// ADR-0070: the ONE spelling now lives in @muon/protocol (exchange-contracts)
+// so every surface that DISCLOSES the version imports the same constant the
+// exporter and importer bind to. Re-exported so existing consumers keep
+// their import path.
+export { MEMORY_PACK_VERSION };
 export const MEMORY_PACK_MANIFEST_NAME = "muon-memory-pack.json";
 export const MEMORY_PACK_MAX_TEXT_CHARS = 10_000;
 export const PACK_SALT_FILE = "pack-salt";
@@ -98,6 +103,21 @@ export type MemoryPackOrigin = {
   label: string;
 };
 
+/**
+ * ADR-0064 A1's named residual, closed: provenance stamps RIDE the record —
+ * data, never authority. The importer materialises NOTHING from this block
+ * (a grounding is a check against the ORIGIN's repository and is re-run
+ * against the receiving one; offer counts are the origin machine's
+ * disclosure of how much use the note saw). It exists so the human
+ * reviewing an import can see what the sending brain knew about the note.
+ * THE shape lives in @muon/protocol (`memoryPackRecordProvenanceSchema`) —
+ * one spelling for the exporter's type, the hostile-import validator, and
+ * the client's file schema (review finding: three local definitions were
+ * free to drift around one hash).
+ */
+export type { MemoryPackRecordProvenance } from "@muon/protocol";
+import type { MemoryPackRecordProvenance } from "@muon/protocol";
+
 export type MemoryPackRecord = {
   version: typeof MEMORY_PACK_VERSION;
   origin: { fingerprint: string; noteId: string; label: string };
@@ -112,6 +132,9 @@ export type MemoryPackRecord = {
     symbols: string[];
     validFrom: string;
     recordedAt: string;
+    /** ADR-0091: the ownership kind's structured owners. OPTIONAL and
+     *  omitted when absent, so pre-0091 record hashes stay stable. */
+    owners?: string[];
   };
   author: { principal: string; kind: "human" | "agent" };
   confirmation: {
@@ -121,6 +144,10 @@ export type MemoryPackRecord = {
     textHash: string;
   };
   supersededTextHashes: string[];
+  /** Absent on records whose note carries no grounding and no offers —
+   *  absence keeps pre-enrichment record hashes stable (additive within
+   *  v1, PACKETS.md 2026-08-22). */
+  provenance?: MemoryPackRecordProvenance;
 };
 
 export type MemoryPackManifestRecord = {
@@ -247,6 +274,10 @@ export function canonicalRecordJson(record: MemoryPackRecord): string {
       symbols: [...record.note.symbols],
       validFrom: record.note.validFrom,
       recordedAt: record.note.recordedAt,
+      // Present-only (hash stability): absent on every non-ownership note.
+      ...(record.note.owners && record.note.owners.length > 0
+        ? { owners: [...record.note.owners] }
+        : {}),
     },
     author: { principal: record.author.principal, kind: record.author.kind },
     confirmation: {
@@ -256,6 +287,33 @@ export function canonicalRecordJson(record: MemoryPackRecord): string {
       textHash: record.confirmation.textHash,
     },
     supersededTextHashes: [...record.supersededTextHashes],
+    // Rebuilt field-by-field like everything above; OMITTED entirely when
+    // absent, so pre-enrichment records keep their exact hashes.
+    ...(record.provenance
+      ? {
+          provenance: {
+            ...(record.provenance.grounding
+              ? {
+                  grounding: {
+                    verdict: record.provenance.grounding.verdict,
+                    at: record.provenance.grounding.at,
+                    checkKinds: [...record.provenance.grounding.checkKinds],
+                  },
+                }
+              : {}),
+            ...(record.provenance.offers
+              ? {
+                  offers: {
+                    distinctChats: record.provenance.offers.distinctChats,
+                    distinctJobs: record.provenance.offers.distinctJobs,
+                    firstOfferedAt: record.provenance.offers.firstOfferedAt,
+                    lastOfferedAt: record.provenance.offers.lastOfferedAt,
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
   };
   return JSON.stringify(canonical);
 }
@@ -314,6 +372,29 @@ export type MemoryPackSource = {
   notes: MemoryNoteRow[];
   /** Full Confirmation feed, ascending by `at` (sorted defensively anyway). */
   confirmations: MemoryPackConfirmationRow[];
+  /** ADR-0058 grounding rows; the builder derives the LATEST stamp per note
+   *  (sorted defensively by at, then id). Optional: a source without them
+   *  builds records with no provenance block, exactly as before. */
+  groundings?: {
+    id: string;
+    noteId: string;
+    verdict: string;
+    /** The stored per-check JSON array; only each row's `kind` travels. */
+    checks: string;
+    at: Date;
+  }[];
+  /** ADR-0060 offer rows; the builder aggregates per-note counts + time
+   *  bounds. Ids stay in the aggregation and never reach the record. Rows
+   *  carry their own workspacePath so the BUILDER enforces the export
+   *  boundary (review finding: grouping by noteId alone aggregated another
+   *  workspace's usage into this workspace's pack). */
+  offers?: {
+    noteId: string;
+    partition: string;
+    jobId: string;
+    firstAt: Date;
+    workspacePath: string | null;
+  }[];
 };
 
 type ConfirmationState = {
@@ -564,6 +645,66 @@ export function buildMemoryPackPages(source: MemoryPackSource): MemoryPackExport
     omissionCounts.set(reason, (omissionCounts.get(reason) ?? 0) + 1);
   };
 
+  // ADR-0064 A1 residual: the LATEST grounding stamp per note (ascending
+  // sort, later rows overwrite) and the per-note offer summary. Both are
+  // DISCLOSURE, never authority — and both understate on defect (a
+  // malformed checks JSON still ships its verdict, with no kinds).
+  const latestGrounding = new Map<
+    string,
+    { verdict: string; at: Date; checkKinds: string[] }
+  >();
+  for (const row of [...(source.groundings ?? [])].sort((a, b) =>
+    a.at.getTime() !== b.at.getTime()
+      ? a.at.getTime() - b.at.getTime()
+      : a.id < b.id
+        ? -1
+        : 1
+  )) {
+    let kinds: string[] = [];
+    try {
+      const parsed = JSON.parse(row.checks) as unknown;
+      if (Array.isArray(parsed)) {
+        kinds = sortedUnique(
+          parsed
+            .map((check) => String((check as { kind?: unknown })?.kind ?? ""))
+            .filter((kind) => kind.length > 0)
+        );
+      }
+    } catch {
+      // malformed evidence understates — the verdict still travels
+    }
+    latestGrounding.set(row.noteId, {
+      verdict: row.verdict,
+      at: row.at,
+      checkKinds: kinds,
+    });
+  }
+  const offerSummary = new Map<
+    string,
+    { chats: Set<string>; jobs: Set<string>; first: Date; last: Date }
+  >();
+  for (const row of source.offers ?? []) {
+    // The export boundary applies to the SUMMARY too (review finding): only
+    // offers served in THIS workspace count. NULL (unscoped historical
+    // rows) is excluded fail-closed — an understated summary, never a
+    // cross-workspace usage disclosure.
+    if (row.workspacePath !== source.workspacePath) continue;
+    const current = offerSummary.get(row.noteId);
+    if (!current) {
+      offerSummary.set(row.noteId, {
+        chats: new Set([row.partition]),
+        jobs: new Set([row.jobId]),
+        first: row.firstAt,
+        last: row.firstAt,
+      });
+    } else {
+      current.chats.add(row.partition);
+      current.jobs.add(row.jobId);
+      if (row.firstAt < current.first) current.first = row.firstAt;
+      if (row.firstAt > current.last) current.last = row.firstAt;
+    }
+  }
+
   const records: { hash: string; record: MemoryPackRecord; chars: number }[] = [];
   const tombstones: MemoryPackTombstone[] = [];
 
@@ -640,6 +781,23 @@ export function buildMemoryPackPages(source: MemoryPackSource): MemoryPackExport
         symbols: sortedUnique(asStringArray(row.symbols)),
         validFrom: row.validFrom.toISOString(),
         recordedAt: row.recordedAt.toISOString(),
+        // ADR-0091: the structured owners travel with the fact (review
+        // finding: an exported ownership note lost whom-to-ask entirely).
+        // Each owner string passes redactForPack exactly as the text does —
+        // the no-credential-material guarantee is field-blind (second
+        // review finding); an owner fully consumed by redaction is dropped.
+        ...(row.kind === "ownership" &&
+        Array.isArray(row.owners) &&
+        row.owners.every((entry: unknown) => typeof entry === "string") &&
+        row.owners.length > 0
+          ? {
+              owners: sortedUnique(
+                (row.owners as string[])
+                  .map((owner) => redactForPack(owner).trim())
+                  .filter((owner) => owner.length > 0)
+              ),
+            }
+          : {}),
       },
       author: {
         principal: row.createdBy,
@@ -653,6 +811,31 @@ export function buildMemoryPackPages(source: MemoryPackSource): MemoryPackExport
       },
       supersededTextHashes: supersededHashesFor(row.id),
     };
+    const grounding = latestGrounding.get(row.id);
+    const offers = offerSummary.get(row.id);
+    if (grounding || offers) {
+      record.provenance = {
+        ...(grounding
+          ? {
+              grounding: {
+                verdict: grounding.verdict,
+                at: grounding.at.toISOString(),
+                checkKinds: grounding.checkKinds,
+              },
+            }
+          : {}),
+        ...(offers
+          ? {
+              offers: {
+                distinctChats: offers.chats.size,
+                distinctJobs: offers.jobs.size,
+                firstOfferedAt: offers.first.toISOString(),
+                lastOfferedAt: offers.last.toISOString(),
+              },
+            }
+          : {}),
+      };
+    }
     records.push({ hash: recordHashOf(record), record, chars: text.length });
   }
 
@@ -687,9 +870,23 @@ async function collectPackSource(
   // merely unused. `MemoryNote.workspacePath` is the partition, so a second
   // derivation of it here would be a second answer to one question — and the query
   // it removes was the fail-open one (a pruned Task row read as "in-workspace").
-  const [notes, confirmations] = await Promise.all([
+  const [notes, confirmations, groundings, offers] = await Promise.all([
     prisma.memoryNote.findMany({ orderBy: { id: "asc" } }),
     prisma.confirmation.findMany({ orderBy: [{ at: "asc" }, { id: "asc" }] }),
+    // ADR-0064 A1 residual: the provenance stamps that ride pack records.
+    prisma.memoryGrounding.findMany({
+      select: { id: true, noteId: true, verdict: true, checks: true, at: true },
+      orderBy: [{ at: "asc" }, { id: "asc" }],
+    }),
+    prisma.memoryOffer.findMany({
+      select: {
+        noteId: true,
+        partition: true,
+        jobId: true,
+        firstAt: true,
+        workspacePath: true,
+      },
+    }),
   ]);
   return {
     workspacePath,
@@ -699,6 +896,8 @@ async function collectPackSource(
     },
     notes,
     confirmations,
+    groundings,
+    offers,
   };
 }
 

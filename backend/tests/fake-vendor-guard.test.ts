@@ -12,6 +12,8 @@ import { buildApp } from "../src/app.js";
 // registry — a module-load evaluation would freeze the seam.
 
 const prismaMock = vi.hoisted(() => ({
+  // The fork-pointer stamp reads the task on every create (D34).
+  task: { findUnique: vi.fn(async () => null) },
   dispatchJob: {
     create: vi.fn(),
     count: vi.fn(),
@@ -227,7 +229,7 @@ describe("fake vendor guard (MUON_FAKE_VENDOR seam)", () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toMatch(
-      /managed for read-only crew roles only/i
+      /cannot hold the 'implementer' role an unscoped claim resolves to/i
     );
     expect(prismaMock.agent.findFirst).not.toHaveBeenCalled();
     await app.close();

@@ -33,6 +33,8 @@
     "graph:test": "npm run --prefix packages/graph test",
     "codegraph:build": "npm run --prefix packages/codegraph build",
     "codegraph:test": "npm run --prefix packages/codegraph test",
+    "docgraph:build": "npm run --prefix packages/docgraph build",
+    "docgraph:test": "npm run --prefix packages/docgraph test",
     "mcp:build": "npm run --prefix packages/mcp build",
     "mcp:test": "npm run --prefix packages/mcp test",
     "dev:desktop": "node scripts/dev-desktop.mjs",
@@ -48,10 +50,7 @@
     "core:build": "npm run --prefix packages/core build",
     "protocol:test": "npm run --prefix packages/protocol typecheck",
     "adapters:test": "npm run --prefix packages/adapters test",
-    "core:test": "npm run --prefix packages/core test",
-    "tui:legacy": "npm run --prefix apps/tui build && npm run --prefix apps/tui start:classic --",
-    "tui:legacy:dev": "npm run --prefix apps/tui dev:classic --",
-    "tui:ink": "npm run --prefix apps/tui build && npm run --prefix apps/tui start:ink --"
+    "core:test": "npm run --prefix packages/core test"
   },
   "dependencies": {
     "@radix-ui/react-collapsible": "^1.1.20",
@@ -62,6 +61,7 @@
     "lucide-react": "^1.23.0",
     "next": "16.2.11",
     "pg": "^8.22.0",
+    "posthog-js": "^1.418.10",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "shadcn": "^4.13.0",

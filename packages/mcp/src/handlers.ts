@@ -1,6 +1,9 @@
+import fs from "node:fs";
+import path from "node:path";
 import {
   classifyHandoffPacket,
   askBlockingQuestion,
+  withdrawBlockingQuestion,
   buildConvergencePreflight,
   buildPreEditView,
   claimFiles,
@@ -64,7 +67,11 @@ import {
   MAX_PEER_SUBJECT_CHARS,
   MAX_QUESTION_BODY_CHARS,
   MAX_QUESTION_SUBJECT_CHARS,
+  MUON_ATTACHED_COORDINATOR_CONTROL_REMAINDER,
+  MUON_EXCHANGE_CONTRACTS,
+  memoryImpactClaimSchema,
   peerMessageKindSchema,
+  sessionSlug,
   type AgentRole,
   type ClaimIntent,
   type HandoffPacket,
@@ -85,13 +92,98 @@ import {
   type ToolUiHints,
 } from "./agent-ui.js";
 import {
-  createGitNexusToolDefinitions,
+  createGitNexusToolkit,
+  resolveCodeGraph,
+  resolveWorkspacePath,
   type GitNexusToolOptions,
 } from "./gitnexus-tools.js";
+import { createQuestionToolDefinitions } from "./question-tools.js";
+import { codeImpactEvidenceFromTool } from "./code-impact-evidence.js";
+import {
+  createDocsToolDefinitions,
+  type DocsToolOptions,
+} from "./docs-tools.js";
 import {
   extractImpactBlastRadius,
   gateImpactResult,
 } from "./impact-preedit-compose.js";
+import { impactAgreementCheck } from "./memory-ground-impact.js";
+import type { ReviewDiffLedger } from "./review-session.js";
+// The POSITIVE exempt set itself, so `whoami` names what a locked session can
+// still reach FROM the enforced list rather than from a prose copy of it.
+// server-factory's own import of this file is type-only, so this is not a
+// runtime cycle.
+import { MCP_IDENTITY_GATE_EXEMPT_TOOLS } from "./server-factory.js";
+import {
+  GATE_SURFACES,
+  type GateSurface,
+  REGISTRATION_RETRY_BY_SURFACE,
+} from "@muon/client/github-identity-gate";
+
+/**
+ * WHICH SURFACES RETRY A DEFERRED INSTALL REGISTRATION BY THEMSELVES.
+ *
+ * MEASURED, not assumed (untruncated grep, 2026-08-17): there is exactly ONE
+ * retry loop in this tree — `startInstallRegistrationRetry` in
+ * `apps/desktop/src/main.ts`, bounded, and alive only while the desktop app is
+ * open. `muon login` registers once and returns; the TUI's startup guard and
+ * this `muon-mcp` server only READ the gate state. Nothing else retries.
+ *
+ * A `Record<GateSurface, …>` rather than a list, so a fourth gate surface does
+ * not compile until somebody states whether it retries. The alternative —
+ * "everything except the CLI" — is the derive-by-subtraction shape that has
+ * silently granted this repo the wrong default twice.
+ */
+// The table lives in @muon/client beside GATE_SURFACES, with the copy it
+// governs. Declared here as well, it was two facts that could disagree — and
+// the whole defect being fixed was one surface's copy being wrong about another
+// surface's behaviour.
+
+/** The surface this note is READ on: `whoami` only ever answers inside a
+ *  `muon-mcp` server, which is the same surface `resolveMcpIdentityGate` files
+ *  its refusals under. */
+const WHOAMI_GATE_SURFACE: GateSurface = "mcp";
+
+/**
+ * ADR-0052 F3 — the `locked-unregistered` note, TRUE FOR THE SURFACE READING IT.
+ *
+ * The state is genuinely distinguished: a human here has signed in and the
+ * install record has not landed, so the ordinary "run `muon login`" refusal
+ * would push them at an action they already completed. The previous copy drew
+ * the wrong conclusion from that and told every agent "do NOT ask the human to
+ * run `muon login` — they already have, and it will not help", justified by
+ * "MUON retries automatically". Only the DESKTOP retries. On a CLI-only tarball
+ * whose first sign-in hit a captive portal, nothing on the machine ever retries
+ * — so the one instruction the agent was given was to withhold the only remedy
+ * there is.
+ *
+ * Composed here, once, and keyed on the table above rather than on prose: the
+ * remedy sentence follows the retry that actually exists, and a surface that
+ * stops retrying changes this copy by changing the table.
+ */
+export function lockedUnregisteredNote(input: {
+  readonly surface: GateSurface;
+  /** The tools a gated server still answers, FROM the enforced set. */
+  readonly stillAvailable: readonly string[];
+}): string {
+  const retriers = GATE_SURFACES.filter(
+    (surface) => REGISTRATION_RETRY_BY_SURFACE[surface]
+  );
+  const elsewhere = retriers.filter((surface) => surface !== input.surface);
+  const remedy = REGISTRATION_RETRY_BY_SURFACE[input.surface]
+    ? "This surface retries automatically while it is open, so this can clear with no action; if it does not clear, `muon login` re-runs the whole flow and files the record."
+    : elsewhere.length > 0
+      ? `NOTHING in this process retries it — only MUON's ${elsewhere.join(
+          " and "
+        )} surface retries automatically, and only while it is open. So unless the human is also running that, \`muon login\` is the ONLY thing that files the record: say so and let them decide. It is not a wasted trip — their sign-in worked, the registration is what did not.`
+      : "NOTHING on this machine retries it: `muon login` is the only thing that files the record, so ask the human to run it again. It is not a wasted trip — their sign-in worked, the registration is what did not.";
+  return (
+    "MUON is LOCKED on this machine, but NOT for want of a sign-in: an identity here is verified and this install's record has not reached the MUON project yet. " +
+    `Every tool except ${input.stillAvailable.join(
+      " and "
+    )} will refuse until it does. ${remedy}`
+  );
+}
 
 export type ToolScope = {
   taskId?: string;
@@ -125,6 +217,48 @@ export type ToolScope = {
    * `memory_delete` refuses ids outside this handle set.
    */
   surfacedMemoryHandles?: Set<string>;
+  /**
+   * WHICH SEAT THIS IS, when it is not an ordinary dispatched crew member.
+   *
+   * Scope coordinates alone cannot tell "a coordinator, which legitimately has
+   * no lane" apart from "a dispatched child whose lane was dropped by a broken
+   * runner", and the two deserve opposite advice. Only refusals read this; no
+   * tool is granted or withheld by it.
+   */
+  seat?: "attached-coordinator";
+  /**
+   * H14 — the ATTACHED SEAT's lease facts, so `whoami` can answer "how long may
+   * I act, and on whose behalf" without a network call.
+   *
+   * Deliberately carries ONLY what is not already a scope coordinate: chat id
+   * and job id live above and are read from there, because two copies of one
+   * fact drift and the wrong copy is the one that gets reported.
+   *
+   * MUTATED IN PLACE by the seat's heartbeat (`runAttachedCoordinator`), which
+   * is why it is an object rather than three flat fields: a snapshot taken at
+   * launch would have `whoami` report the FIRST lease for the whole life of a
+   * session that has since renewed dozens of times — a confidently wrong expiry
+   * is worse than none. Never holds the capability's tokens; only its
+   * coordinates.
+   */
+  /**
+   * A4 — the session's `review_diff` record, shared BY REFERENCE with the
+   * control tools so `ship` can refuse to file a merge gate for a task nobody
+   * in this session has reviewed. The base tools and the control tools are
+   * composed separately and never see each other's scope, so this one object
+   * is the wire between them. Absent → the preflight finds nothing, which is
+   * the fail-closed direction.
+   */
+  reviewLedger?: ReviewDiffLedger;
+  attached?: {
+    /** ISO expiry of the current lease (ADR-0028 §3). */
+    expiresAt: string;
+    /** ADR-0049: this lease has never heartbeated, so it rides the wider
+     *  bootstrap horizon until the first one lands. */
+    bootstrap: boolean;
+    /** The vendor CLI the human attached this seat to. */
+    vendor: string;
+  };
 };
 
 function ensureSurfacedHandles(scope: ToolScope): Set<string> {
@@ -168,7 +302,16 @@ function failWithImpactEvidence(
 
 export type ToolDefinitionOptions = {
   gitNexus?: GitNexusToolOptions;
+  /** ADR-0053 — the docs graph's injection point (tests, embedders). */
+  docs?: DocsToolOptions;
 };
+
+/**
+ * H5: how many pending coordinates `review_queue` hands back PER HALF. This is
+ * a pointer to the operator surface, not a page of it — a human who is thirty
+ * gates behind needs to be told that, not handed thirty rows in a chat.
+ */
+const REVIEW_QUEUE_LIMIT = 20;
 
 const MEMORY_KINDS = [
   "decision",
@@ -176,6 +319,7 @@ const MEMORY_KINDS = [
   "convention",
   "attempt",
   "question",
+  "ownership",
 ] as const;
 
 const MEMORY_GRAPH_RELATIONS = [
@@ -265,6 +409,8 @@ function structuredHandoffPacketView(packet: HandoffPacket) {
 const PREEDIT_COVERAGE_ACTION: Record<PreEditCoverageEmptyReason, string> = {
   no_anchors:
     "No anchors resolved: pass module/files (and blastRadiusModules from code_impact) so the gate has something to look up.",
+  no_module_anchor:
+    "You named a symbol but no file, and memory is anchored to files: re-run with `filePath`/`module` (or pass blastRadiusModules from code_impact). This is NOT evidence that nothing is recorded.",
   no_notes_on_anchors:
     "Nothing is anchored to this radius at all: record what you decide with memory_add so the next lane inherits it.",
   withheld_no_crew_chat:
@@ -559,8 +705,28 @@ const CLAIM_INTENTS = [
 export function ungovernedSessionRefusal(
   tool: string,
   needs: string,
-  scope?: { jobId?: string }
+  scope?: { jobId?: string; seat?: "attached-coordinator" }
 ): string {
+  // AN ATTACHED COORDINATOR IS NOT A FAULT. It holds a job and a chat and no
+  // lane, by design (ADR-0028 Tier C), so the lane-scoped tools are correctly
+  // out of reach — but both branches below would misdiagnose it, one as a
+  // hand-launched session (it has a job) and the other as a runner-injection
+  // incident to report (nothing is broken). Measured on 2026-08-13: a live
+  // `muon mcp attach claude-code` seat was told it "was hand-launched".
+  // `&& jobId`: the seat text states "it holds a job" as fact, so it may only
+  // fire when that is one. A seat missing its jobId is an injection incident
+  // (main() refuses to construct the scope partially, so something upstream
+  // broke) and falls through to the diagnoses below rather than to a branch
+  // that would announce nothing is broken.
+  if (scope?.seat === "attached-coordinator" && scope.jobId) {
+    return (
+      `${tool} requires ${needs}. This is an attached coordinator seat ` +
+      "(`muon mcp attach`): it holds a job and a chat but no LANE, because it " +
+      "is not a dispatched crew member — so lane-scoped work is out of reach " +
+      "here by design, and nothing is broken. Dispatch a crew member and let " +
+      "it do this, or do it yourself on a MUON surface."
+    );
+  }
   // A session that DOES carry a job identity but is missing another scope
   // coordinate is a GOVERNED session with an injection fault (e.g. the runner
   // failed to pass MUON_PREFLIGHT_NONCE) — telling it it was hand-launched is
@@ -573,12 +739,31 @@ export function ungovernedSessionRefusal(
       "retrying."
     );
   }
+  // A HAND-LAUNCHED SESSION IS THE RELEASE TARBALL'S PRIMARY USER, and this
+  // branch used to send it straight into the code-graph tools — which, on the
+  // install that ships `muon-mcp` WITHOUT a `gitnexus` CLI, are precisely the
+  // tools that refuse. "Here is your next move" pointing at a set of refusals
+  // is the loop this whole surface exists to prevent, so the sentence is
+  // conditional on the ONE process-wide resolution every other code-graph
+  // sentence reads (`resolveCodeGraph`) — never a second derivation that could
+  // disagree with the handlers it is describing.
+  const codeGraph = resolveCodeGraph();
   return (
     `${tool} requires ${needs}. This session was hand-launched (a vendor CLI ` +
     "with `muon mcp install`), which never has a job identity — only a crew " +
     "member MUON dispatched (via `muon chat`, `muon run`, or the desktop) " +
-    "gets one. From here, use the CODE-GRAPH tools (code_query, code_context, " +
-    "code_impact, repo_map, review_diff), which need no job. MEMORY tools are " +
+    "gets one. " +
+    (codeGraph.available
+      ? "From here, use the CODE-GRAPH tools (code_query, code_context, " +
+        "code_impact, repo_map, review_diff, data_boundaries, flow_scope), " +
+        "which need no job. "
+      : "The CODE-GRAPH tools need no job, but NO `gitnexus` CLI is reachable " +
+        "on this install, so they are listed and every one of them refuses — " +
+        "do not reach for them either. Read and grep the files instead, say " +
+        "plainly which conclusions are file-read-only because of it, and tell " +
+        "the human that installing GitNexus (or setting MUON_GITNEXUS_BIN) " +
+        "and restarting this session restores them. ") +
+    "MEMORY tools are " +
     "partitioned BY JOB and refuse this session for the same reason — do not " +
     "reach for them next. To get memory or coordination, start governed work " +
     "with `muon chat`."
@@ -600,7 +785,7 @@ function coordinationScope(
   if (!scope.jobId) {
     return {
       ok: false,
-      error: ungovernedSessionRefusal(tool, "a job-scoped agent session"),
+      error: ungovernedSessionRefusal(tool, "a job-scoped agent session", scope),
     };
   }
   if (!scope.apiBase || !scope.apiToken) {
@@ -622,8 +807,13 @@ export function createToolDefinitions(
   scope: ToolScope,
   options: ToolDefinitionOptions = {}
 ): ToolDefinition[] {
-  const gitNexusTools = createGitNexusToolDefinitions({
+  // ONE workspace resolution for BOTH derived graphs (ADR-0053 Phase 2).
+  // Resolved here and handed down rather than defaulted twice, so `docs_impact`
+  // and `code_impact` can never be describing two different trees.
+  const workspacePath = resolveWorkspacePath(options.gitNexus?.workspacePath);
+  const gitNexusToolkit = createGitNexusToolkit({
     ...options.gitNexus,
+    workspacePath,
     // B4: RepoMap sizing receives only the trusted chat's coordinate-only
     // analytics. No chat scope means no memory signal, never a global fallback.
     memoryAnalytics: scope.jobId
@@ -636,7 +826,33 @@ export function createToolDefinitions(
     fetchTaskDiff: scope.jobId
       ? (taskId: string) => client.taskWorktreeDiff(taskId)
       : options.gitNexus?.fetchTaskDiff,
+    // A4: the SAME Map the control tools read at ship time. Handed through the
+    // scope rather than created here, because a ledger this factory owned would
+    // be a different object from the one `ship` looks in.
+    reviewLedger: scope.reviewLedger ?? options.gitNexus?.reviewLedger,
   });
+  const gitNexusTools = gitNexusToolkit.tools;
+  // ADR-0053 — the docs graph, BESIDE the code graph and independent of it. It
+  // needs no CLI, no index and no job: the corpus is the repository's own
+  // markdown, rebuilt in-process from the working tree, so these three READS
+  // answer on an install where every code-graph tool refuses. Composed here
+  // rather than inside `createGitNexusToolDefinitions` because the two graphs
+  // share only their root — one degrading must never take the other with it.
+  const docsTools = createDocsToolDefinitions({
+    workspacePath,
+    ...options.docs,
+  });
+  // EXACTLY the tools that refuse when the code graph is absent, read off the
+  // list that was just built. `whoami`'s note used to RETYPE seven names beside
+  // this builder, which is the drift shape ADR-0022 keeps closing: the note and
+  // the enforced set were free to disagree, and the eighth code-graph tool to
+  // land would have been missing from the note on the day it shipped.
+  const codeGraphToolNames = gitNexusTools.map((tool) => tool.name);
+  // THE resolution (memoised per process, see `resolveCodeGraph`): the same
+  // value the handlers above were frozen with and that `initialize` rendered
+  // its instructions from, so `whoami` cannot report "available" beside
+  // handlers that refuse.
+  const codeGraph = resolveCodeGraph();
   // Filled in by buildMuonServer with the FINAL registered list (feature #10).
   // Until then `whoami` answers from the base definitions it can see — an
   // understatement of the grant, never an overstatement.
@@ -645,7 +861,7 @@ export function createToolDefinitions(
     {
       name: "memory_search",
       description:
-        "Search MUON's shared work memory (decisions, constraints, conventions, attempts, questions) across all agent lanes IN THIS REPOSITORY. Memory is scoped per workspace, so another repository's notes are never returned and finding nothing here does not mean nothing was learned elsewhere. Notes past their retention TTL are hidden; a human confirm makes a note permanent.",
+        "Search MUON's shared work memory (decisions, constraints, conventions, attempts, questions) across all agent lanes IN THIS REPOSITORY. Memory is scoped per workspace, so another repository's notes are never returned and finding nothing here does not mean nothing was learned elsewhere. Notes past their retention TTL are hidden; a human confirm makes a note permanent. ADR-0061 disclosure: `suppressed_count` = N more notes matched but ranked below the result cap (ask narrower, or ask an operator); `withheld` = identifier-only stubs {id, kind, reason: expired|paused|stale} for notes policy-hidden in YOUR OWN partition — recall the id, ask an operator to un-pause, or ground the stale one. Absent fields mean nothing was suppressed. Notes another partition holds are NEVER counted or stubbed.",
       inputSchema: {
         type: "object",
         properties: {
@@ -675,17 +891,31 @@ export function createToolDefinitions(
         // reaches only the orchestrator/delegate DISPATCH coordinates (see
         // `src/index.ts`) and never this `ToolScope`, because the runner remaps it to
         // the governed task worktree for every worker under an editing harness.
-        const notes = await client.searchMemory(query, {
+        const envelope = await client.searchMemoryDisclosed(query, {
           chatId: scope.chatId,
           filter: filter.filter,
         });
-        const result = bounded(notes, MEMORY_RESULT_LIMIT);
+        const result = bounded(envelope.notes, MEMORY_RESULT_LIMIT);
         trackSurfacedNoteIds(scope, result.items);
+        // ADR-0061: ONE suppressed_count across every layer that clips —
+        // the server's cap-class count plus THIS tool's own bound (the cap
+        // that used to be silent). Policy stubs ride verbatim. Absent
+        // fields mean nothing suppressed; the tool description explains the
+        // two fields once, never per-response.
+        const suppressedCount =
+          (envelope.suppressedCount ?? 0) + result.evidence.omitted;
         return ok(
-          { notes: result.items },
+          {
+            notes: result.items,
+            ...(suppressedCount > 0
+              ? { suppressed_count: suppressedCount }
+              : {}),
+            ...(envelope.withheld ? { withheld: envelope.withheld } : {}),
+          },
           {
             evidence: {
               ...result.evidence,
+              omitted: suppressedCount,
               kind: "memory notes",
             },
           }
@@ -695,7 +925,7 @@ export function createToolDefinitions(
     {
       name: "memory_recall",
       description:
-        "Recall shared memory notes by stable noteId or filter, within THIS REPOSITORY (memory is workspace-scoped). A peer message's refs.noteIds are coordinates: pass one here to resolve it through mission/trust fences. With relatedToTask, walks task -> touched modules -> anchored notes + lane notes. Defaults to the current task when no coordinate is given.",
+        "Recall shared memory notes by stable noteId or filter, within THIS REPOSITORY (memory is workspace-scoped). A peer message's refs.noteIds are coordinates: pass one here to resolve it through mission/trust fences. With relatedToTask, walks task -> touched modules -> anchored notes + lane notes. Defaults to the current task when no coordinate is given. ADR-0061 disclosure: `suppressed_count` = N more notes matched but ranked below the result cap (ask narrower, or ask an operator); `withheld` = identifier-only stubs {id, kind, reason: expired|paused|stale} for notes policy-hidden in YOUR OWN partition — recall the id, ask an operator to un-pause, or ground the stale one. Absent fields mean nothing was suppressed. Notes another partition holds are NEVER counted or stubbed.",
       inputSchema: {
         type: "object",
         properties: {
@@ -756,15 +986,15 @@ export function createToolDefinitions(
         // operator-promoted global memory — and, ADR-0026 §6, that promotion widens a
         // note across MISSIONS only, never across repositories. The workspace fence
         // is derived server-side from this session's capability (see memory_search).
-        const recalled = noteId
-          ? await client.recallMemoryById(noteId)
+        const envelope = noteId
+          ? await client.recallMemoryByIdDisclosed(noteId)
           : relatedToTask
-          ? await client.recallRelatedToTask(
+          ? await client.recallRelatedToTaskDisclosed(
               relatedToTask,
               scope.chatId,
               filter.filter
             )
-          : await client.recallMemory({
+          : await client.recallMemoryDisclosed({
               taskId: args.taskId as string | undefined,
               laneId: args.laneId as string | undefined,
               module: args.module as string | undefined,
@@ -773,6 +1003,7 @@ export function createToolDefinitions(
               chatId: scope.chatId,
               filter: filter.filter,
             });
+        const recalled = envelope.notes;
         // Explicit reinforcement producer (ADR-0009 §2.4 / KG-2): recall surfaces
         // these notes INTO the agent's context, that is a genuine "used" signal
         // (unlike a bare search). Fire-and-forget; a ranking hint never fails the
@@ -787,11 +1018,23 @@ export function createToolDefinitions(
             .catch(() => undefined);
         }
         trackSurfacedNoteIds(scope, result.items);
+        // ADR-0061: one suppressed_count across every clipping layer — the
+        // server's cap-class count plus this tool's own bound. Stubs ride
+        // verbatim; absent means nothing suppressed.
+        const suppressedCount =
+          (envelope.suppressedCount ?? 0) + result.evidence.omitted;
         return ok(
-          { notes: result.items },
+          {
+            notes: result.items,
+            ...(suppressedCount > 0
+              ? { suppressed_count: suppressedCount }
+              : {}),
+            ...(envelope.withheld ? { withheld: envelope.withheld } : {}),
+          },
           {
             evidence: {
               ...result.evidence,
+              omitted: suppressedCount,
               kind: "recalled memory notes",
             },
           }
@@ -837,7 +1080,8 @@ export function createToolDefinitions(
           return fail(
             ungovernedSessionRefusal(
               "memory_neighbors",
-              "a job-scoped agent session"
+              "a job-scoped agent session",
+              scope
             )
           );
         }
@@ -908,7 +1152,8 @@ export function createToolDefinitions(
           return fail(
             ungovernedSessionRefusal(
               "memory_explain",
-              "a job-scoped agent session"
+              "a job-scoped agent session",
+              scope
             )
           );
         }
@@ -949,7 +1194,8 @@ export function createToolDefinitions(
           return fail(
             ungovernedSessionRefusal(
               "memory_delete",
-              "a job- and lane-scoped agent session"
+              "a job- and lane-scoped agent session",
+              scope
             )
           );
         }
@@ -991,7 +1237,8 @@ export function createToolDefinitions(
           return fail(
             ungovernedSessionRefusal(
               "memory_clone",
-              "a job- and lane-scoped agent session"
+              "a job- and lane-scoped agent session",
+              scope
             )
           );
         }
@@ -1013,11 +1260,17 @@ export function createToolDefinitions(
     {
       name: "memory_add",
       description:
-        "Propose a memory note for the shared brain (decision | constraint | convention | attempt | question). Notes land unconfirmed until a human confirms them, and an unconfirmed note is retired at the deadline reported in note_status; confirming it makes it permanent.",
+        "Propose a memory note for the shared brain (decision | constraint | convention | attempt | question | ownership). Notes land unconfirmed until a human confirms them, and an unconfirmed note is retired at the deadline reported in note_status; confirming it makes it permanent.",
       inputSchema: {
         type: "object",
         properties: {
           kind: { type: "string", enum: [...MEMORY_KINDS] },
+          owners: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "ONLY with kind 'ownership': principal strings naming who owns the surface (whom to ask). Orientation, never authority — naming an owner routes nothing and grants nothing.",
+          },
           text: { type: "string" },
           modules: {
             type: "array",
@@ -1037,6 +1290,11 @@ export function createToolDefinitions(
             maxItems: 128,
             description:
               "Only for a file that does not exist YET. Coordinates listed here are recorded as planned instead of unresolved; anything not listed is checked against the repository's tracked files. Do not list a file that already exists — it resolves normally either way. Coordinates only, never prose.",
+          },
+          impactClaim: {
+            type: "object",
+            description:
+              "ADR-0063: a machine-readable blast-radius assertion memory_ground can re-run impact against — {v:1, target, module?, direction:'upstream', atCommit, summary:{directCallers, processes, risk}}. Record what code_impact actually reported, never an estimate; malformed is refused.",
           },
         },
         required: ["kind", "text"],
@@ -1062,6 +1320,24 @@ export function createToolDefinitions(
             `plannedCoordinates must contain at most 128 single-line coordinates of at most ${MAX_COORDINATE_LENGTH} characters`
           );
         }
+        // ADR-0063: validate HERE so a malformed claim fails with the schema's
+        // own message instead of an opaque route 400 — and only the parsed
+        // value ever travels (the route re-validates; two gates, one shape).
+        let impactClaim;
+        if (args.impactClaim !== undefined) {
+          const parsedClaim = memoryImpactClaimSchema.safeParse(
+            args.impactClaim
+          );
+          if (!parsedClaim.success) {
+            return fail(
+              `impactClaim is malformed: ${parsedClaim.error.issues
+                .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+                .join("; ")
+                .slice(0, 300)}`
+            );
+          }
+          impactClaim = parsedClaim.data;
+        }
         const result = await client.addMemoryNoteWithAction({
           kind: kind as MemoryKind,
           text,
@@ -1077,6 +1353,13 @@ export function createToolDefinitions(
           // resolved against the tracked-file set alone.
           ...(plannedResult.value
             ? { plannedCoordinates: plannedResult.value }
+            : {}),
+          ...(impactClaim ? { impactClaim } : {}),
+          // ADR-0091: pass-through coordinate; the route refuses it loudly on
+          // any kind but ownership.
+          ...(Array.isArray(args.owners) &&
+          args.owners.every((entry) => typeof entry === "string")
+            ? { owners: args.owners as string[] }
             : {}),
           createdBy: scope.laneKey ?? "agent",
         });
@@ -1534,13 +1817,23 @@ export function createToolDefinitions(
             evidence: handoffEvidence,
             coordination: {
               handoffCount: rows.length,
-              state: rows.length > 0 ? "handoff_available" : "clear",
+              // H2 — a degraded packet must never wear a clean packet's state:
+              // "handoff_available" read the same for a yellow packet as for a
+              // certified one, which is exactly the mistake-as-success the
+              // degrade contract exists to prevent.
+              state:
+                handoffEvidence.degradedPackets > 0
+                  ? "handoff_degraded"
+                  : rows.length > 0
+                    ? "handoff_available"
+                    : "clear",
             },
           }
         );
       },
     },
     ...gitNexusTools,
+    ...docsTools,
     {
       name: "capability_preflight",
       description:
@@ -1592,7 +1885,7 @@ export function createToolDefinitions(
     {
       name: "whoami",
       description:
-        "Who you are in this MUON session, in one answer: your governed identity, the scope your reads and writes are fenced to, and the tools MUON registered for you. Ask when you are unsure whether you may do something. Read the list as an UPPER BOUND: 'not listed' means you genuinely do not have it, but your vendor may additionally have removed one MUON cannot see from here, so a listed tool can still fail as unknown. Takes no arguments: every coordinate is derived from your session, and none can be asserted.",
+        "Who you are in this MUON session, in one answer: your governed identity, the SEAT you hold (attached coordinator with its lease, dispatched orchestrator, or no seat at all — plus the control verbs deliberately absent from it), the scope your reads and writes are fenced to, and the tools MUON registered for you. Ask when you are unsure whether you may do something, or whether you may say you are MUON's coordinator. Read the list as an UPPER BOUND: 'not listed' means you genuinely do not have it, but your vendor may additionally have removed one MUON cannot see from here, so a listed tool can still fail as unknown. Takes no arguments: every coordinate is derived from your session, and none can be asserted.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       bindSessionSurface: (bound) => {
         surface = bound;
@@ -1605,11 +1898,112 @@ export function createToolDefinitions(
         const toolNames = surface
           ? [...surface.toolNames].sort()
           : tools.map((tool) => tool.name).sort();
+        // H14 — WHICH SEAT THIS IS, and what this seat deliberately cannot do.
+        //
+        // Three answers that must never collapse into one. An ATTACHED
+        // coordinator holds a human-minted, expiring lease and a NAMED
+        // remainder. A DISPATCHED orchestrator holds the whole control tier
+        // under MUON's own dispatch lifecycle, so it has no lease to report and
+        // no remainder to name. Everything else is not a coordinator at all,
+        // and is told so in a sentence rather than left to infer it from an
+        // absence — "a human Claude session without attach is not described as
+        // a coordinator" is the acceptance criterion, and silence reads as yes.
+        const seat =
+          scope.seat === "attached-coordinator"
+            ? {
+                kind: "attached-coordinator" as const,
+                chatId: scope.chatId ?? null,
+                jobId: scope.jobId ?? null,
+                // Reported as UNKNOWN when the lease facts never reached this
+                // process. A seat that cannot see its own expiry must not
+                // answer with a reassuring timestamp it invented.
+                leaseExpiresAt: scope.attached?.expiresAt ?? null,
+                bootstrap: scope.attached?.bootstrap ?? null,
+                vendor: scope.attached?.vendor ?? null,
+                leaseNote:
+                  "This seat runs on a short renewable lease a human minted (ADR-0028). The terminal's heartbeat renews it; when the terminal stops, the lease lapses and MUON reaps the seat and its children on purpose. `bootstrap: true` means no heartbeat has landed yet, so the wider ADR-0049 start-up horizon applies until the first one does.",
+                remainder: [
+                  ...MUON_ATTACHED_COORDINATOR_CONTROL_REMAINDER,
+                ] as string[],
+                remainderNote:
+                  "These control verbs are deliberately ABSENT from this seat rather than withheld at call time, and they are answered on an operator surface — the Desktop approvals inbox, the TUI, or `muon` on the command line — where a human decides.",
+              }
+            : surface?.mode === "orchestrator"
+              ? {
+                  kind: "dispatched-orchestrator" as const,
+                  chatId: scope.chatId ?? null,
+                  jobId: scope.jobId ?? null,
+                  // No attach lease exists on this path, so there is nothing
+                  // honest to put here: this seat's lifetime is its dispatch.
+                  leaseExpiresAt: null,
+                  bootstrap: null,
+                  vendor: null,
+                  leaseNote:
+                    "MUON dispatched this coordinator, so its lifetime is its job's, not a renewable attach lease; there is no lease expiry to report.",
+                  remainder: [] as string[],
+                  remainderNote:
+                    "This seat holds the whole control tier; no control verb is named absent for it. Every human-gated verb still files a gate a human decides.",
+                }
+              : {
+                  kind: "not-a-coordinator" as const,
+                  chatId: scope.chatId ?? null,
+                  jobId: scope.jobId ?? null,
+                  leaseExpiresAt: null,
+                  bootstrap: null,
+                  vendor: null,
+                  leaseNote:
+                    "You hold NO coordinator seat: MUON minted none for this session, so there is no lease, no crew, and no fleet to speak for. Do not describe yourself as MUON's coordinator. A HUMAN mints an attached seat with `muon mcp attach <vendor>`; you cannot mint one for yourself.",
+                  remainder: [] as string[],
+                  remainderNote:
+                    "The control tier is absent from this session entirely, so there is no remainder to name — `set_fleet`, `raise_budget`, and `apply_workflow` are no more absent here than `dispatch` is.",
+                };
+        // ADR-0052 — IS MUON LOCKED ON THIS MACHINE, as a typed value.
+        //
+        // `whoami` is one of exactly two tools a gated server still answers,
+        // which makes it the only honest place to ask. The gate already
+        // announces itself in the `initialize` instructions, but instructions
+        // are prose a caller has to pattern-match; `muon mcp probe` needs a
+        // discriminator, and prose-matching a refusal is how a check starts
+        // lying the first time the copy is edited.
+        //
+        // Read from the surface the SERVER bound, so this reports the gate
+        // that is actually enforcing, and re-read per call so a `muon login`
+        // in another terminal shows up here without a restart. Unbound
+        // (a tool list nobody built a server around) reports `unarmed`.
+        const identityGate = surface?.identityGate?.() ?? "unarmed";
         return ok(
           {
+            identityGate,
+            identityGateNote:
+              identityGate === "locked"
+                ? `MUON is LOCKED on this machine: every tool except ${[
+                    ...MCP_IDENTITY_GATE_EXEMPT_TOOLS,
+                  ].join(
+                    " and "
+                  )} will refuse until a HUMAN runs \`muon login\`. Say so plainly and continue without MUON's tools; you cannot open this gate yourself.`
+                : // ADR-0052 F3 — the SAME refusal, a completely different
+                  // instruction. A human here has already signed in; the
+                  // install record has not landed yet. Composed by
+                  // `lockedUnregisteredNote` from the retry that actually
+                  // exists for THIS surface, rather than retyped here: this
+                  // branch used to tell every agent not to ask for `muon
+                  // login`, on a surface where nothing retries and that is the
+                  // only remedy.
+                  identityGate === "locked-unregistered"
+                  ? lockedUnregisteredNote({
+                      surface: WHOAMI_GATE_SURFACE,
+                      stillAvailable: [...MCP_IDENTITY_GATE_EXEMPT_TOOLS],
+                    })
+                  : identityGate === "open"
+                    ? "This build arms MUON's identity gate and a verified GitHub identity is persisted on this machine, so nothing here is gated on it."
+                    : "This build does not arm MUON's identity gate (a dev checkout, or a distributed build with no client id). It is NOT a statement that anyone signed in.",
+            seat,
             identity: {
               governed,
               jobId: scope.jobId ?? null,
+              // H10: the deterministic speakable name for this job — computed,
+              // never stored, identical on every surface. Null when ungoverned.
+              slug: scope.jobId ? sessionSlug(scope.jobId) : null,
               laneKey: scope.laneKey ?? null,
               // The role lives in the chat's crew plan, keyed by vendor lane —
               // this session is not told its own role at launch. Rather than
@@ -1628,6 +2022,12 @@ export function createToolDefinitions(
                 ? `chat:${scope.chatId}`
                 : "unpartitioned (no chat coordinate)",
             },
+            // ADR-0070: what this install SPEAKS on the exchange boundaries —
+            // the packet family (dispatch pack / wrap / continuation) and
+            // the at-rest memory pack. A consumer negotiates by reading
+            // this, not by trying; a version from the future is refused
+            // whole at the receiving route.
+            contracts: MUON_EXCHANGE_CONTRACTS,
             grant: {
               mode: surface?.mode ?? "base",
               toolCount: toolNames.length,
@@ -1640,6 +2040,25 @@ export function createToolDefinitions(
               // inventory. Claiming "the exact tools you hold" would make this
               // tool produce the confusion it was built to end.
               listIs: "upper-bound",
+              // The OTHER reason a listed tool will not work, and the one the
+              // caveat below cannot cover because it is MUON's own half:
+              // without a reachable `gitnexus` CLI (a release tarball that
+              // does not ship one, and no MUON_GITNEXUS_BIN) every code-graph
+              // tool is registered and every one refuses.
+              // Reported here rather than left to be discovered at call time,
+              // because `review_diff` is the ship preflight's named next
+              // action — an agent that finds out by calling it is already in
+              // the loop.
+              codeGraph: codeGraph.available ? "available" : "unavailable",
+              codeGraphNote: codeGraph.available
+                ? "A GitNexus CLI is reachable, so the code-graph tools can run. Whether this repo's graph is INDEXED and fresh is a separate question each tool answers for itself."
+                : // The tool names come from the BUILT list, never retyped, and
+                  // the claim is bounded to what was actually resolved. The
+                  // previous wording said "Memory, coordination and review-queue
+                  // tools are unaffected", which this process never measured —
+                  // and which `grant.note` two fields below directly contradicts
+                  // for an ungoverned session, where memory comes back 403.
+                  `NO GitNexus CLI is reachable from this install (${codeGraph.reason}), so these tools are listed and every one of them refuses: ${codeGraphToolNames.join(", ")}. preflight_edit composes code_impact, so it fails closed here too. That is the whole of what was measured — no other tool was probed, and this says NOTHING about whether memory or coordination will answer for you: that is decided by this session's own scope (read grant.note and identityGateNote in this same payload). Do not plan work that depends on the code graph; tell the human that installing GitNexus, or pointing MUON at one with MUON_GITNEXUS_BIN, restores it after a session restart.`,
               listCaveat:
                 "These are the tools MUON registered for this session. Your vendor may have removed some of them from your inventory; MUON cannot observe that from inside this process. If a tool listed here comes back as unknown, that is why — report it, do not retry silently.",
               note: governed
@@ -1672,6 +2091,186 @@ export function createToolDefinitions(
         );
       },
     },
+    {
+      // H5 — WHAT IS WAITING ON THE HUMAN, as coordinates.
+      //
+      // Base tier on purpose, and read-only by construction: an agent working
+      // beside a person needs to be able to say "two things are waiting on
+      // you", and until now it could only guess. The gates and the unconfirmed
+      // notes were both invisible from here — approvals because nothing
+      // surfaced them, memory because every recall path correctly hides an
+      // unvouched note behind the KG-6 gate.
+      //
+      // There is deliberately no confirm and no reject here, and adding one
+      // later would be adding a governance verb to the tier every worker
+      // holds. The whole point of this tool is to hand the human a coordinate
+      // and get out of the way.
+      name: "review_queue",
+      description:
+        "What is waiting on the HUMAN in this chat's partition, as coordinates: pending approval/gate ids and pending UNCONFIRMED memory note ids. Read-only and coordinate-only — no approval reason text, no note text, and there is no confirm or reject verb here or anywhere in your tier. Use it to tell the person beside you exactly what MUON is blocked on, then name `nextSurface`. Scoped to your own chat and workspace: work in another partition is not listed and is not named. PENDING-NOW, not since-you-looked: the bound review digest (what changed since the operator last looked, with its read cursor) is a Desktop/operator surface and has no MCP sibling — do not present this list as that digest. Takes no arguments.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      handler: async () => {
+        const chatId = scope.chatId?.trim();
+        if (!chatId) {
+          // NOT a partition refusal — there is no foreign id here to withhold.
+          // This session simply has no partition, so there is nothing it could
+          // lawfully list; saying so beats an empty list that reads as "clear".
+          return fail(
+            "review_queue needs a chat partition and this session has none, so an empty queue would be a claim rather than an answer. A human mints an attached seat with `muon mcp attach <vendor>`; until then read the queue on a MUON operator surface (Desktop approvals inbox, TUI, `muon approve list`, `muon memory review`)."
+          );
+        }
+        const nextSurface =
+          "These wait on a human decision, and no MCP tier can make it. Confirm or reject on a MUON operator surface: the Desktop approvals inbox, the TUI inbox, `muon approve resolve` for a gate, or `muon memory review` / `muon memory confirm --note-id <id>` for a note.";
+
+        // Two INDEPENDENT reads: one failing must not erase the other's
+        // answer, because "I could not see the gates" and "there are no gates"
+        // are opposite facts and this tool exists to keep them apart.
+        const degradations: string[] = [];
+        let pendingApprovals: {
+          id: string;
+          kind: string;
+          taskId: string;
+          gateTag?: string;
+          ageMs: number;
+        }[] = [];
+        let approvalsRead = false;
+        let approvalsTruncated = false;
+        let approvalsOmitted = 0;
+        try {
+          const [tasks, approvals] = await Promise.all([
+            client.listTasks(),
+            client.listApprovals(),
+          ]);
+          // The SAME chat fence the observer's `check_approval` applies. The
+          // backend already narrows both reads to the caller's capability, but
+          // a session holding only the shared agent bearer has no capability
+          // to narrow by — so the fence is restated HERE rather than assumed.
+          const chatTaskIds = new Set(
+            tasks.filter((task) => task.chatId === chatId).map((task) => task.id)
+          );
+          const now = Date.now();
+          const matching = approvals.filter(
+            (approval) =>
+              approval.status === "pending" && chatTaskIds.has(approval.taskId)
+          );
+          approvalsTruncated = matching.length > REVIEW_QUEUE_LIMIT;
+          approvalsOmitted = Math.max(0, matching.length - REVIEW_QUEUE_LIMIT);
+          pendingApprovals = matching
+            .slice(0, REVIEW_QUEUE_LIMIT)
+            .map((approval) => ({
+              id: approval.id,
+              // Coordinates only: `kind` and `gateTag` say WHICH action is
+              // gated. `reason` is agent-authored prose and stays out.
+              kind: approval.kind,
+              taskId: approval.taskId,
+              ...(approval.gateTag ? { gateTag: approval.gateTag } : {}),
+              ageMs: approval.createdAt
+                ? Math.max(0, now - Date.parse(approval.createdAt))
+                : 0,
+            }));
+          approvalsRead = true;
+        } catch (error) {
+          degradations.push(
+            `pending gates unavailable: ${
+              error instanceof Error ? error.message : String(error)
+            }`.slice(0, 300)
+          );
+        }
+
+        let pendingMemory: { noteId: string; kind: string; ageMs: number }[] = [];
+        let memoryRead = false;
+        let memoryTruncated = false;
+        try {
+          const pending = await client.listPendingMemory();
+          const now = Date.now();
+          pendingMemory = pending.notes
+            .slice(0, REVIEW_QUEUE_LIMIT)
+            .map((note) => ({
+              noteId: note.id,
+              kind: note.kind,
+              ageMs: Math.max(0, now - Date.parse(note.createdAt)),
+            }));
+          memoryTruncated =
+            pending.truncated || pending.notes.length > REVIEW_QUEUE_LIMIT;
+          memoryRead = true;
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          // Release-testing finding (v0.4.0): for a hand-attached BASE
+          // session this half ALWAYS lands here, because the pending-memory
+          // read is partition-fenced to an authenticated job capability and
+          // a claimed chat never opens a partition (ADR-0026). That is the
+          // fence working — but echoing a bare 403 told the human nothing.
+          // Name the actual gesture: an ATTACHED seat holds a job capability
+          // and gets this half; operator surfaces always have it.
+          degradations.push(
+            /job capability/i.test(message)
+              ? "pending memory is partition-fenced to an authenticated job capability, which this hand-attached session does not hold (by design, ADR-0026 — a claimed chat opens no partition). See it from an attached seat (`muon mcp attach <claude|codex>`) or on an operator surface (Desktop memory review, `muon memory library`)."
+              : `pending memory unavailable: ${message}`.slice(0, 300)
+          );
+        }
+
+        return ok(
+          {
+            chatId,
+            pendingApprovals,
+            pendingMemory,
+            nextSurface,
+            // Which half actually answered. Without this a degraded read is
+            // indistinguishable from an empty inbox, which is the exact
+            // confusion H2/H5 exist to end.
+            coverage: {
+              gates: approvalsRead ? "read" : "unavailable",
+              memory: memoryRead ? "read" : "unavailable",
+            },
+          },
+          {
+            evidence: {
+              bounded: true,
+              limit: REVIEW_QUEUE_LIMIT,
+              included: pendingApprovals.length + pendingMemory.length,
+              // The gates half now counts what the cap dropped; the memory
+              // half's own bound is server-side, so its omission count is
+              // unknown here and rides the degradation text instead. An
+              // `omitted: 0` beside a silently clipped list was the exact
+              // inbox-that-lies-by-omission this tool exists to end.
+              omitted: approvalsOmitted,
+              kind: "pending human decisions (coordinates only)",
+            },
+            degradation:
+              degradations.length > 0
+                ? {
+                    active: true,
+                    reason: degradations.join(" "),
+                    action:
+                      "Read the queue on a MUON operator surface instead; do not report an empty queue from this call.",
+                  }
+                : memoryTruncated || approvalsTruncated
+                  ? {
+                      active: true,
+                      reason: [
+                        ...(approvalsTruncated
+                          ? [
+                              `${approvalsOmitted} more pending gate(s) exist beyond this list's ${REVIEW_QUEUE_LIMIT}-row cap.`,
+                            ]
+                          : []),
+                        ...(memoryTruncated
+                          ? [
+                              `More than ${REVIEW_QUEUE_LIMIT} unconfirmed notes are pending; the memory list is the head of the queue, not all of it.`,
+                            ]
+                          : []),
+                      ].join(" "),
+                      action:
+                        "Report it as 'at least this many'; the full queue is on the operator surface.",
+                    }
+                  : { active: false },
+            humanDecisionRequired:
+              pendingApprovals.length + pendingMemory.length > 0,
+            nextActions: [nextSurface],
+          }
+        );
+      },
+    },
     // ── A2A coordination tier ────────────────────────────────────────────────
     // Horizontal, peer-to-peer, and deliberately powerless. None of these tools
     // takes a chat, mission, or job-of-self argument: the backend derives every
@@ -1691,7 +2290,7 @@ export function createToolDefinitions(
           },
           kind: {
             type: "string",
-            enum: ["decision", "constraint", "convention", "attempt", "question"],
+            enum: ["decision", "constraint", "convention", "attempt", "question", "ownership"],
             description:
               "What sort of thing this is. `attempt` records something you TRIED — pair it with `outcome`.",
           },
@@ -1727,6 +2326,11 @@ export function createToolDefinitions(
             description:
               "Who to tell. Defaults to the whole crew, which is usually right — you rarely know who will need this.",
           },
+          contradicts_note_id: {
+            type: "string",
+            description:
+              "ADR-0081 — this finding DISPUTES another note (typically a sibling's finding; the id from memory_recall or preedit). MUON fences the target under your own read reach, files a contradicts edge from your minted note, and both render together wherever contradictions surface. Never destructive: the disputed note stands until a human decides.",
+          },
         },
         required: ["text", "kind", "subject"],
         additionalProperties: false,
@@ -1750,6 +2354,11 @@ export function createToolDefinitions(
           ...(args.body === undefined ? {} : { body: args.body }),
           ...(args.outcome === undefined ? {} : { outcome: args.outcome }),
           ...(args.to === undefined ? {} : { to: args.to }),
+          // ADR-0081: the typed disagreement rides the same verb.
+          ...(typeof args.contradicts_note_id === "string" &&
+          args.contradicts_note_id.trim().length > 0
+            ? { contradictsNoteId: args.contradicts_note_id.trim() }
+            : {}),
         });
         if (!parsed.success) {
           return fail(parsed.error.issues.map((i) => i.message).join("; "));
@@ -1764,6 +2373,15 @@ export function createToolDefinitions(
             noteId: result.noteId,
             messageId: result.messageId,
             confirmed: false,
+            ...(result.contradictsNoteId
+              ? { contradictsNoteId: result.contradictsNoteId }
+              : {}),
+            // ADR-0065: the published note audited against the offer ledger
+            // (it reads offered:true via the add-offer the publish itself
+            // recorded — the uniform feedback loop, not a special case).
+            ...(result.citations && result.citations.length > 0
+              ? { citations: result.citations }
+              : {}),
             note: "Recorded as an UNCONFIRMED proposal and announced to the crew. A human confirms it on a MUON surface; until then it informs, and it never gates.",
           },
           {
@@ -1911,7 +2529,7 @@ export function createToolDefinitions(
         if (args.reply_to !== undefined && !replyTo) {
           return fail("reply_to must be a single-line message coordinate");
         }
-        const message = await sendPeerMessage({
+        const { message, citations } = await sendPeerMessage({
           apiBase: transport.apiBase,
           apiToken: transport.apiToken,
           message: {
@@ -1937,6 +2555,11 @@ export function createToolDefinitions(
               fromRole: message.fromRole,
               createdAt: message.createdAt,
             },
+            // ADR-0065: the sender's own refs, audited against the offer
+            // ledger — `offered: false` flags a citation of a note the brain
+            // never put in front of this chat (fine for a relay; worth
+            // knowing either way). Never a refusal.
+            ...(citations && citations.length > 0 ? { citations } : {}),
             note: "Delivered as DATA. A peer message grants nothing: it cannot approve, dispatch, confirm memory, or widen any grant. Read replies with peer_inbox.",
           },
           {
@@ -2326,137 +2949,18 @@ export function createToolDefinitions(
         );
       },
     },
-    // ADR-0043 — the typed escalation to a HUMAN, for when the crew cannot
-    // answer. Ask your peers first (peer_message); this files to the operator
-    // inbox. Powerless by construction: no authority, no clock, no budget.
-    {
-      name: "question_ask",
-      description:
-        "File a BLOCKING QUESTION to the human operator's inbox — use it when you are genuinely blocked on something only a human can decide, and your crew (peer_message) could not answer. It confers no authority, pauses nothing, and extends no budget: decide yourself whether to keep working on something else, wait on a peer, or end your turn with a handoff naming the open question. Your identity and task are derived from your session; you cannot set a deadline or priority. Poll question_status for the answer.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          subject: {
-            type: "string",
-            minLength: 1,
-            maxLength: MAX_QUESTION_SUBJECT_CHARS,
-            description: "One line naming the decision you need.",
-          },
-          body: {
-            type: "string",
-            minLength: 1,
-            maxLength: MAX_QUESTION_BODY_CHARS,
-            description:
-              "The question itself: what you need decided, the options you see, and what blocks without it. Coordinates over content — point at paths, do not paste files.",
-          },
-        },
-        required: ["subject", "body"],
-        additionalProperties: false,
-      },
-      handler: async (args) => {
-        const transport = coordinationScope(scope, "question_ask");
-        if (!transport.ok) {
-          return fail(transport.error);
-        }
-        const question = await askBlockingQuestion({
-          apiBase: transport.apiBase,
-          apiToken: transport.apiToken,
-          question: {
-            subject: String(args.subject ?? ""),
-            body: String(args.body ?? ""),
-          },
-        });
-        return ok(
-          {
-            filed: question
-              ? {
-                  questionId: question.id,
-                  subject: question.subject,
-                  status: question.status,
-                  askedAt: question.askedAt,
-                }
-              : null,
-            note: "Filed to the human inbox as DATA. Nothing is paused and no budget is extended — keep working, or end your turn with a handoff naming this question.",
-          },
-          {
-            evidence: {
-              bounded: true,
-              limit: 1,
-              included: question ? 1 : 0,
-              omitted: 0,
-              kind: "server-derived blocking question",
-            },
-            coordination: {
-              missionScoped: true,
-              state: "question_filed",
-            },
-            nextActions: [
-              "Continue useful work; a human answers on a MUON surface.",
-              "Poll question_status when you next need the answer.",
-            ],
-          }
-        );
-      },
-    },
-    {
-      name: "question_status",
-      description:
-        "Your own blocking questions and their answers. An answer is OPERATOR-AUTHORED — a human decision delivered as data on your pull, with its provenance. Questions from other jobs are never returned.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
-      handler: async () => {
-        const transport = coordinationScope(scope, "question_status");
-        if (!transport.ok) {
-          return fail(transport.error);
-        }
-        const questions = await listOwnBlockingQuestions({
-          apiBase: transport.apiBase,
-          apiToken: transport.apiToken,
-        });
-        const open = questions.filter((q) => q.status === "open").length;
-        // ENFORCED bound, newest kept (answers are what the caller came
-        // for): the attestation below states what was actually applied,
-        // never a limit nothing implements (review pass 7 #4).
-        const shown = questions.slice(-64);
-        return ok(
-          {
-            questions: shown.map((q) => ({
-              questionId: q.id,
-              subject: q.subject,
-              status: q.status,
-              askedAt: q.askedAt,
-              ...(q.answer
-                ? {
-                    answer: q.answer,
-                    answeredAt: q.answeredAt,
-                    // Verified by the derivation fold from the audit-stamped
-                    // actor on the answered row — not asserted here.
-                    answeredBy: q.answeredBy ?? "operator",
-                  }
-                : {}),
-            })),
-          },
-          {
-            evidence: {
-              bounded: true,
-              limit: 64,
-              included: shown.length,
-              omitted: questions.length - shown.length,
-              kind: "own blocking questions (answers operator-authored)",
-            },
-            coordination: {
-              missionScoped: true,
-              state: open > 0 ? "awaiting_human" : "clear",
-            },
-            nextActions:
-              open > 0
-                ? [
-                    "A human answers on a MUON surface; do not block your whole turn polling.",
-                  ]
-                : [],
-          }
-        );
-      },
-    },
+    // ADR-0090: the question family lives in its own dispatcher
+    // (question-tools.ts) — the fourth factory, extracted so the family's
+    // invariants are locally reviewable and 0082's growth lands in the
+    // extracted shape, not on this monolith. Behavior-frozen: names,
+    // schemas, tier placement, and refusal strings are the extraction's
+    // review bar.
+    ...createQuestionToolDefinitions({
+      scope,
+      coordinationScope,
+      coordinate,
+      coordinateArray,
+    }),
     {
       name: "crew_roles",
       description:
@@ -2536,6 +3040,225 @@ export function createToolDefinitions(
   if (!memoryPreedit || !codeImpact) {
     throw new Error("preflight_edit requires memory_preedit and code_impact");
   }
+
+  /** How many of a note's symbol anchors one grounding will resolve. Bounded
+   *  and DISCLOSED (ADR-0022): each resolution is a code-graph read. */
+  const GROUND_SYMBOL_CAP = 8;
+
+  // ADR-0058 — the grounding verb. A memory claim checked against the repo
+  // rather than believed. Three check kinds, a POSITIVE list (D2); the overall
+  // verdict is derived SERVER-side; a mismatch files an unconfirmed
+  // contradiction proposal through the same gate as every agent write (D3);
+  // and what could NOT be checked is said kind by kind, never a vacuous pass
+  // (D4). Grounding no hosted memory product can match: the ground truth for
+  // this note's dominant content is on the same disk as the brain.
+  const memoryGround: ToolDefinition = {
+    name: "memory_ground",
+    description:
+      "Check ONE memory note's claims against the repository: do its symbol anchors still resolve in the code graph, do its module anchors still exist on disk, and has its anchored code changed since it was written? Persists the verdict as a grounding stamp on the note; a mismatch files an UNCONFIRMED contradiction proposal for human review. Never promotes trust — a clean grounding is provenance, not confirmation.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        noteId: {
+          type: "string",
+          minLength: 1,
+          maxLength: 200,
+          description:
+            "Exact note id (from memory_search / memory_recall / memory_add). Exact — this verb writes evidence.",
+        },
+      },
+      required: ["noteId"],
+      additionalProperties: false,
+    },
+    handler: async (args) => {
+      const noteId = String(args.noteId ?? "").trim();
+      if (!noteId) return fail("noteId is required");
+      let facts: Awaited<ReturnType<typeof client.memoryGroundFacts>>;
+      try {
+        facts = await client.memoryGroundFacts(noteId, scope.chatId);
+      } catch (error) {
+        return fail(
+          `The note could not be read: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      const note = facts.note;
+
+      // ---- check 1: anchor existence -----------------------------------
+      const checks: Array<{
+        kind: "anchor-existence" | "staleness" | "impact-agreement";
+        verdict: "holds" | "mismatch" | "not-checkable";
+        detail: string;
+      }> = [];
+      const anchorFindings: string[] = [];
+      const anchorErrors: string[] = [];
+      let anchorMismatch = false;
+      let anchorChecked = 0;
+      // Module anchors: paths. Disk is the ground truth — the graph may lag,
+      // the filesystem cannot.
+      for (const module of note.modules) {
+        const absolute = path.resolve(workspacePath, module);
+        if (!absolute.startsWith(path.resolve(workspacePath))) {
+          anchorFindings.push(`module '${module}' escapes the workspace`);
+          anchorMismatch = true;
+          continue;
+        }
+        anchorChecked += 1;
+        if (!fs.existsSync(absolute)) {
+          anchorMismatch = true;
+          anchorFindings.push(`module '${module}' no longer exists on disk`);
+        }
+      }
+      // Symbol anchors: `<module>#<name>` — resolved against the code graph,
+      // capped and disclosed.
+      const symbolAnchors = note.symbols.slice(0, GROUND_SYMBOL_CAP);
+      for (const symbol of symbolAnchors) {
+        const hash = symbol.indexOf("#");
+        const name = hash >= 0 ? symbol.slice(hash + 1) : symbol;
+        const moduleHalf = hash >= 0 ? symbol.slice(0, hash) : undefined;
+        if (!name) continue;
+        anchorChecked += 1;
+        // The TYPED resolver, through the same escalating spawn path every
+        // code-graph tool uses — never a sibling tool's presentation layer
+        // (review finding: casting `code_context`'s structuredContent coupled
+        // grounding verdicts to MCP formatting). The module half rides along,
+        // so a same-named symbol in another file cannot validate the wrong
+        // anchor, and only the graph's own "found" reads as resolving:
+        // "not-found" AND "error" are both non-resolution, because a graph
+        // that could not be asked must never stamp `holds`.
+        const resolved = await gitNexusToolkit.resolveSymbol(
+          name,
+          moduleHalf
+        );
+        if (resolved.status === "not-found") {
+          anchorMismatch = true;
+          anchorFindings.push(
+            `symbol '${symbol}' no longer resolves in the code graph`
+          );
+        } else if (resolved.status === "error") {
+          // A graph that could not be ASKED is not evidence of anything:
+          // "error" must never become a mismatch (an unreachable graph filing
+          // contradiction proposals against healthy notes), and it must never
+          // read as holds either. It surfaces as not-checkable.
+          anchorErrors.push(
+            `symbol '${symbol}' could not be checked (${resolved.detail.slice(0, 120)})`
+          );
+        }
+      }
+      const symbolOverflow = note.symbols.length - symbolAnchors.length;
+      if (anchorChecked === 0) {
+        checks.push({
+          kind: "anchor-existence",
+          verdict: "not-checkable",
+          detail: "this note carries no module or symbol anchors",
+        });
+      } else if (anchorMismatch) {
+        // A REAL not-found outranks a concurrent error: the mismatch stands on
+        // the evidence that was gathered.
+        checks.push({
+          kind: "anchor-existence",
+          verdict: "mismatch",
+          detail: anchorFindings.slice(0, 4).join("; ").slice(0, 480),
+        });
+      } else if (anchorErrors.length > 0) {
+        checks.push({
+          kind: "anchor-existence",
+          verdict: "not-checkable",
+          detail: anchorErrors.slice(0, 2).join("; ").slice(0, 480),
+        });
+      } else {
+        checks.push({
+          kind: "anchor-existence",
+          verdict: "holds",
+          detail: `${anchorChecked} anchor(s) resolve${
+            symbolOverflow > 0
+              ? `; ${symbolOverflow} symbol anchor(s) beyond the ${GROUND_SYMBOL_CAP}-anchor cap were NOT checked`
+              : ""
+          }`,
+        });
+      }
+
+      // ---- check 2: staleness confrontation ----------------------------
+      if (anchorChecked === 0) {
+        checks.push({
+          kind: "staleness",
+          verdict: "not-checkable",
+          detail: "no anchors to confront against the change history",
+        });
+      } else if (note.stale) {
+        checks.push({
+          kind: "staleness",
+          verdict: "mismatch",
+          detail: `anchored code changed after this note was written (stale since ${note.staleSince ?? "unknown"}); the silent rank demotion is now a reviewable fact`,
+        });
+      } else {
+        checks.push({
+          kind: "staleness",
+          verdict: "holds",
+          detail: "no anchored module has changed since this note was written",
+        });
+      }
+
+      // ---- check 3: impact agreement (ADR-0063) ------------------------
+      // A note may carry a machine-readable blast-radius claim; when it
+      // does, re-run `impact` and diff like against like. All verdict
+      // logic lives in `impactAgreementCheck` (pure, branch-pinned by its
+      // own suite); this block owns only the plumbing: resolve the target
+      // through the SAME typed resolver the anchors use, and run
+      // `code_impact` only when it resolved.
+      const claim = facts.note.impactClaim;
+      if (!claim) {
+        checks.push({
+          kind: "impact-agreement",
+          verdict: "not-checkable",
+          detail:
+            "this note carries no machine-readable impact claim to re-run impact against",
+        });
+      } else {
+        const resolvedTarget = await gitNexusToolkit.resolveSymbol(
+          claim.target,
+          claim.module
+        );
+        const impact =
+          resolvedTarget.status === "found"
+            ? await codeImpact.handler({
+                target: claim.target,
+                ...(claim.module ? { filePath: claim.module } : {}),
+              })
+            : undefined;
+        checks.push(
+          impactAgreementCheck(claim, resolvedTarget, impact, gitCommitsMatch)
+        );
+      }
+
+      const stamped = await client.memoryGround(note.id, {
+        checks,
+        ...(scope.chatId ? { chatId: scope.chatId } : {}),
+      });
+      return ok(
+        {
+          noteId: note.id,
+          verdict: stamped.verdict,
+          groundingId: stamped.groundingId,
+          at: stamped.at,
+          checks,
+          proposalNoteId: stamped.proposalNoteId,
+          outcome: stamped.proposalNoteId
+            ? `mismatch — contradiction proposal ${stamped.proposalNoteId} filed, UNCONFIRMED; a human reviews it, and this note's own status is unchanged`
+            : `${stamped.verdict} — stamp persisted as provenance; no trust was promoted`,
+        },
+        {
+          evidence: {
+            bounded: true,
+            limit: 3,
+            included: checks.length,
+            omitted: 0,
+            kind: "grounding check verdicts",
+          },
+        }
+      );
+    },
+  };
+
   // ROADMAP M3: `memory_preedit`'s own description documents "fuse governed
   // memory over the code-graph blast radius" as the pattern an agent is meant
   // to plumb by hand (run code_impact, pass its modules/symbols back in). This
@@ -2591,33 +3314,25 @@ export function createToolDefinitions(
         filePath: args.filePath,
         ...(args.kind === undefined ? {} : { kind: args.kind }),
       });
-      if (impact.isError) {
-        return fail(
-          String(
-            impact.structuredContent?.error ??
-              "GitNexus impact evidence is unavailable"
-          )
-        );
+      // ADR-0089: THE producing seam — parsed once; the TYPED view gates
+      // and composes, while the RAW payload is what response embedding
+      // carries (review finding: the normalized view — uppercased risk,
+      // coerced counts — must not silently replace the verbatim evidence
+      // an agent reads back).
+      const evidence = codeImpactEvidenceFromTool(impact);
+      if (!evidence.ok) {
+        return fail(evidence.reason);
       }
-      const impactPayload = impact.structuredContent ?? {};
-      const rawResult = impactPayload.result;
-      const rawRepo = impactPayload.repo;
-      if (
-        !rawResult ||
-        typeof rawResult !== "object" ||
-        !rawRepo ||
-        typeof rawRepo !== "object"
-      ) {
-        return fail("GitNexus returned incomplete impact evidence");
-      }
-      const impactResult = rawResult as Record<string, unknown>;
-      const repo = rawRepo as Record<string, unknown>;
+      const impactResult = evidence.evidence.result;
+      const repo = evidence.evidence.repo;
+      const rawImpactResult = evidence.raw.result;
+      const rawRepo = evidence.raw.repo;
       const gate = gateImpactResult(impactResult, repo, gitCommitsMatch);
       if (!gate.ok) {
         return failWithImpactEvidence(
           gate.failure.reason,
-          impactResult,
-          repo,
+          rawImpactResult,
+          rawRepo,
           {
             humanDecisionRequired: gate.failure.humanDecisionRequired,
             degradation: gate.failure.degradation,
@@ -2687,8 +3402,10 @@ export function createToolDefinitions(
           : undefined;
       return ok(
         {
-          impact: impactResult,
-          repo,
+          // Verbatim evidence for the reader; the typed view stayed
+          // internal to the gate/compose above (ADR-0089 placement rule).
+          impact: rawImpactResult,
+          repo: rawRepo,
           memoryCoverage,
           preflight: memoryPayload.preflight,
           context: memoryPayload.context,
@@ -2786,33 +3503,25 @@ export function createToolDefinitions(
         filePath: args.filePath,
         ...(args.kind === undefined ? {} : { kind: args.kind }),
       });
-      if (impact.isError) {
-        return fail(
-          String(
-            impact.structuredContent?.error ??
-              "GitNexus impact evidence is unavailable"
-          )
-        );
+      // ADR-0089: THE producing seam — parsed once; the TYPED view gates
+      // and composes, while the RAW payload is what response embedding
+      // carries (review finding: the normalized view — uppercased risk,
+      // coerced counts — must not silently replace the verbatim evidence
+      // an agent reads back).
+      const evidence = codeImpactEvidenceFromTool(impact);
+      if (!evidence.ok) {
+        return fail(evidence.reason);
       }
-      const impactPayload = impact.structuredContent ?? {};
-      const rawResult = impactPayload.result;
-      const rawRepo = impactPayload.repo;
-      if (
-        !rawResult ||
-        typeof rawResult !== "object" ||
-        !rawRepo ||
-        typeof rawRepo !== "object"
-      ) {
-        return fail("GitNexus returned incomplete impact evidence");
-      }
-      const impactResult = rawResult as Record<string, unknown>;
-      const repo = rawRepo as Record<string, unknown>;
+      const impactResult = evidence.evidence.result;
+      const repo = evidence.evidence.repo;
+      const rawImpactResult = evidence.raw.result;
+      const rawRepo = evidence.raw.repo;
       const gate = gateImpactResult(impactResult, repo, gitCommitsMatch);
       if (!gate.ok) {
         return failWithImpactEvidence(
           gate.failure.reason,
-          impactResult,
-          repo,
+          rawImpactResult,
+          rawRepo,
           {
             humanDecisionRequired: gate.failure.humanDecisionRequired,
             degradation: gate.failure.degradation,
@@ -2927,8 +3636,10 @@ export function createToolDefinitions(
           : undefined;
       return ok(
         {
-          impact: impactResult,
-          repo,
+          // Verbatim evidence for the reader; the typed view stayed
+          // internal to the gate/compose above (ADR-0089 placement rule).
+          impact: rawImpactResult,
+          repo: rawRepo,
           coverage: unsignedEvidence,
           memoryCoverage,
           preflight: memoryPayload.preflight,
@@ -2956,6 +3667,10 @@ export function createToolDefinitions(
     (tool) => tool.name === "memory_preedit"
   );
   tools.splice(memoryPreeditIndex + 1, 0, impactMemory, preflightEdit);
+  // Canonical position (the inventory pin is exact order): memory_ground sits
+  // right after memory_add, the tool whose authority class it shares.
+  const memoryAddIndex = tools.findIndex((tool) => tool.name === "memory_add");
+  tools.splice(memoryAddIndex + 1, 0, memoryGround);
 
   return withAgentUi(tools, {
     principal: "agent",

@@ -76,6 +76,11 @@ function fakeVendorRunner() {
       );
       return { code: 0, stdout: "Added", stderr: "", spawnFailed: false };
     }
+    if (command === "cursor-agent") {
+      // MUON writes `~/.cursor/mcp.json` itself; this spawn is only the
+      // vendor's own `mcp enable` nicety.
+      return { code: 0, stdout: "enabled", stderr: "", spawnFailed: false };
+    }
     throw new Error(`unexpected spawn: ${command}`);
   };
 }
@@ -172,22 +177,26 @@ describe("attachMcpCoordinator — the main-process side of the Connections Atta
     expect(fs.readFileSync(capFile, "utf8")).toContain(TOKEN);
   });
 
-  it("refuses a non-coordinator vendor without calling the backend at all", async () => {
+  it("ADR-0057: cursor holds the seat now, so the bridge attaches it", async () => {
+    // This test used to assert the opposite. The refusal branch it covered is
+    // unchanged and still proven by "refuses an unknown vendor id" below, which
+    // uses an id that genuinely holds no seat; what changed is Cursor's answer.
     const vendorIo = io();
-    let attachCalled = false;
-    const client = fakeAttachClient({
-      attachCoordinator: async () => {
-        attachCalled = true;
-        throw new Error("should not be called");
-      },
-    });
+    const dataDir = tempDir("muon-desktop-attach-data-");
     const result = await attachMcpCoordinator(
       "cursor",
       { workspacePath: "/repo" },
-      { io: vendorIo, client, apiBase: "http://127.0.0.1:4317" }
+      {
+        io: vendorIo,
+        client: fakeAttachClient(),
+        apiBase: "http://127.0.0.1:4317",
+        dataDir,
+      }
     );
-    expect(result.kind).toBe("refused");
-    expect(attachCalled).toBe(false);
+    expect(result.kind).toBe("attached");
+    expect(JSON.stringify(result)).not.toContain(TOKEN);
+    const capFile = attachedCoordinatorCapabilityFilePath("cursor", dataDir);
+    expect(fs.statSync(capFile).mode & 0o777).toBe(0o600);
   });
 
   it("refuses an unknown vendor id", async () => {

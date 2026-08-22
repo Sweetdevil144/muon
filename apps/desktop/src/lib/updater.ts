@@ -1,8 +1,14 @@
 /**
  * Auto-update decision logic + a thin controller over electron-updater.
  *
- * INVARIANT: the update CHECK is an explicit outbound call to the GitHub
- * releases feed. It is opt-in (settings.autoUpdate) or user-initiated ("Check
+ * INVARIANT: the update CHECK is an explicit outbound call to the release feed
+ * configured in electron-builder.yml — `provider: generic` at
+ * https://download.getmuon.com, i.e. `latest-mac.yml` on the Railway download
+ * volume. (This said "the GitHub releases feed" for a long time and was simply
+ * wrong: the workflow publishes a GitHub Release as a durable record, but the
+ * app has never read it. Worth naming precisely, because it decides which
+ * artifact going missing breaks auto-update — deleting the volume's copies
+ * does, deleting a GitHub asset does not.) It is opt-in (settings.autoUpdate) or user-initiated ("Check
  * for updates"), NEVER silent: every state transition is surfaced to the UI via
  * onStatus, and nothing downloads or installs without an explicit user action
  * (autoDownload / autoInstallOnAppQuit are forced off). PR/check egress is a
@@ -11,6 +17,19 @@
  * lib/staged-swap.ts) — download and apply are each their own explicit user
  * action; the Squirrel path stays behind "signed-verified" for a future
  * signed build. See docs/install.md.
+ *
+ * ONE follow-on write rides on that explicit apply (founder requirement,
+ * 2026-08-19 — "update SHOULD auto-update all aspects"): on the first boot of
+ * the version the user chose to install, a PRESENT-and-older npm-global
+ * `muon-cli` is refreshed from the same download host (lib/cli-refresh.ts).
+ * It is scoped by the same consent chain — it only ever runs as the
+ * completion of an update the user explicitly applied, it never installs
+ * onto a machine that has no global CLI, and it is PINNED to the canonical
+ * download host (the same one this updater's own feed hardcodes; the
+ * `MUON_DOWNLOAD_HOST` override is deliberately NOT honored on this silent
+ * path — an env-settable host on an unprompted `npm install -g` would be an
+ * environment-variable-to-code-execution bridge). Documented in
+ * docs/install.md.
  *
  * This module is deliberately electron-FREE: the real `autoUpdater` from
  * electron-updater is injected by main.ts. That keeps the decision logic pure +

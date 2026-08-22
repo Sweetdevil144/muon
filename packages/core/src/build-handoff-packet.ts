@@ -71,7 +71,7 @@ export type BuildHandoffPacketInput = {
   unresolvedDecisions?: string[];
   recommendedNextAction?: string;
   memoryProposals?: {
-    kind?: "decision" | "constraint" | "convention" | "attempt" | "question";
+    kind?: "decision" | "constraint" | "convention" | "attempt" | "question" | "ownership";
     text: string;
   }[];
   /**
@@ -80,6 +80,8 @@ export type BuildHandoffPacketInput = {
    * the vendor actually said, independent of the live stream's bounds.
    */
   finalMessage?: string;
+  /** ADR-0062: the parsed BRAIN RECEIPT answer, when the worker gave one. */
+  brainReceipt?: "context_updated" | "no_update_required";
   /** Extra caller-supplied degradation reasons, merged with the auto ones. */
   degradedReasons?: string[];
 };
@@ -490,6 +492,11 @@ export function buildHandoffPacket(
           ),
         }
       : {}),
+    // ADR-0062: the worker's answer, carried verbatim when it parsed.
+    // ABSENCE is deliberate here — the server stamps `no_brain_receipt` at
+    // the terminal transition, version-independently, so an old runner's
+    // packet gets the same honest degradation as a silent worker's.
+    ...(input.brainReceipt ? { brainReceipt: input.brainReceipt } : {}),
     degraded: { flag: reasons.length > 0, reasons },
   };
 

@@ -39,5 +39,5 @@ orchestrates vendor CLIs, it does not re-host their loops.
 ## Optional
 
 - [Full inline overview](llms-full.txt): the expanded single-file version.
-- [Testing baseline](Testing.md): current test entry commands.
+- [Testing baseline](docs/testing-methodology.md): current test entry commands.
 - [Product language](WIKI.md): surface behavior and naming.

@@ -1,17 +1,6 @@
 import type { Metadata } from "next";
 import { Analytics } from "@vercel/analytics/next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
 
 const deploymentHost =
   process.env.VERCEL_PROJECT_PRODUCTION_URL ??
@@ -23,15 +12,15 @@ const deploymentProtocol = deploymentHost.startsWith("localhost")
 
 export const metadata: Metadata = {
   metadataBase: new URL(`${deploymentProtocol}://${deploymentHost}`),
-  title: "MUON LABS",
+  title: "MUON — run your AI coding agents as one crew",
   description:
-    "MUON turns the AI coding tools you already use into one crew, with shared context and human approval before anything ships.",
+    "MUON turns the AI coding tools you already use into one crew, with shared memory and human approval before anything ships.",
   openGraph: {
     type: "website",
-    siteName: "MUON LABS",
-    title: "Turn your coding agents into one engineering team.",
+    siteName: "MUON",
+    title: "Make your coding agents work as one.",
     description:
-      "Give MUON one mission. It plans the work, keeps the crew aligned, and brings you back when a real decision is needed.",
+      "Give MUON one mission. It plans the work, keeps the crew aligned through shared memory, and brings you back to approve what ships.",
     images: [
       {
         url: "/og-orchestration.png",
@@ -43,9 +32,9 @@ export const metadata: Metadata = {
   },
   twitter: {
     card: "summary_large_image",
-    title: "Turn your coding agents into one engineering team.",
+    title: "Make your coding agents work as one.",
     description:
-      "Give MUON one mission. It plans the work, keeps the crew aligned, and brings you back when a real decision is needed.",
+      "Give MUON one mission. It plans the work, keeps the crew aligned through shared memory, and brings you back to approve what ships.",
     images: ["/og-orchestration.png"],
   },
   icons: {
@@ -65,11 +54,30 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full scroll-smooth antialiased`}
-    >
-      <body className="min-h-full overflow-x-hidden bg-white text-zinc-900">
+    // `dark` is pinned rather than left to the OS: this is a terminal-native
+    // design with one intended appearance, and the trust palette (blue human,
+    // green crew, amber stale, red unconfirmed) is calibrated against the dark
+    // panel. Letting it render on white would change what the colours mean.
+    <html lang="en" className="dark h-full scroll-smooth antialiased">
+      <head>
+        {/*
+          Two families, loaded as links rather than @import so they are
+          discovered in the initial HTML instead of after the stylesheet parses.
+          globals.css names these families literally, so they are requested by
+          the same names it declares.
+        */}
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link
+          rel="preconnect"
+          href="https://fonts.gstatic.com"
+          crossOrigin="anonymous"
+        />
+        <link
+          rel="stylesheet"
+          href="https://fonts.googleapis.com/css2?family=Work+Sans:ital,wght@0,300..700;1,300..700&family=JetBrains+Mono:ital,wght@0,300..700;1,300..700&display=swap"
+        />
+      </head>
+      <body className="min-h-full overflow-x-hidden bg-background font-sans text-foreground">
         {children}
         <Analytics />
       </body>

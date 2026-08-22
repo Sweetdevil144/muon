@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { MuonApiClient, ApprovalRequest } from "@muon/client";
+import { REMEMBER_ACTION_TTL_MS } from "@muon/client";
 import { Desk } from "../src/shell/desk.js";
 import { emptyBrainSnapshot, type BrainSnapshot } from "../src/lib/brain-store.js";
 
@@ -91,6 +92,118 @@ function makeDesk(
   });
   return { desk, calls, changes, quitCount: () => quit };
 }
+
+describe("ADR-0085 — the desk leads with the digest", () => {
+  const digest = (over: Record<string, unknown> = {}) => ({
+    since: Date.parse("2026-08-22T06:00:00Z"),
+    lastSeenAt: Date.now(),
+    sections: {
+      gatesOpened: { count: 1, truncated: false, items: [{ id: "g1", taskId: "task-a", kind: "merge", createdAt: "2026-08-22T06:10:00Z" }] },
+      gatesDecided: { count: 0, truncated: false, items: [] },
+      packets: { count: 41, truncated: true, receiptsMinted: 1, items: [{ id: "p1", taskId: "task-a", classification: "typed_degraded", at: "2026-08-22T06:12:00Z" }] },
+      questions: { count: 0, truncated: false, items: [] },
+      forks: { count: 0, truncated: false, items: [] },
+      findings: { count: 0, truncated: false, items: [] },
+      contradictions: { count: 0, truncated: false, items: [] },
+    },
+    ...over,
+  });
+
+  it("showDigest reveals the frame on top; esc dismisses to the ordinary desk", () => {
+    const { desk } = makeDesk();
+    expect(desk.top()).toBeNull();
+    desk.showDigest(digest() as never);
+    expect(desk.top()).toBe("digest");
+    expect(desk.centreKind()).toBe("digest");
+    desk.handleKey(esc);
+    // Dismissed — the ordinary desk's own empty-state policy (the picker)
+    // takes over; the digest never re-opens itself.
+    expect(desk.top()).not.toBe("digest");
+    expect(desk.centreKind()).not.toBe("digest");
+  });
+
+  it("D3 in the rendering: a truncated section and a complete one are different sentences, and degradation reads loudly", async () => {
+    const { DigestPane } = await import("../src/shell/digest-pane.js");
+    const lines = new DigestPane(digest() as never)
+      .render(200)
+      .map((line) => line.replaceAll(/\u001b\[[0-9;]*m/g, ""));
+    const text = lines.join("\n");
+    expect(text).toContain("(1, complete)");
+    expect(text).toContain("(41 total, showing 1)");
+    expect(text).toContain("typed_degraded");
+    expect(text).toContain("carried a session receipt");
+  });
+
+  it("an empty digest never opens the frame (the boot guard), and a null-section digest says why", async () => {
+    const { digestHasContent, DigestPane } = await import(
+      "../src/shell/digest-pane.js"
+    );
+    const empty = digest({
+      sections: {
+        gatesOpened: { count: 0, truncated: false, items: [] },
+        gatesDecided: { count: 0, truncated: false, items: [] },
+        packets: { count: 0, truncated: false, receiptsMinted: 0, items: [] },
+        questions: { count: 0, truncated: false, items: [] },
+        forks: { count: 0, truncated: false, items: [] },
+        findings: { count: 0, truncated: false, items: [] },
+        contradictions: { count: 0, truncated: false, items: [] },
+      },
+    });
+    expect(digestHasContent(empty as never)).toBe(false);
+    expect(digestHasContent(digest() as never)).toBe(true);
+    const noBoundary = digest({ since: null, sections: null, note: "No previous session boundary is recorded yet." });
+    expect(digestHasContent(noBoundary as never)).toBe(false);
+    const rendered = new DigestPane(noBoundary as never)
+      .render(200)
+      .join("\n");
+    expect(rendered).toContain("No previous session");
+  });
+});
+
+describe("ADR-0087 M10/M11 — the tasks pane family", () => {
+  const PREFIX = String.fromCodePoint(2);
+  it("ctrl+b k lists the snapshot's tasks; ⏎ fetches the detail through the real route shape; esc closes", async () => {
+    const getTaskDetail = vi.fn(async () => ({
+      id: "t1",
+      title: "First",
+      description: "d",
+      status: "in_progress",
+      priority: "medium",
+      createdAt: "x",
+      updatedAt: "x",
+      assignments: [],
+      handoffs: [],
+      approvals: [],
+    }));
+    const { desk } = makeDesk(
+      { tasks: [{ id: "t1", title: "First", status: "backlog" }] as never },
+      { getTaskDetail }
+    );
+    desk.handleKey(PREFIX);
+    desk.handleKey("k");
+    expect(desk.centreKind()).toBe("tasks");
+    desk.handleKey("\r");
+    await vi.waitFor(() => expect(getTaskDetail).toHaveBeenCalledWith("t1"));
+    desk.handleKey(esc);
+    expect(desk.centreKind()).not.toBe("tasks");
+  });
+
+  it("a failed detail read keeps the LIST and says why — never a dead pane", async () => {
+    const getTaskDetail = vi.fn(async () => {
+      throw new Error("brain unreachable");
+    });
+    const { desk } = makeDesk(
+      { tasks: [{ id: "t1", title: "First", status: "backlog" }] as never },
+      { getTaskDetail }
+    );
+    desk.handleKey(PREFIX);
+    desk.handleKey("k");
+    desk.handleKey("\r");
+    await vi.waitFor(() => expect(getTaskDetail).toHaveBeenCalled());
+    // Back on the list, the surface still open.
+    expect(desk.centreKind()).toBe("tasks");
+  });
+});
 
 describe("the memory read — the CRITICAL that made the pane never work", () => {
   it("uses the LIBRARY route, not search (search 400s on an empty query)", async () => {
@@ -250,6 +363,84 @@ describe("the inbox and the two-press rule, through the executor", () => {
       status: "approved",
       decisionNotes: "decided from MUON TUI",
     });
+  });
+
+  // 0087 retirement-ledger row I2/I5 — remember and attest reach the shell
+  // desk through the SAME shared payload builder, with the classic desk's
+  // own guards (governed-op cross-surface parity).
+  it("A approves-and-remembers where a receipt can exist — the payload carries the shared TTL", async () => {
+    // A Bash action with a concrete command is receipt-eligible by the
+    // shared derivation (the fixture's bare label classifies to nothing).
+    const { desk, calls } = makeDesk({
+      approvals: [
+        approval({
+          evidence: {
+            action: "Bash",
+            scope: "the workspace",
+            impactIfApproved: "runs npm test",
+            details: { command: "npm test" },
+            payloadDigest: "sha256:a",
+          },
+        } as never),
+      ],
+    });
+    desk.handleKey(String.fromCodePoint(2)); desk.handleKey("i");
+    desk.handleKey("\r");
+    desk.handleKey("A");
+    await vi.waitFor(() => expect(calls.resolveApproval).toHaveBeenCalled());
+    const payload = calls.resolveApproval.mock.calls[0]![0] as Record<
+      string,
+      unknown
+    >;
+    expect(payload.receipt).toEqual({ ttlMs: REMEMBER_ACTION_TTL_MS });
+    expect(payload.status).toBe("approved");
+  });
+
+  it("a merge gate: plain approve refuses while evidence loads, refuses review-blind, and m attests with the digest + blind files", async () => {
+    const certification = {
+      status: "blocked" as const,
+      blockCode: "review-blind" as const,
+      reason: "2 changed files have no review coverage",
+      blindFiles: ["src/a.ts", "src/b.ts"],
+      changedFiles: ["src/a.ts", "src/b.ts"],
+      artifactDigest: "a".repeat(64),
+    };
+    let releaseCertification: (value: typeof certification) => void = () => {};
+    const gate = new Promise<typeof certification>((resolve) => {
+      releaseCertification = resolve;
+    });
+    const { desk, calls } = makeDesk(
+      { approvals: [approval({ id: "merge-1", kind: "merge" })] },
+      { getApprovalReviewCertification: vi.fn(() => gate) }
+    );
+    desk.handleKey(String.fromCodePoint(2)); desk.handleKey("i");
+    desk.handleKey("\r");
+    expect(desk.centreKind()).toBe("review");
+    // While the coverage evidence is in flight, approve is refused —
+    // deciding review-blind is the exact hole the certification closes.
+    desk.handleKey("a");
+    expect(calls.resolveApproval).not.toHaveBeenCalled();
+    releaseCertification(certification);
+    await vi.waitFor(() =>
+      expect(desk.reviewState()?.certification?.phase).toBe("loaded")
+    );
+    // Loaded and BLOCKED: plain approve still refuses; reject stays live.
+    desk.handleKey("a");
+    expect(calls.resolveApproval).not.toHaveBeenCalled();
+    // The explicit attest press approves WITH the attestation, bound to
+    // the artifact digest and the complete blind-file list.
+    desk.handleKey("m");
+    await vi.waitFor(() => expect(calls.resolveApproval).toHaveBeenCalled());
+    const payload = calls.resolveApproval.mock.calls[0]![0] as Record<
+      string,
+      unknown
+    >;
+    expect(payload.manualReview).toEqual({
+      acknowledged: true,
+      artifactDigest: "a".repeat(64),
+      blindFiles: ["src/a.ts", "src/b.ts"],
+    });
+    expect(payload.decisionNotes).toContain("manually reviewed");
   });
 
   it("the decision binds to the approval READ, even if the list moves under it", async () => {

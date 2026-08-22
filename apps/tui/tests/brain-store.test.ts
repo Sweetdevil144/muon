@@ -62,6 +62,8 @@ function healthyBody(url: string): unknown | null {
   }
   // P0.4: live receipts for the ReviewInbox annotation.
   if (url.includes("/api/receipts")) return { receipts: [] };
+  // ADR-0056: live durable grants for the sibling annotation.
+  if (url.includes("/api/grants")) return { grants: [] };
   return null;
 }
 
@@ -586,6 +588,81 @@ describe("brain-store", () => {
 
       const snap = store.getSnapshot();
       expect(snap.error).toBeNull();
+      expect(snap.activeReceipts).toEqual([]);
+    });
+
+    it("a brain with no /api/grants route stays SILENT (no banner for an old install)", async () => {
+      // The mirror of the questions-route split: a 404 here is "this brain
+      // predates the route", not "something is wrong". A read-only annotation
+      // must never put a permanent error banner on a working install.
+      const fetcher = vi.fn(async (url: string) => {
+        if (url.includes("/api/grants")) {
+          return mockResponse({}, 404);
+        }
+        const body = healthyBody(url);
+        return body ? mockResponse(body) : mockResponse({}, 404);
+      });
+      const client = new MuonApiClient("http://localhost:4000", fetcher);
+      const store = createBrainStore(client);
+      await store.refresh();
+
+      const snap = store.getSnapshot();
+      expect(snap.error).toBeNull();
+      expect(snap.activeGrants).toBeNull();
+    });
+
+    it("a LIVE grants failure stays visible and still clears the count", async () => {
+      const fetcher = vi.fn(async (url: string) => {
+        if (url.includes("/api/grants")) {
+          return mockResponse({}, 500);
+        }
+        const body = healthyBody(url);
+        return body ? mockResponse(body) : mockResponse({}, 404);
+      });
+      const client = new MuonApiClient("http://localhost:4000", fetcher);
+      const store = createBrainStore(client);
+      await store.refresh();
+
+      const snap = store.getSnapshot();
+      expect(snap.error).toContain("grants");
+      expect(snap.activeGrants).toBeNull();
+    });
+
+    it("present: a successful poll exposes the live durable grants", async () => {
+      const fetcher = vi.fn(async (url: string) => {
+        if (url.includes("/api/grants")) {
+          return mockResponse({
+            grants: [
+              {
+                id: "grant-1",
+                approvalId: "approval-1",
+                taskId: "task-1",
+                workspacePath: "/repo",
+                actionClass: "edit",
+                toolName: "Edit",
+                payloadDigest: "digest",
+                resolvedTarget: "src/a.ts",
+                policyFingerprint: "f".repeat(32),
+                originJobId: "job-1",
+                expiresAt: "2026-07-16T00:00:00.000Z",
+                useCount: 2,
+              },
+            ],
+          });
+        }
+        const body = healthyBody(url);
+        return body ? mockResponse(body) : mockResponse({}, 404);
+      });
+      const client = new MuonApiClient("http://localhost:4000", fetcher);
+      const store = createBrainStore(client);
+      await store.refresh();
+
+      const snap = store.getSnapshot();
+      expect(snap.error).toBeNull();
+      expect(snap.activeGrants).toHaveLength(1);
+      expect(snap.activeGrants?.[0]?.id).toBe("grant-1");
+      // Receipts and grants are counted separately — a durable grant must never
+      // be reported as a single-run receipt.
       expect(snap.activeReceipts).toEqual([]);
     });
 

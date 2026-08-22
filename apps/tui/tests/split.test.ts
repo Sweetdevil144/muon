@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { MuonApiClient } from "@muon/client";
 import { Desk } from "../src/shell/desk.js";
+import {
+  DESK_SIDEBAR_WIDTH,
+  DeskSidebar,
+} from "../src/shell/desk-sidebar.js";
 import { emptyBrainSnapshot, type BrainSnapshot } from "../src/lib/brain-store.js";
 
 /**
@@ -210,6 +214,47 @@ describe("the sidebar says what session you are in", () => {
     } finally {
       desk.dispose();
     }
+  });
+
+  // H8 (TUI half) — sessions must read as belonging to a SPACE, not as a
+  // second flat list next to one. The heading carries the grouping so no row
+  // has to spend columns repeating it.
+  it("groups SESSIONS under the space they are in, with a count", () => {
+    const desk = makeDesk();
+    try {
+      openShell(desk);
+      desk.handleKey(PREFIX);
+      desk.handleKey("s");
+      desk.render();
+      const frame = plain(desk.shell.render(140));
+      expect(frame).toContain("SESSIONS · muon-labs (1)");
+    } finally {
+      desk.dispose();
+    }
+  });
+
+  it("lets a long project name give way so the session count always survives", () => {
+    const sidebar = new DeskSidebar({
+      spaces: [
+        {
+          name: "a-very-long-monorepo-name-indeed",
+          branch: "main",
+          active: true,
+        },
+      ],
+      sessions: [
+        { id: "s1", label: "zsh", kind: "shell", active: true, paneCount: 1, ungoverned: true },
+        { id: "s2", label: "codex", kind: "vendor", active: false, paneCount: 1, ungoverned: false },
+      ],
+      chat: [],
+      info: [],
+    });
+    const heading = plain(sidebar.render(DESK_SIDEBAR_WIDTH))
+      .split("\n")
+      .find((line) => line.includes("SESSIONS"))!;
+    expect(heading.length).toBeLessThanOrEqual(DESK_SIDEBAR_WIDTH);
+    expect(heading).toContain("(2)");
+    expect(heading).toContain("…");
   });
 
   it("INFO reports the pane count and the governance mode", () => {

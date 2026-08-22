@@ -384,6 +384,134 @@ describe("memory pack export (P1.4 slice 1)", () => {
     expect(taskAnchored!.record.note.modules).toContain("src/parser.ts");
   });
 
+  it("ADR-0064 A1 residual: grounding stamp + offer lineage RIDE the record — latest-only, counts-only, hash-covered", async () => {
+    // Two grounding rows: the LATER one is the stamp that travels. Its
+    // check DETAIL carries a machine-local path that must stay home.
+    await prisma.memoryGrounding.create({
+      data: {
+        id: "ground-early",
+        noteId: "mem-task-ws",
+        verdict: "mismatch",
+        checks: JSON.stringify([
+          { kind: "anchor-exists", verdict: "mismatch", detail: "gone" },
+        ]),
+        groundedBy: "agent:job:job-g1",
+        at: T1,
+      },
+    });
+    await prisma.memoryGrounding.create({
+      data: {
+        id: "ground-late",
+        noteId: "mem-task-ws",
+        verdict: "holds",
+        checks: JSON.stringify([
+          {
+            kind: "anchor-exists",
+            verdict: "holds",
+            detail: "/Users/machine-local/secret-path/parser.ts",
+          },
+          { kind: "symbol-resolves", verdict: "holds", detail: "ok" },
+        ]),
+        groundedBy: "agent:job:job-g2",
+        at: T2,
+      },
+    });
+    // Offers across two chats and three jobs — COUNTS travel, ids do not.
+    // Rows carry the exporting workspace; the two below do NOT and must be
+    // fenced out of the summary (another workspace's row, and an unscoped
+    // historical NULL — both fail-closed exclusions, review finding).
+    await prisma.memoryOffer.createMany({
+      data: [
+        {
+          partition: "chat-pack-a",
+          jobId: "job-pack-1",
+          principal: "agent:job:job-pack-1",
+          noteId: "mem-task-ws",
+          surface: "recall",
+          firstAt: T0,
+          workspacePath: wsPath,
+        },
+        {
+          partition: "chat-pack-a",
+          jobId: "job-pack-2",
+          principal: "agent:job:job-pack-2",
+          noteId: "mem-task-ws",
+          surface: "recall",
+          firstAt: T1,
+          workspacePath: wsPath,
+        },
+        {
+          partition: "chat-pack-b",
+          jobId: "job-pack-3",
+          principal: "agent:job:job-pack-3",
+          noteId: "mem-task-ws",
+          surface: "standing-pack",
+          firstAt: T2,
+          workspacePath: wsPath,
+        },
+        {
+          partition: "chat-other-ws",
+          jobId: "job-other-ws",
+          principal: "agent:job:job-other-ws",
+          noteId: "mem-task-ws",
+          surface: "recall",
+          firstAt: new Date("2026-06-01T10:00:00.000Z"),
+          workspacePath: otherWsPath,
+        },
+        {
+          partition: "chat-unscoped",
+          jobId: "job-unscoped",
+          principal: "agent:job:job-unscoped",
+          noteId: "mem-task-ws",
+          surface: "recall",
+          firstAt: new Date("2026-06-02T10:00:00.000Z"),
+        },
+      ],
+    });
+
+    const pack = await packLib.collectMemoryPack(wsPath);
+    const stamped = pack.records.find(
+      (r) => r.record.origin.noteId === "mem-task-ws"
+    );
+    expect(stamped).toBeDefined();
+    expect(stamped!.record.provenance).toEqual({
+      grounding: {
+        verdict: "holds", // the LATEST stamp, not the early mismatch
+        at: T2.toISOString(),
+        checkKinds: ["anchor-exists", "symbol-resolves"],
+      },
+      offers: {
+        // The cross-workspace row and the unscoped NULL row are absent from
+        // every number below — including the time bounds, which their
+        // earlier June dates would otherwise have widened.
+        distinctChats: 2,
+        distinctJobs: 3,
+        firstOfferedAt: T0.toISOString(),
+        lastOfferedAt: T2.toISOString(),
+      },
+    });
+    // The content address COVERS the block (tampering breaks the hash) and
+    // the canonical bytes carry no ids and no machine-local check detail.
+    expect(packLib.recordHashOf(stamped!.record)).toBe(stamped!.hash);
+    const tampered = structuredClone(stamped!.record);
+    tampered.provenance!.grounding!.verdict = "mismatch";
+    expect(packLib.recordHashOf(tampered)).not.toBe(stamped!.hash);
+    const serialized = packLib.canonicalRecordJson(stamped!.record);
+    expect(serialized).not.toContain("chat-pack-a");
+    expect(serialized).not.toContain("job-pack-1");
+    expect(serialized).not.toContain("secret-path");
+    // A note with neither stamp still has NO provenance key at all — the
+    // pre-enrichment record hash is unchanged by this feature.
+    const bare = pack.records.find(
+      (r) => r.record.origin.noteId !== "mem-task-ws"
+    );
+    expect(bare).toBeDefined();
+    expect("provenance" in bare!.record).toBe(false);
+    expect(packLib.canonicalRecordJson(bare!.record)).not.toContain(
+      "provenance"
+    );
+  });
+
   it("mints a stable 0600 pack salt and a stable fingerprint across exports", async () => {
     const a = await packLib.collectMemoryPack(wsPath);
     const b = await packLib.collectMemoryPack(wsPath);

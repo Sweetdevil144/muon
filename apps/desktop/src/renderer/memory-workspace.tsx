@@ -5,10 +5,12 @@ import type {
   MemoryLibrarySnapshot,
 } from "@muon/client/memory-library";
 import type { MemoryExplainResult, MemoryNeighborsResult } from "@muon/client";
+import type { MemoryColdStartState } from "../shared/ipc.js";
 // Subpath, not the aggregate barrel: the renderer must not pull the Node
 // package barrel in at runtime (P11 architecture fitness).
 import { memoryNoteTier } from "@muon/client/memory-tier";
 import { MemoryGovernancePanel } from "./memory-governance.js";
+import { useDeskTokens } from "./desk-tokens.js";
 import forceAtlas2 from "graphology-layout-forceatlas2";
 // `sigma` touches WebGL/canvas at module-eval time, which crashes in the
 // jsdom test env — LAZY-imported inside the render effect below (mirrors
@@ -664,6 +666,10 @@ function MemoryGraph(props: {
   // truth either way, so this only ever downgrades the EXTRA interactive view.
   const [canvasError, setCanvasError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // See graph-view.tsx: a WebGL canvas is unreachable from the stylesheet.
+  const deskTokens = useDeskTokens(containerRef);
+  const deskTokensRef = useRef(deskTokens);
+  deskTokensRef.current = deskTokens;
   const sigmaRef = useRef<SigmaType<
     MemoryGraphNodeAttributes,
     MemoryGraphEdgeAttributes
@@ -717,7 +723,8 @@ function MemoryGraph(props: {
     const graph = buildMemoryGraph(
       props.snapshot,
       showUntrusted,
-      props.autoConfirmAgentMemory
+      props.autoConfirmAgentMemory,
+      deskTokensRef.current.bg
     );
 
     async function render() {
@@ -732,13 +739,13 @@ function MemoryGraph(props: {
           MemoryGraphEdgeAttributes
         >(graph, container, {
           renderLabels: true,
-          labelColor: { color: "#F3F4F6" },
+          labelColor: { color: deskTokensRef.current.textPrimary },
           labelFont: "JetBrains Mono, ui-monospace, monospace",
           labelSize: 10,
           labelWeight: "500",
           labelRenderedSizeThreshold: 7,
-          defaultNodeColor: "#9ca3af",
-          defaultEdgeColor: "#4a4a5a",
+          defaultNodeColor: deskTokensRef.current.textTertiary,
+          defaultEdgeColor: deskTokensRef.current.borderStrong,
           minCameraRatio: 0.05,
           maxCameraRatio: 20,
           hideEdgesOnMove: true,
@@ -831,6 +838,18 @@ function MemoryGraph(props: {
     props.autoConfirmAgentMemory,
     teardown,
   ]);
+
+  // A graph that is already open must repaint when the desk theme flips —
+  // sigma is constructed once, so the construction-time colours would otherwise
+  // persist until the tab is rebuilt (discarding the viewer's camera with it).
+  useEffect(() => {
+    const sigma = sigmaRef.current;
+    if (!sigma) return;
+    sigma.setSetting("labelColor", { color: deskTokens.textPrimary });
+    sigma.setSetting("defaultNodeColor", deskTokens.textTertiary);
+    sigma.setSetting("defaultEdgeColor", deskTokens.borderStrong);
+    sigma.refresh();
+  }, [deskTokens]);
 
   // Keep sigma's canvas in sync with the container (splitter drag, window
   // resize, sidebar collapse — none of those fire a graph rebuild).
@@ -1278,13 +1297,87 @@ function MemoryGraph(props: {
  * memory is gone. Each branch says which world it is in and, when there is
  * something to recover, offers the one action that recovers it.
  */
+/** ADR-0061 D3 — the cold-start card's rendering half: the three-class
+ *  vocabulary beneath whichever empty-state sentence applies. Policy
+ *  classes are THIS workspace's, with their reasons; the fence class is
+ *  partition totals ONLY — counts and paths, never content. Absent state
+ *  (bridge missing, read failed) renders nothing extra: the card never
+ *  invents machine-wide claims it could not read. */
+function ColdStartCard(props: { coldStart: MemoryColdStartState }) {
+  const { held, partitions, workspacePath } = props.coldStart;
+  const policyLines = [
+    ...(held.paused > 0
+      ? [
+          `${held.paused} paused — an operator suspended them; un-pause in the library to restore recall`,
+        ]
+      : []),
+    ...(held.stale > 0
+      ? [
+          `${held.stale} stale — the repo moved under them; grounding or confirming clears the demotion`,
+        ]
+      : []),
+  ];
+  const elsewhere = partitions.filter(
+    (partition) => partition.workspacePath !== (workspacePath ?? null)
+  );
+  const elsewhereTotal = elsewhere.reduce(
+    (sum, partition) => sum + partition.total,
+    0
+  );
+  if (policyLines.length === 0 && elsewhereTotal === 0) {
+    return null;
+  }
+  return (
+    <div className="memory-coldstart-card" role="status">
+      {policyLines.length > 0 ? (
+        <>
+          <strong>Held back by policy in this workspace</strong>
+          <ul>
+            {policyLines.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+      {elsewhereTotal > 0 ? (
+        <>
+          <strong>
+            This machine&apos;s brain holds {elsewhereTotal} note
+            {elsewhereTotal === 1 ? "" : "s"} in {elsewhere.length} other
+            workspace{elsewhere.length === 1 ? "" : "s"}
+          </strong>
+          <ul>
+            {elsewhere.slice(0, 5).map((partition) => (
+              <li key={partition.workspacePath ?? "unscoped"}>
+                {partition.workspacePath ?? "unscoped residue"} ·{" "}
+                {partition.total}
+              </li>
+            ))}
+            {elsewhere.length > 5 ? (
+              <li>… and {elsewhere.length - 5} more</li>
+            ) : null}
+          </ul>
+          <span>
+            Counts only — memory is workspace-fenced, and another
+            repository&apos;s notes never appear here.
+          </span>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 function LibraryEmptyState(props: {
   expiredProbing: boolean;
   hiddenExpired: number;
   onShowExpired: () => void;
   query: string;
   showExpired: boolean;
+  coldStart?: MemoryColdStartState | null;
 }) {
+  const card = props.coldStart ? (
+    <ColdStartCard coldStart={props.coldStart} />
+  ) : null;
   if (props.showExpired) {
     return (
       <div className="brain-empty memory-library-empty">
@@ -1296,6 +1389,7 @@ function LibraryEmptyState(props: {
         <span>
           Memory fills itself as the crew works; confirmed notes never expire.
         </span>
+        {card}
       </div>
     );
   }
@@ -1320,6 +1414,7 @@ function LibraryEmptyState(props: {
         <button className="ghost-btn" onClick={props.onShowExpired} type="button">
           Show expired
         </button>
+        {card}
       </div>
     );
   }
@@ -1332,12 +1427,52 @@ function LibraryEmptyState(props: {
         If something you expect is missing, turn on Show expired — a lapsed note
         is hidden, never deleted.
       </span>
+      {card}
     </div>
   );
 }
 
 export function MemoryWorkspace(props: Props) {
   const [tab, setTab] = useState<MemoryTab>("inbox");
+  // ADR-0061 D3 — the cold-start card's read: loaded only at the cold-start
+  // moment (an empty default library view), through the bound-workspace
+  // bridge read. A missing bridge or failed read renders NO card — the
+  // page never invents machine-wide claims it could not read.
+  const [coldStart, setColdStart] = useState<MemoryColdStartState | null>(
+    null
+  );
+  // The COLD-START moment only (review finding): the default view — no
+  // search, default posture — with zero notes. An empty SEARCH is a search
+  // answer, not a cold start, and must not summon machine-wide context.
+  // …and only while the LIBRARY tab is looking (round-5 finding: the read
+  // is operator-privileged and its result renders nowhere else).
+  const libraryEmpty =
+    tab === "library" &&
+    (props.snapshot?.notes.length ?? -1) === 0 &&
+    props.query === "" &&
+    !(props.showExpired ?? false);
+  useEffect(() => {
+    if (!libraryEmpty || typeof window.muon?.memoryColdStart !== "function") {
+      setColdStart(null);
+      return;
+    }
+    let stopped = false;
+    void window.muon
+      .memoryColdStart()
+      .then((state) => {
+        if (!stopped) setColdStart(state);
+      })
+      .catch(() => {
+        if (!stopped) setColdStart(null);
+      });
+    return () => {
+      stopped = true;
+    };
+    // Keyed on the SNAPSHOT identity too (review finding): a workspace
+    // switch delivers a new — possibly still-empty — snapshot, and the card
+    // must refetch against the newly bound workspace rather than label the
+    // previous one's totals as this one's.
+  }, [libraryEmpty, props.snapshot]);
   // Everything the crew has learned that is still live. P0-2: this is the LOG,
   // not the queue — with the orchestrator vouching, most of it is settled
   // knowledge the operator never has to touch.
@@ -1661,6 +1796,7 @@ export function MemoryWorkspace(props: Props) {
             ))}
             {props.snapshot.notes.length === 0 ? (
               <LibraryEmptyState
+                coldStart={coldStart}
                 expiredProbing={props.expiredProbing ?? false}
                 hiddenExpired={hiddenExpired}
                 onShowExpired={() => props.onShowExpiredChange?.(true)}

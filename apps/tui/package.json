@@ -13,12 +13,8 @@
     "start": "node dist/shell/index.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "dev:classic": "tsx src/index.tsx",
-    "start:classic": "node dist/index.js",
     "sim:desk": "node ./scripts/desk-layout-sim.mjs",
     "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",
-    "start:ink": "node dist/next/index.js",
-    "dev:ink": "tsx src/next/index.tsx",
     "keys": "npm run build && node dist/shell/keys-doctor-entry.js"
   },
   "dependencies": {
@@ -28,15 +24,11 @@
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
     "get-east-asian-width": "1.6.0",
-    "ink": "^7.1.0",
     "marked": "18.0.5",
-    "node-pty": "^1.1.0",
-    "react": "^19.2.7"
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
-    "@types/react": "^19.2.0",
-    "ink-testing-library": "^4.0.0",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"

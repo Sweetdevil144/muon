@@ -10,6 +10,26 @@ import {
 } from "@muon/client/mcp-vendor-config";
 import { attachedCoordinatorCapabilityFilePath } from "@muon/client/attached-coordinator-capability";
 import type { MuonApiClient } from "../src/lib/api-client.js";
+import { vendorHoldsCoordinatorSeat } from "@muon/client/mcp-vendor-config";
+
+/**
+ * The seat gate is fail-closed machinery, and since ADR-0057 EVERY installable
+ * vendor holds the seat — so there is no real id left that can drive the CLI
+ * down the refusal branch. Rather than delete the test (which would retire a
+ * guard that must still work the day a fifth vendor lands without a seat), the
+ * registry answer is mocked for that one case: the branch under test belongs to
+ * the CLI, and the registry's own values are fenced in the backend's
+ * vendor-position matrix. The test below it runs the SAME command against the
+ * real registry, so a gate that refused everything could not pass both.
+ */
+vi.mock("@muon/client/mcp-vendor-config", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@muon/client/mcp-vendor-config")>();
+  return {
+    ...actual,
+    vendorHoldsCoordinatorSeat: vi.fn(actual.vendorHoldsCoordinatorSeat),
+  };
+});
 
 /**
  * `muon mcp attach|detach` — ADR-0028 Tier C, CLI parity (Batch 3).
@@ -19,6 +39,12 @@ import type { MuonApiClient } from "../src/lib/api-client.js";
  * vendor runner throws on a spawn without that override.
  */
 
+const realVendorHoldsCoordinatorSeat = (
+  await vi.importActual<typeof import("@muon/client/mcp-vendor-config")>(
+    "@muon/client/mcp-vendor-config"
+  )
+).vendorHoldsCoordinatorSeat;
+
 const MCP_BIN = "/opt/muon/bin/muon-mcp";
 const TOKEN = "t".repeat(64);
 
@@ -27,6 +53,12 @@ afterEach(() => {
   tempRoots.forEach((dir) => fs.rmSync(dir, { recursive: true, force: true }));
   tempRoots.length = 0;
   vi.restoreAllMocks();
+  // `restoreAllMocks` clears the factory's `vi.fn(actual…)` implementation, so
+  // put the REAL registry answer back — otherwise every later test would run
+  // against a gate that silently answers `undefined`.
+  vi.mocked(vendorHoldsCoordinatorSeat).mockImplementation(
+    realVendorHoldsCoordinatorSeat
+  );
 });
 
 function tempHome(): string {
@@ -72,6 +104,12 @@ function fakeVendorRunner() {
         `${stripped}${stripped && !stripped.endsWith("\n") ? "\n" : ""}${header}\ncommand = ${JSON.stringify(args[args.length - 1])}\n${envLines.length > 0 ? `${envHeader}\n${envLines.join("\n")}\n` : ""}`
       );
       return ok("Added global MCP server 'muon'.");
+    }
+    if (command === "cursor-agent") {
+      // MUON writes `~/.cursor/mcp.json` itself; this spawn is only the
+      // vendor's own `mcp enable` nicety, so accepting it is faithful — the
+      // assertions below read the file MUON actually wrote.
+      return ok("enabled");
     }
     throw new Error(`unexpected spawn: ${command}`);
   };
@@ -214,6 +252,10 @@ describe("muon mcp attach", () => {
   });
 
   it("refuses a vendor with no coordinator seat and touches nothing", async () => {
+    // Drive the branch with a registry that says "no seat" for this vendor.
+    vi.mocked(vendorHoldsCoordinatorSeat).mockImplementation(
+      (id) => id !== "cursor"
+    );
     const h = harness();
     const err = vi.spyOn(process.stderr, "write").mockReturnValue(true);
     let attachCalled = false;
@@ -229,6 +271,35 @@ describe("muon mcp attach", () => {
     expect(attachCalled).toBe(false);
     expect(process.exitCode).toBe(1);
     process.exitCode = 0;
+  });
+
+  it("ADR-0057: cursor now HOLDS the seat and is admitted, not refused", async () => {
+    // The other half of the mocked test above: with the REAL registry, the same
+    // command that used to be refused attaches end to end. Without this, a gate
+    // that refused everything would still pass the mocked test.
+    const h = harness();
+    const out = vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    await withFakeEntrypoint(() =>
+      run(["mcp", "attach", "cursor"], h, fakeClient())
+    );
+
+    expect(vendorHoldsCoordinatorSeat("cursor")).toBe(true);
+    const text = out.mock.calls.map((call) => String(call[0])).join("");
+    expect(text).toContain("attached Cursor");
+    expect(text).not.toContain(TOKEN);
+
+    // The seat is only real if the registration and the capability landed.
+    const capFile = attachedCoordinatorCapabilityFilePath("cursor", h.dataDir);
+    expect(fs.statSync(capFile).mode & 0o777).toBe(0o600);
+    const config = JSON.parse(
+      fs.readFileSync(path.join(h.home, ".cursor", "mcp.json"), "utf8")
+    ) as { mcpServers: Record<string, { env?: Record<string, string> }> };
+    const entry = config.mcpServers.muon;
+    expect(entry?.env?.MUON_MCP_MODE).toBe("attached-coordinator");
+    expect(entry?.env?.MUON_ATTACHED_CAPABILITY_FILE).toBe(capFile);
+    expect(JSON.stringify(config)).not.toContain(TOKEN);
+    expect(process.exitCode ?? 0).toBe(0);
   });
 
   it("refuses an unknown vendor", async () => {

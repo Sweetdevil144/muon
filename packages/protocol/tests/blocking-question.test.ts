@@ -245,3 +245,162 @@ describe("pass-7 hardening", () => {
     }
   });
 });
+
+// ── ADR-0069 D2's override leg — the ONE legal second terminal ──────────────
+import {
+  QUESTION_PREANSWER_EVENT_KIND,
+  QUESTION_WITHDRAW_REASON_ANSWERED_FROM_MEMORY,
+} from "../src/blocking-question.js";
+
+describe("ADR-0069 D2 — a human override of a memory answer", () => {
+  const preanswer: QuestionSpineEvent = {
+    kind: QUESTION_PREANSWER_EVENT_KIND,
+    taskId: "task-1",
+    timestamp: "2026-08-07T10:00:30.000Z",
+    metadata: {
+      questionId: "q-ov",
+      notes: [
+        { noteId: "mem-a", kind: "constraint", excerpt: "Retry budget is 3." },
+      ],
+    },
+  };
+  const memoryClose: QuestionSpineEvent = {
+    kind: QUESTION_WITHDRAWN_EVENT_KIND,
+    taskId: "task-1",
+    timestamp: "2026-08-07T10:01:00.000Z",
+    metadata: {
+      questionId: "q-ov",
+      reason: QUESTION_WITHDRAW_REASON_ANSWERED_FROM_MEMORY,
+      citedNoteIds: ["mem-a"],
+    },
+  };
+  const humanAnswer: QuestionSpineEvent = {
+    kind: QUESTION_ANSWERED_EVENT_KIND,
+    taskId: "task-1",
+    timestamp: "2026-08-07T10:02:00.000Z",
+    metadata: { questionId: "q-ov", answer: "No — the budget changed to 5." },
+    principalKind: "human",
+  };
+
+  it("a human answer lands on an answered_from_memory close: answered + overrodeMemoryAnswer, citations preserved as provenance", () => {
+    const [q] = deriveBlockingQuestions([
+      opened("q-ov"),
+      preanswer,
+      memoryClose,
+      humanAnswer,
+    ]);
+    expect(q.status).toBe("answered");
+    expect(q.overrodeMemoryAnswer).toBe(true);
+    expect(q.answeredBy).toBe("operator");
+    expect(q.answer).toBe("No — the budget changed to 5.");
+    // The overridden memory answer stays derivable — it is the override's
+    // provenance, not discarded history.
+    expect(q.withdrawnReason).toBe(
+      QUESTION_WITHDRAW_REASON_ANSWERED_FROM_MEMORY
+    );
+    expect(q.withdrawnCitedNoteIds).toEqual(["mem-a"]);
+  });
+
+  it("a PLAIN withdrawal stays terminal — no override path exists for it", () => {
+    const [q] = deriveBlockingQuestions([
+      opened("q-ov"),
+      {
+        kind: QUESTION_WITHDRAWN_EVENT_KIND,
+        taskId: "task-1",
+        timestamp: "2026-08-07T10:01:00.000Z",
+        metadata: { questionId: "q-ov" },
+      },
+      humanAnswer,
+    ]);
+    expect(q.status).toBe("withdrawn");
+    expect(q.overrodeMemoryAnswer).toBeUndefined();
+  });
+
+  it("an override is itself terminal (no third transition), an ordinary answer never carries the flag, and a non-human override is ignored", () => {
+    const [answeredPlainly] = deriveBlockingQuestions([
+      opened("q-ov"),
+      humanAnswer,
+    ]);
+    expect(answeredPlainly.status).toBe("answered");
+    expect(answeredPlainly.overrodeMemoryAnswer).toBeUndefined();
+
+    const [overridden] = deriveBlockingQuestions([
+      opened("q-ov"),
+      preanswer,
+      memoryClose,
+      humanAnswer,
+      {
+        ...humanAnswer,
+        timestamp: "2026-08-07T10:03:00.000Z",
+        metadata: { questionId: "q-ov", answer: "A third opinion." },
+      },
+    ]);
+    expect(overridden.answer).toBe("No — the budget changed to 5.");
+
+    const [notHuman] = deriveBlockingQuestions([
+      opened("q-ov"),
+      preanswer,
+      memoryClose,
+      { ...humanAnswer, principalKind: "agent" },
+    ]);
+    expect(notHuman.status).toBe("withdrawn");
+  });
+});
+
+// ── ADR-0082: the crew-context block on the fold ────────────────────────────
+import { QUESTION_CREW_CONTEXT_EVENT_KIND } from "../src/blocking-question.js";
+
+describe("ADR-0082 — crew context beside the ask", () => {
+  const crewEvent: QuestionSpineEvent = {
+    kind: QUESTION_CREW_CONTEXT_EVENT_KIND,
+    taskId: "task-1",
+    timestamp: "2026-08-07T10:00:20.000Z",
+    metadata: {
+      questionId: "q-crew",
+      items: [
+        {
+          kind: "note",
+          id: "mem-crew-1",
+          standing: "unconfirmed decision by agent:job:job-2",
+          excerpt: "Maybe five attempts.",
+        },
+      ],
+    },
+  };
+
+  it("attaches labeled context to the question; first disclosure wins; malformed derives nothing", () => {
+    const [q] = deriveBlockingQuestions([opened("q-crew"), crewEvent]);
+    expect(q.crewContext).toBeDefined();
+    expect(q.crewContext!.items[0]).toMatchObject({
+      kind: "note",
+      id: "mem-crew-1",
+    });
+
+    const [first] = deriveBlockingQuestions([
+      opened("q-crew"),
+      crewEvent,
+      {
+        ...crewEvent,
+        timestamp: "2026-08-07T10:00:30.000Z",
+        metadata: {
+          questionId: "q-crew",
+          items: [
+            {
+              kind: "packet",
+              id: "handoff-9",
+              standing: "packet from codex",
+              excerpt: "later",
+            },
+          ],
+        },
+      },
+    ]);
+    expect(first.crewContext!.items[0]!.id).toBe("mem-crew-1");
+
+    const [none] = deriveBlockingQuestions([
+      opened("q-crew"),
+      { ...crewEvent, metadata: { questionId: "q-crew", items: [] } },
+    ]);
+    expect(none.crewContext).toBeUndefined();
+  });
+});

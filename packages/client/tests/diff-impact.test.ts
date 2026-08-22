@@ -141,3 +141,61 @@ describe("diffImpactQueries", () => {
     expect(q.steps).toContain("r.step AS step");
   });
 });
+
+// A graph nobody could read is not a graph that checked out. Before this, the
+// shared type required a boolean, so every producer had to spell "unmeasurable"
+// as `false` — and `false` is what the verdict reads as "verified current".
+describe("index freshness that could not be measured", () => {
+  it("is review-blind, not flows-resolved, when stale is null", () => {
+    const impact = buildDiffImpact(
+      base({ indexFreshness: { graphCommit: "abc", stale: null } })
+    );
+    expect(impact.verdict).toBe("review-blind");
+    expect(impact.totals.blindFiles).toBe(0);
+  });
+
+  it("is review-blind when stale is simply absent", () => {
+    expect(buildDiffImpact(base({ indexFreshness: {} })).verdict).toBe(
+      "review-blind"
+    );
+  });
+
+  it("names WHICH half was unreadable, and never quotes the STALE sentence", () => {
+    const graphMissing = buildDiffImpact(
+      base({ indexFreshness: { headCommit: "def", stale: null } })
+    );
+    expect(graphMissing.notes.join(" ")).toContain(
+      "the graph's indexed commit could not be read"
+    );
+    expect(graphMissing.notes.join(" ")).not.toContain("Index is STALE");
+
+    expect(
+      buildDiffImpact(base({ indexFreshness: {} })).notes.join(" ")
+    ).toContain("neither the graph's indexed commit");
+
+    expect(
+      buildDiffImpact(
+        base({ indexFreshness: { graphCommit: "abc", stale: null } })
+      ).notes.join(" ")
+    ).toContain("the diff's commit could not be read");
+  });
+
+  it("points at the ADR-0054 remedy rather than at a second concurrent index", () => {
+    const notes = buildDiffImpact(base({ indexFreshness: {} })).notes.join(" ");
+    expect(notes).toContain("muon graph reindex");
+    expect(notes).toContain("rather than starting a second one");
+  });
+
+  it("still earns flows-resolved on a reading that IS provably current", () => {
+    expect(buildDiffImpact(base()).verdict).toBe("flows-resolved");
+  });
+
+  // An empty diff has nothing to be blind about, and `ship` refuses no-op
+  // anyway — that arm must not be dragged into review-blind by an unknown.
+  it("leaves an empty diff as no-op", () => {
+    const impact = buildDiffImpact(
+      base({ changedFiles: [], indexFreshness: { stale: null } })
+    );
+    expect(impact.verdict).toBe("no-op");
+  });
+});

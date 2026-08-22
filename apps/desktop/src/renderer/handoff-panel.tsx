@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { describeHandoffContract } from "@muon/client/handoff-view";
+import {
+  describeHandoffContract,
+  describeHandoffDegradation,
+  handoffContractIsDegraded,
+} from "@muon/client/handoff-view";
 import type { TaskHandoffPage, TaskHandoffView } from "../shared/ipc.js";
 
 /**
@@ -94,6 +98,16 @@ export function HandoffPanel(props: {
 
   if (!props.taskId || !supported) return null;
 
+  // H2 — DEGRADED IS COUNTED SEPARATELY, ON THE CLOSED DISCLOSURE.
+  //
+  // The summary used to read "Session handoff 3", which is the number of rows
+  // and says nothing about whether any of them can be trusted. A human who
+  // never opens the panel then learns nothing, and the one packet that
+  // declares its own missing evidence is invisible behind a neutral count.
+  const degradedCount = (rows ?? []).filter((row) =>
+    handoffContractIsDegraded(row.contract)
+  ).length;
+
   return (
     <details
       className="dock-collapsible handoff-panel"
@@ -103,7 +117,12 @@ export function HandoffPanel(props: {
       <summary>
         Session handoff
         {rows && rows.length > 0 ? (
-          <span className="handoff-count">{rows.length}</span>
+          <span
+            className={`handoff-count${degradedCount > 0 ? " degraded" : ""}`}
+          >
+            {rows.length} handoff{rows.length === 1 ? "" : "s"}
+            {degradedCount > 0 ? ` · ${degradedCount} degraded` : ""}
+          </span>
         ) : null}
       </summary>
       {loading && rows === null ? (
@@ -117,15 +136,56 @@ export function HandoffPanel(props: {
         </div>
       ) : (
         <div className="handoff-list">
-          {rows.map((row) => (
-            <div className="handoff-card" key={row.id}>
-              <div className={`handoff-contract ${row.contract}`}>
+          {rows.map((row) => {
+            // H2 — a degraded packet is ranked WITH the failures, not beside
+            // the successes. One decision per row, made once and applied to
+            // the card frame, the contract line and the missing-evidence line,
+            // so no part of the card can quietly disagree with another.
+            const degraded = handoffContractIsDegraded(row.contract);
+            const degradation = describeHandoffDegradation(row);
+            return (
+            <div
+              className={`handoff-card${degraded ? " degraded" : ""}`}
+              key={row.id}
+            >
+              <div
+                className={`handoff-contract ${row.contract}${
+                  degraded ? " degraded" : ""
+                }`}
+              >
+                {degraded ? (
+                  // Decorative: the sentence beside it already carries the
+                  // meaning, so a screen reader is not made to say "warning
+                  // sign" before every degraded contract line.
+                  <span className="handoff-warn" aria-hidden="true">
+                    ⚠
+                  </span>
+                ) : null}
                 {describeHandoffContract(row.contract)}
               </div>
               <div className="handoff-title">{row.packetTitle}</div>
               <div className="handoff-lanes">
                 {row.fromLane ?? "—"} → {row.toLane ?? "—"} · {row.status}
               </div>
+              {/* ALWAYS VISIBLE, and always present for a degraded contract —
+                  never folded into a disclosure and never omitted because the
+                  agent flagged itself without saying why. This is the sentence
+                  the ship gate refuses on, so it has to be readable from the
+                  same screen as the refusal. */}
+              {degradation ? (
+                <div className="handoff-degraded" role="alert">
+                  {degradation}
+                </div>
+              ) : row.degradedReasons.length > 0 ? (
+                // `{flag:false, reasons:[…]}` is representable (the schema does
+                // not couple them), so a packet can list caveats while denying
+                // it is degraded. Those reasons must not vanish — but they also
+                // must not borrow the alarm above, because MUON's own
+                // classification, not the packet's prose, sets the rank.
+                <div className="handoff-omitted">
+                  Packet notes: {row.degradedReasons.join(", ")}
+                </div>
+              ) : null}
               {row.checks.length > 0 ? (
                 <div className="handoff-checks">
                   {row.checks.map((check) => (
@@ -138,11 +198,6 @@ export function HandoffPanel(props: {
                   ))}
                 </div>
               ) : null}
-              {row.degradedReasons.length > 0 ? (
-                <div className="handoff-degraded">
-                  Degraded: {row.degradedReasons.join(", ")}
-                </div>
-              ) : null}
               {row.changedFiles.length > 0 ? (
                 <div className="handoff-files">
                   {row.changedFiles.join(", ")}
@@ -153,9 +208,10 @@ export function HandoffPanel(props: {
               ) : null}
               <div className="handoff-body">{row.packetBody}</div>
             </div>
-          ))}
+            );
+          })}
           {omitted > 0 ? (
-            <div className="handoff-degraded">
+            <div className="handoff-omitted">
               +{omitted} older handoff{omitted === 1 ? "" : "s"} not shown —
               `muon handoff` lists them all.
             </div>

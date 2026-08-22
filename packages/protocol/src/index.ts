@@ -7,6 +7,7 @@ export * from "./attached-coordinator.js";
 export * from "./brain-port.js";
 export * from "./agent-role.js";
 export * from "./approval.js";
+export * from "./approval-grant.js";
 // THE brief-heading contract. Lives here, not in @muon/orchestrator, because
 // @muon/mcp cannot depend on the orchestrator and therefore restated the list in
 // prose — see brief-contract.ts's header for the five drifts that caused.
@@ -23,6 +24,7 @@ export * from "./delegation.js";
 export * from "./detection-manifest.js";
 export * from "./dispatch-lifecycle.js";
 export * from "./events.js";
+export * from "./exchange-contracts.js";
 export * from "./gate.js";
 export * from "./handoff.js";
 export * from "./harness.js";
@@ -32,14 +34,17 @@ export * from "./mcp-tool-inventory.js";
 export * from "./memory-filter.js";
 export * from "./memory-access.js";
 export * from "./memory-directory.js";
+export * from "./memory-impact-claim.js";
 export * from "./memory-ingest-policy.js";
 export * from "./memory-lifecycle-policy.js";
+export * from "./memory-offers.js";
 export * from "./note-derivation.js";
 export * from "./peer-wait.js";
 export * from "./policy-profile.js";
 export * from "./preedit-coverage.js";
 export * from "./preflight-edit.js";
 export * from "./refusal.js";
+export * from "./session-slug.js";
 export * from "./tool-capability.js";
 export * from "./unattended-horizon.js";
 export * from "./vendor.js";

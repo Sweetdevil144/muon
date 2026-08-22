@@ -55,3 +55,22 @@ describe("listVendorModels", () => {
     }
   });
 });
+
+describe("catalogue parsing survives a colouring CLI", () => {
+  it("cursor rows wrapped in SGR sequences still parse (2026.08.11 regression)", async () => {
+    // The real defect: `cursor-agent 2026.08.11` colours `models` output even
+    // when piped, so " - " never matched and the live catalogue silently fell
+    // back. Pinned here without the live CLI.
+    const coloured = [
+      "\u001b[2mAvailable models\u001b[22m",
+      "",
+      "\u001b[36mauto\u001b[39m \u001b[2m- Auto\u001b[22m\u001b[2m (default)\u001b[22m",
+      "\u001b[36mgpt-5.3-codex\u001b[39m \u001b[2m- Codex 5.3\u001b[22m",
+    ].join("\n");
+    const { parseCursorModelsForTest } = await import("../src/lib/vendor-models.js");
+    const models = parseCursorModelsForTest(coloured);
+    expect(models.some((m) => m.id === "auto")).toBe(true);
+    expect(models.some((m) => m.id === "gpt-5.3-codex")).toBe(true);
+  });
+});
+

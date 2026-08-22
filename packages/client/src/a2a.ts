@@ -3,6 +3,8 @@ import {
   claimCoordinateSchema,
   A2A_PROTOCOL_VERSION,
   buildRefusal,
+  citationAuditEntrySchema,
+  type CitationAuditEntry,
   claimIntentSchema,
   publishFindingSchema,
   publishFindingResultSchema,
@@ -11,6 +13,8 @@ import {
   claimResultSchema,
   coordinationSnapshotSchema,
   detectA2AVersionSkew,
+  messageCitationAuditsSchema,
+  type MessageCitationAudits,
   peerInboxSchema,
   peerMessageSchema,
   peerMessageSendSchema,
@@ -155,17 +159,24 @@ async function refusalReason(response: Response): Promise<string | undefined> {
  */
 export async function sendPeerMessage(
   input: A2aRequest & { message: PeerMessageSend }
-): Promise<PeerMessage> {
+): Promise<{
+  message: PeerMessage;
+  /** ADR-0065: the sender's refs, audited against the offer ledger.
+   *  Absent on pre-0065 servers or when the ledger was unreadable. */
+  citations?: CitationAuditEntry[];
+}> {
   // Validate locally first so an over-long or malformed envelope fails here
   // instead of burning a round-trip; the route re-validates regardless.
   const body = peerMessageSendSchema.parse(input.message);
-  const result = await a2aJson(
+  return a2aJson(
     input,
     "/api/a2a/messages",
-    z.object({ message: peerMessageSchema }),
+    z.object({
+      message: peerMessageSchema,
+      citations: z.array(citationAuditEntrySchema).optional(),
+    }),
     body
   );
-  return result.message;
 }
 
 /**
@@ -303,21 +314,34 @@ const messagesLimitSchema = z
   .min(1)
   .max(MAX_PEER_MESSAGES_PER_JOB);
 
-/** One chat's (optionally one mission's) peer traffic, newest first. */
+/**
+ * One chat's (optionally one mission's) peer traffic, newest first — with
+ * the SAME per-message citation audits the agent inbox carries (ADR-0086
+ * D2): a sibling field, absent on older servers and when the ledger was
+ * unreadable, keyed by message id and testifying about the CITER. The
+ * envelope shape changed from a bare array so the operator surfaces (desk
+ * crew detail, `muon crew coord`) can render provenance without a second
+ * read.
+ */
 export async function listPeerMessages(
   input: A2aRequest & { chatId: string; missionId?: string; limit?: number }
-): Promise<PeerMessage[]> {
+): Promise<{
+  messages: PeerMessage[];
+  citationAudits?: MessageCitationAudits;
+}> {
   const params = new URLSearchParams({ chatId: input.chatId });
   if (input.missionId) params.set("missionId", input.missionId);
   if (input.limit !== undefined) {
     params.set("limit", String(messagesLimitSchema.parse(input.limit)));
   }
-  const result = await a2aJson(
+  return a2aJson(
     input,
     `/api/a2a/messages?${params.toString()}`,
-    z.object({ messages: z.array(peerMessageSchema) })
+    z.object({
+      messages: z.array(peerMessageSchema),
+      citationAudits: messageCitationAuditsSchema.optional(),
+    })
   );
-  return result.messages;
 }
 
 /**
@@ -364,6 +388,15 @@ export type UntrustedPeerMessageView = {
   body: string;
   files: string[];
   symbols: string[];
+  /** ADR-0065: the message's cited note ids — addressable COORDINATES
+   *  (recall them under your own authority; a citation resolves nothing on
+   *  trust), each labelled with its offer-ledger verdict when the server
+   *  derived one. `offered: false` means the brain never put that note in
+   *  front of the citing chat — fine for a relay, worth knowing either way. */
+  cited_note_ids?: string[];
+  citations?: CitationAuditEntry[];
+  /** The ONE finding this message announces, when it announces one. */
+  memory_note_id?: string;
   reply_to?: string;
   created_at: string;
 };
@@ -377,23 +410,39 @@ export type UntrustedInboxView = {
 
 /** Wrap an inbox so untrusted peer prose is unmistakably labelled as data. */
 export function untrustedInboxView(inbox: PeerInbox): UntrustedInboxView {
+  const auditsById = new Map(
+    (inbox.citationAudits ?? []).map((entry) => [
+      entry.messageId,
+      entry.citations,
+    ])
+  );
   return {
     notice: UNTRUSTED_PEER_NOTICE,
     unread: inbox.unread,
     truncated: inbox.truncated,
-    untrusted_peer_messages: inbox.messages.map((message) => ({
-      message_id: message.id,
-      from_job_id: message.fromJobId,
-      from_role: message.fromRole,
-      from_vendor: message.fromVendor,
-      ...(message.fromName ? { from_name: message.fromName } : {}),
-      kind: message.kind,
-      subject: message.subject,
-      body: message.body,
-      files: message.refs.files,
-      symbols: message.refs.symbols,
-      ...(message.replyTo ? { reply_to: message.replyTo } : {}),
-      created_at: message.createdAt,
-    })),
+    untrusted_peer_messages: inbox.messages.map((message) => {
+      const citations = auditsById.get(message.id);
+      return {
+        message_id: message.id,
+        from_job_id: message.fromJobId,
+        from_role: message.fromRole,
+        from_vendor: message.fromVendor,
+        ...(message.fromName ? { from_name: message.fromName } : {}),
+        kind: message.kind,
+        subject: message.subject,
+        body: message.body,
+        files: message.refs.files,
+        symbols: message.refs.symbols,
+        ...((message.refs.noteIds ?? []).length > 0
+          ? { cited_note_ids: message.refs.noteIds }
+          : {}),
+        ...(citations && citations.length > 0 ? { citations } : {}),
+        ...(message.memoryNoteId
+          ? { memory_note_id: message.memoryNoteId }
+          : {}),
+        ...(message.replyTo ? { reply_to: message.replyTo } : {}),
+        created_at: message.createdAt,
+      };
+    }),
   };
 }

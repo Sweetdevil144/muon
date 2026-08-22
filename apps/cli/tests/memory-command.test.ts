@@ -162,7 +162,7 @@ describe("muon memory library (operator browse)", () => {
 
 describe("muon memory R3 TTL + R5 filter (cross-surface parity)", () => {
   it("threads --show-expired and a validated --filter into search and recall", async () => {
-    const searchMemory = vi.fn().mockResolvedValue([]);
+    const searchMemory = vi.fn().mockResolvedValue({ notes: [] });
     await run(
       [
         "memory",
@@ -172,7 +172,7 @@ describe("muon memory R3 TTL + R5 filter (cross-surface parity)", () => {
         "--filter",
         '{"field":"kind","op":"eq","value":"decision"}',
       ],
-      { searchMemory } as unknown as Partial<MuonApiClient>
+      { searchMemoryDisclosed: searchMemory } as unknown as Partial<MuonApiClient>
     );
     expect(searchMemory).toHaveBeenCalledWith("retry", {
       // ADR-0026: the workspace default rides EVERY read, so it is part of the exact
@@ -183,7 +183,7 @@ describe("muon memory R3 TTL + R5 filter (cross-surface parity)", () => {
       filter: { field: "kind", op: "eq", value: "decision" },
     });
 
-    const recallMemory = vi.fn().mockResolvedValue([]);
+    const recallMemory = vi.fn().mockResolvedValue({ notes: [] });
     await run(
       [
         "memory",
@@ -193,7 +193,7 @@ describe("muon memory R3 TTL + R5 filter (cross-surface parity)", () => {
         "--filter",
         '{"not":{"field":"trust","op":"eq","value":"low"}}',
       ],
-      { recallMemory } as unknown as Partial<MuonApiClient>
+      { recallMemoryDisclosed: recallMemory } as unknown as Partial<MuonApiClient>
     );
     expect(recallMemory).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -202,6 +202,53 @@ describe("muon memory R3 TTL + R5 filter (cross-surface parity)", () => {
         filter: { not: { field: "trust", op: "eq", value: "low" } },
       })
     );
+  });
+
+  it("ADR-0061: the search rendering says what was withheld — count line + stub lines, and silence when nothing was", async () => {
+    const written: string[] = [];
+    const spy = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation((chunk: unknown) => {
+        written.push(String(chunk));
+        return true;
+      });
+    try {
+      await run(["memory", "search", "retry"], {
+        searchMemoryDisclosed: vi.fn().mockResolvedValue({
+          notes: [],
+          suppressedCount: 4,
+          withheld: [
+            { id: "mem-p1", kind: "constraint", reason: "paused" },
+            { id: "mem-e1", kind: "decision", reason: "expired" },
+          ],
+        }),
+      } as unknown as Partial<MuonApiClient>);
+    } finally {
+      spy.mockRestore();
+    }
+    const out = written.join("");
+    expect(out).toContain("withheld: 4 more matched, ranked below the cap");
+    expect(out).toContain("withheld: mem-p1 (constraint) — paused");
+    expect(out).toContain("withheld: mem-e1 (decision) — expired");
+    // And a zero-note answer WITH stubs must not claim "no matching notes"
+    // as the whole story alongside them — the stub lines are the story.
+
+    const quiet: string[] = [];
+    const spy2 = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation((chunk: unknown) => {
+        quiet.push(String(chunk));
+        return true;
+      });
+    try {
+      await run(["memory", "search", "retry"], {
+        searchMemoryDisclosed: vi.fn().mockResolvedValue({ notes: [] }),
+      } as unknown as Partial<MuonApiClient>);
+    } finally {
+      spy2.mockRestore();
+    }
+    expect(quiet.join("")).toContain("no matching notes");
+    expect(quiet.join("")).not.toContain("withheld:");
   });
 
   it("refuses an out-of-grammar --filter before calling the backend", async () => {

@@ -6,6 +6,13 @@ export const MUON_CONTEXT_TOOL_NAMES = [
   "memory_delete",
   "memory_clone",
   "memory_add",
+  // ADR-0058. The grounding verb: check ONE note's claims against the repo
+  // (anchor existence, staleness confrontation, impact agreement — a positive
+  // list). Base tier like `memory_add`, whose authority class it shares: it
+  // reads the graph, stamps provenance, and on mismatch PROPOSES — the
+  // contradiction lands unconfirmed through the same gate as every agent
+  // write. It can promote nothing.
+  "memory_ground",
   "memory_preedit",
   "impact_memory",
   "preflight_edit",
@@ -18,12 +25,28 @@ export const MUON_CONTEXT_TOOL_NAMES = [
   "review_diff",
   "data_boundaries",
   "flow_scope",
+  // ADR-0053 §8. A deliberate widening of the base tier by three READS over the
+  // repository's own markdown corpus. Every seat gets them because "what has
+  // this repository already decided" is a question any agent has, and grepping
+  // is the alternative. They carry no write verb, no new grant, and no side
+  // effect; doc prose rides the standard trust envelope as DATA, and the docs
+  // graph is deliberately NOT a brief slice or an ADR-0051 §1 institutional
+  // source (a brief is text the agent cannot decline and has no envelope).
+  "docs_query",
+  "docs_context",
+  "docs_impact",
   "capability_preflight",
   // Feature #10. Base tier on purpose: "who am I and what may I do" is the one
   // question every agent has, and an agent that cannot ask it guesses instead.
   // It reports the session's own coordinates and grant — it reads nothing and
   // can widen nothing.
   "whoami",
+  // H5. Base tier for the same reason `whoami` is: "what is MUON waiting on the
+  // human for" is a question any session beside a person needs to answer, and
+  // guessing at it is worse than not answering. It returns COORDINATES — gate
+  // ids and unconfirmed note ids in the caller's own partition — and carries no
+  // decision verb: confirm and reject stay operator-tier, on operator surfaces.
+  "review_queue",
 ] as const;
 
 /**
@@ -49,6 +72,12 @@ export const MUON_COORDINATION_TOOL_NAMES = [
   // no clock, extends no budget; the ask schema is strict and identity-free.
   "question_ask",
   "question_status",
+  // ADR-0069 D2: the asker's OWN terminal verb — withdraw a question,
+  // optionally recording that the disclosed memory pre-answer settled it
+  // (typed reason + citations from that pre-answer). Self-scoped like the
+  // rest of the family: only the asking job's questions, never a close of
+  // anyone else's, never a human answer.
+  "question_withdraw",
   "crew_roles",
 ] as const;
 
@@ -67,6 +96,12 @@ export const MUON_CONTROL_TOOL_NAMES = [
   "interrupt",
   "propose_workflow",
   "apply_workflow",
+  // A14 / ADR-0045. The PROPOSE half of plan amendment, and only that half:
+  // it records an inert draft and returns the gate tag a human approves.
+  // Appending to a live run is gated exactly as hard as applying one, so
+  // there is deliberately no `apply_amendment` here — and `apply_workflow`
+  // stays in the attached coordinator's remainder for the same reason.
+  "propose_amendment",
   "workflow_status",
   "ship",
   "check_approval",
@@ -103,6 +138,10 @@ export const MUON_ATTACHED_COORDINATOR_CONTROL_TOOL_NAMES = [
   "ship",
   "assign_roles",
   "propose_workflow",
+  // A14. Granted for the SAME reason `propose_workflow` is: proposing changes
+  // nothing. `apply_workflow` remains in the remainder below, and no amendment
+  // APPLY verb exists at any tier — the human approves the amendment gate.
+  "propose_amendment",
 ] as const;
 
 /** Control verbs intentionally unavailable to an attached coordinator. */

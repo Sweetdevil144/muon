@@ -415,4 +415,43 @@ describe("ensureTaskWorktree preparation", () => {
       ensureTaskWorktree({ repoRoot, taskId: "prep-4" })
     ).rejects.toThrow(/this worktree is not test-capable/);
   });
+
+  // ── T5/H11: pending setup confirmation must not fail the dispatch ──────────
+  //
+  // The confirm loop is runner-files-gate → operator approves → confirmation
+  // recorded → next dispatch runs setup. When pending confirmation rode in
+  // `problems`, this threw "not test-capable" BEFORE the runner's gate-filing
+  // code could run, so a repo declaring confirmation-bound setup could never
+  // dispatch at all — the gate that would have unblocked it was unreachable.
+  it("hands over the tree with a typed pending state when setup awaits confirmation", async () => {
+    const previousDataDir = process.env.MUON_DATA_DIR;
+    process.env.MUON_DATA_DIR = join(worktreeStorage, "data-dir");
+    try {
+      await commitPackageRepo();
+      await write(
+        join(repoRoot, ".muon", "project.json"),
+        JSON.stringify({
+          version: 1,
+          setup: [{ command: "touch", args: ["ran-setup"] }],
+        })
+      );
+
+      const created = await ensureTaskWorktree({ repoRoot, taskId: "prep-5" });
+
+      expect(created.preparation.problems).toEqual([]);
+      expect(created.preparation.setupConfirmationRequired).toBeDefined();
+      expect(
+        created.preparation.setupConfirmationRequired?.setupHash
+      ).toMatch(/^[0-9a-f]{16,}$/);
+      // The unconfirmed command must not have run.
+      expect(existsSync(join(created.path, "ran-setup"))).toBe(false);
+      // The operator-facing summary says why setup did not run.
+      expect(summarizeWorktreePreparation(created.preparation)).toMatch(
+        /setup awaits operator confirmation/
+      );
+    } finally {
+      if (previousDataDir === undefined) delete process.env.MUON_DATA_DIR;
+      else process.env.MUON_DATA_DIR = previousDataDir;
+    }
+  });
 });

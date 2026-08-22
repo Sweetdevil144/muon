@@ -128,6 +128,33 @@ export const KEYMAP: readonly KeymapEntry[] = [
     help: "memory — the brain's notes",
   },
   {
+    // ADR-0087 M10/M11: the task ledger with each task's packets zone —
+    // classification, receipt, and delivery verdicts in one place.
+    key: "ctrl+b k",
+    match: ["k"],
+    scope: "prefix",
+    action: "open-tasks",
+    help: "tasks — the ledger and each task's packets",
+  },
+  {
+    // ADR-0087 M3: proposed plans — the FULL step table renders before
+    // apply, and apply FILES tasks; nothing runs.
+    key: "ctrl+b r",
+    match: ["r"],
+    scope: "prefix",
+    action: "open-workflows",
+    help: "workflow runs — review, apply or dismiss a plan",
+  },
+  {
+    // ADR-0087 M6: the pre-edit gate — what breaks if I touch X, with the
+    // brain's governed memory beside it.
+    key: "ctrl+b e",
+    match: ["e"],
+    scope: "prefix",
+    action: "open-context",
+    help: "evidence — pre-edit blast radius + governed memory",
+  },
+  {
     // ADVERTISED UNSHIFTED. `?` still works — the decoder now reads the
     // terminal's own shifted key rather than guessing at the layout — but no
     // chord on this desk REQUIRES a shift to reach it. A binding a human has
@@ -150,7 +177,12 @@ export const KEYMAP: readonly KeymapEntry[] = [
     match: ["a"],
     scope: "prefix",
     action: "open-composer",
-    help: "new task — give MUON work to do",
+    // NAMES THE PICKER, not one command. This opened `task-new` alone once,
+    // and the help kept saying so after it became a chooser — so a human read
+    // "new task" and never learned the key also runs, assigns, answers, sets
+    // a status, ships and files a note. The list it offers is derived from
+    // the action registry (ROADMAP H13), so this stays true as it grows.
+    help: "do something — task, run, assign, answer, status, ship, note",
   },
   {
     // Unshifted, same reasoning. `|` and tmux's `%` both still work.

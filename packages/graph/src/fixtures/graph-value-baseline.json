@@ -1,0 +1,22 @@
+{
+  "_readme": "ADR-0067 — the ratchet baseline for the SHIPPED ranker (the '+centrality' arm, which is the production flat pipeline + the calibrated prior) on the committed fixture corpus, per profile. The eval suite fails when a measured score departs from this file by more than the tolerance IN EITHER DIRECTION: a regression is a regression, and an unexplained improvement means this baseline is stale — move it IN THE SAME COMMIT as the change that moved the score, which is exactly 'every ranking change carries its measurement' enforced by diff review instead of discipline. The relational ablation pins (traversal adds no gold, etc.) live in the test suite; this file pins ABSOLUTE quality, which those comparisons cannot see drop.",
+  "arm": "+centrality",
+  "tolerance": 0.005,
+  "profiles": {
+    "wide": {
+      "recall": 0.873437,
+      "precision": 0.281771,
+      "ndcg": 0.714631
+    },
+    "tight": {
+      "recall": 0.678646,
+      "precision": 0.383333,
+      "ndcg": 0.61522
+    },
+    "denseOff": {
+      "recall": 0.647396,
+      "precision": 0.252083,
+      "ndcg": 0.482751
+    }
+  }
+}

@@ -1,4 +1,8 @@
 import type { McpProbeVerdict } from "@muon/client/mcp-probe";
+// TYPE-ONLY, and that is the whole constraint: the renderer imports this file,
+// and `@muon/client/github-identity-gate` reaches node:fs. The vocabulary
+// crosses; the module does not.
+import type { IdentityGateState } from "@muon/client/github-identity-gate";
 import type { DataBoundary } from "@muon/client/data-boundaries";
 import type {
   BlockingQuestion,
@@ -32,6 +36,15 @@ import type {
   InstallOutcome as McpInstallOutcome,
   McpConfigScope,
 } from "@muon/client/mcp-vendor-config";
+// Founder request, 2026-08-17 — Settings -> Command Line Tools. TYPE-ONLY:
+// `cli-link-bridge.ts` reaches node:fs/node:os, so it runs in MAIN and only
+// its plain-data reports cross the bridge, same shape as the MCP types above.
+import type {
+  CliLinkResult,
+  CliLinkStatusReport,
+  CliUnlinkResult,
+} from "../lib/cli-link-bridge.js";
+import type { CliLinkBinStatus } from "../lib/cli-link.js";
 import type { DiffImpact, DiffScope } from "@muon/client/diff-impact";
 import type { RepoMap, WorkUnit } from "@muon/client/repo-map";
 import type {
@@ -39,6 +52,8 @@ import type {
   TerminalSpawn,
 } from "./terminal-protocol.js";
 import type {
+  ApprovalGrant,
+  ApprovalGrantDuration,
   ApprovalReceipt,
   ApprovalRequest,
   AutoContext,
@@ -63,6 +78,10 @@ import type {
   MemoryLibrarySnapshot,
   ManualReviewAttestation,
   ApprovalMergeResult,
+  // TYPE-ONLY (erased): `ReviewThreadDigest` is derived from this class's own
+  // method signature rather than restated, so the H1 digest contract cannot
+  // drift between the brain client and the two sides of this bridge.
+  MuonApiClient,
   OrchestratorChatRecord,
   PreEditContext,
   PreEditTargetInput,
@@ -161,6 +180,14 @@ export type McpInstallReport = {
   command: string | null;
   outcome: McpInstallOutcome;
 };
+
+/**
+ * Settings -> Command Line Tools. Re-exported verbatim (not restated) for the
+ * same reason `McpStatusReport` is above: the renderer names the shape and
+ * never the evaluator, which lives in `../lib/cli-link-bridge.ts` (main only,
+ * touches the filesystem).
+ */
+export type { CliLinkBinStatus, CliLinkResult, CliLinkStatusReport, CliUnlinkResult };
 
 /**
  * ADR-0028 Tier C — what `mcpAttach` answers with. Main runs the SAME
@@ -354,7 +381,25 @@ export type DesktopState = {
    * wraps every IPC channel) — a renderer that ignores this field still
    * cannot start work. Optional so older state literals in tests stay valid.
    */
-  githubGate?: { required: boolean; satisfied: boolean };
+  githubGate?: {
+    required: boolean;
+    satisfied: boolean;
+    /**
+     * ADR-0052 Decision 5 — the install-record consent sentence, composed in
+     * MAIN (`installRecordDisclosure`) and rendered VERBATIM. Present only when
+     * the gate is armed, which is exactly when connecting GitHub files a
+     * record. Spelled inline here rather than imported from `lib/github-gate.ts`
+     * because this file is the renderer's contract and that one is a
+     * main-process module reaching `node:fs`.
+     */
+    recordDisclosure?: string;
+    /** ADR-0052 F3 — the install record's own state, so a deferred registration
+     *  is something the operator can SEE rather than a main-process warning. */
+    registration?: {
+      state: "open" | "locked" | "locked-unregistered";
+      detail?: string;
+    };
+  };
   /** Full-Auto standing-consent state, mirrored for the persistent "safety gates off" indicator. */
   fullAuto: boolean;
   /**
@@ -393,6 +438,17 @@ export type DesktopState = {
   chats: OrchestratorChatRecord[];
   /** Pending approvals only, what the inline gate cards render. */
   approvals: ApprovalRequest[];
+  /**
+   * H6 — the newest DECIDED gates (bounded, decision-time ordered), so a
+   * session header can name what the last gate on its task concluded.
+   *
+   * Deliberately NOT folded into `approvals` above: that field is pending-only
+   * and every consumer of it means "still needs a human". Optional so older
+   * state literals stay valid; `undefined` means the snapshot could not be
+   * built (offline), which is why a missing decision renders as NO LINE rather
+   * than as "no gates have been decided".
+   */
+  decidedApprovals?: ApprovalRequest[];
   /** OPEN blocking questions machine-wide (ADR-0043) — the human inbox half. */
   questions: BlockingQuestion[];
   /** The inbox read is BOUNDED (spine window + response cap); true = partial. */
@@ -649,6 +705,73 @@ export type ShipTaskResult = {
   approvalId: string;
   pending: boolean;
   merge?: ApprovalMergeResult;
+};
+
+/**
+ * H12 — what ONE continue-on-lane gesture did, or the reason it did nothing.
+ *
+ * A refusal is DATA, not an exception, and its `reason` is the composer's own
+ * sentence (`buildContinuationDispatch`, @muon/client) carried through
+ * unrephrased: the desk must not invent a second vocabulary for "that lane is
+ * not dispatch-ready" or "there is no typed packet to seed from".
+ *
+ * Success names the SUCCESSOR JOB and the PACKET IT CITES, because that pair is
+ * the whole claim — a continuation that cannot name its source packet is a new
+ * mission wearing the old one's coat. It grants nothing: `enqueueDispatch` files
+ * an ordinary dispatch, so role ceilings, caps, chat partition and budgets are
+ * exactly what they were before the click.
+ */
+export type ContinueOnLaneResult =
+  | {
+      ok: true;
+      /** The successor dispatch. */
+      jobId: string;
+      /** The typed wrap packet the successor was seeded from and must cite. */
+      packetId: string;
+      /** Lane the successor runs on (echoed, never re-derived by the renderer). */
+      vendor: string;
+    }
+  | { ok: false; reason: string };
+
+/**
+ * ADR-0044/0071 — what ONE fork gesture minted, or the server's refusal.
+ *
+ * A refusal is DATA, and its `reason` is the fork route's own sentence
+ * ("not the task's latest settled step…", "still running — interrupt or
+ * wait…") carried through unrephrased: the route's guards are the whole
+ * vocabulary, and the desk must not invent a second one. Success names the
+ * NEW mission (its own chat + task — a fork never reuses the source's) and
+ * the ROOT job queued on the chosen lane.
+ */
+export type ForkMissionResult =
+  | {
+      ok: true;
+      chatId: string;
+      chatTitle: string;
+      taskId: string;
+      /** The fork's root dispatch, queued through the ordinary create path. */
+      jobId: string;
+      /** Lane the root runs on (echoed, never re-derived by the renderer). */
+      vendor: string;
+    }
+  | { ok: false; reason: string };
+
+/**
+ * H1 — the BOUND review thread's digest, exactly as the brain returns it.
+ *
+ * Derived from the client method rather than restated so the two can never
+ * drift: the digest is ids + structural flags off the ledger (packet ids with
+ * their own degraded flag, gate ids with status/decision, open question ids),
+ * and it deliberately carries no agent prose. Ids ARE the evidence here.
+ */
+export type ReviewThreadDigest = Awaited<
+  ReturnType<MuonApiClient["getReviewThread"]>
+>;
+
+/** Which thread a review-look read/advance is about. */
+export type ReviewThreadTarget = {
+  targetKind: "task" | "chat";
+  targetId: string;
 };
 
 export type StreamsQuery = {
@@ -1167,6 +1290,19 @@ export type MuonBridge = {
     id: string;
   }): Promise<void>;
   /**
+   * ADR-0056 D8.1 — every live durable grant, so none can act unseen. The
+   * desktop is where `always` is MINTED (review-gate.tsx), so it is also where
+   * the operator must be able to see and revoke one; until this existed the
+   * only kill switch for a grant minted by clicking a button was a terminal.
+   */
+  listApprovalGrants(filter?: {
+    activeOnly?: boolean;
+    workspacePath?: string;
+    taskId?: string;
+  }): Promise<ApprovalGrant[]>;
+  /** One-way revocation; effective on the very next redemption attempt. */
+  revokeApprovalGrant(grantId: string): Promise<ApprovalGrant>;
+  /**
    * P9 — resume a paused/interrupted loop dispatch as a fresh governed job.
    */
   resumeObjectiveLoop(input: { jobId: string }): Promise<{ jobId: string }>;
@@ -1220,6 +1356,32 @@ export type MuonBridge = {
    */
   mcpInstall(vendor: VendorId): Promise<McpInstallReport>;
   /**
+   * Settings -> Command Line Tools. Read-only status of the three
+   * `~/.local/bin` shims (`muon`, `muon-tui`, `muon-mcp`) this app can link:
+   * per binary, absent / linked-current / linked-but-stale / foreign
+   * (something MUON did not write is already there). Never writes; safe to
+   * call on every Settings render. Always RESOLVES — `kind: "unavailable"`
+   * (a dev/source run, or a build with no staged CLI) is data, not a
+   * rejection.
+   */
+  cliLinkStatus(): Promise<CliLinkStatusReport>;
+  /**
+   * Write (or refresh) the shims. Idempotent: re-running when already
+   * current touches nothing. Never overwrites a binary at the target path
+   * MUON did not write itself — that entry comes back `action: "refused"`
+   * with the reason, one entry at a time, so e.g. a tarball-installed
+   * `muon` sitting at `~/.local/bin/muon` is left alone while `muon-tui`
+   * and `muon-mcp` still link. Always RESOLVES; never throws.
+   */
+  cliLink(): Promise<CliLinkResult>;
+  /**
+   * Undo: removes exactly the shims MUON's own marker identifies as its
+   * own, leaves anything foreign in place. Works even when the CURRENT
+   * build has no staged CLI to link against, so it can always clean up a
+   * link made by an older/newer build. Always RESOLVES; never throws.
+   */
+  cliUnlink(): Promise<CliUnlinkResult>;
+  /**
    * ADR-0028 Tier C — mint a governed dispatch seat for a coordinator-seat
    * vendor CLI the human runs themselves, through the SAME operator-tier
    * `attachCoordinator` the CLI's `muon mcp attach` calls: no independent
@@ -1250,6 +1412,61 @@ export type MuonBridge = {
   /** One handoff packet as the desk renders it — classified, never raw. */
   taskHandoffs(input: { taskId: string }): Promise<TaskHandoffPage>;
   /**
+   * H12 — CONTINUE THIS MISSION ON ANOTHER LANE, in one gesture.
+   *
+   * Main reads the task's handoffs, hands them to the ONE shared composer
+   * (`buildContinuationDispatch`) together with its own dispatch-ready vendor
+   * set, and — only if the composer plans one — files an ORDINARY dispatch
+   * seeded from the newest typed wrap packet and citing it via
+   * `sourcePacketId`. There is no new authority here: no approval is created,
+   * no cap is raised, no claim widens. A refusal resolves as
+   * `{ok:false, reason}` rather than rejecting, because "no typed packet yet"
+   * and "that lane is not dispatch-ready" are ANSWERS, not failures.
+   */
+  continueOnLane(input: {
+    taskId: string;
+    /** Owning chat, so the successor lands in the same mission partition. */
+    chatId?: string;
+    vendor: string;
+  }): Promise<ContinueOnLaneResult>;
+  /**
+   * ADR-0044/0071 — fork a NEW mission from a RECORDED step (a settled job
+   * of the bound chat). Everything that makes a fork a fork — the
+   * latest-settled-step guard, gesture-time capture, authority re-derivation,
+   * offer-prefix inheritance, compensation — is enforced SERVER-SIDE at the
+   * fork route; this bridge only names the step, the brief and the lane.
+   * Main fences the source job to the renderer's own bound chat, exactly as
+   * `continueOnLane` fences its task. Refusals resolve as `{ok:false,reason}`
+   * with the route's words.
+   */
+  forkMission(input: {
+    sourceJobId: string;
+    brief: string;
+    vendor: string;
+    title?: string;
+  }): Promise<ForkMissionResult>;
+  /**
+   * H1 — what changed on this review thread since THIS principal last looked.
+   *
+   * A read, and only a read: calling it NEVER advances the cursor, which is
+   * precisely what leaves a thread bound when it is closed without a decision.
+   * `advanceReviewLook` is the only thing that moves it.
+   */
+  reviewThread(input: ReviewThreadTarget): Promise<ReviewThreadDigest>;
+  /**
+   * H1 — stamp "I have seen this". Surfaces call it on a DECISION or an
+   * explicit acknowledge, never on open.
+   *
+   * `digestAt` is the digest's own read stamp, echoed back from `reviewThread`,
+   * so the cursor lands where the operator was LOOKING rather than at the
+   * moment they clicked — otherwise everything filed in the render→click
+   * window is consumed unseen. Omit it only when there is no rendered digest
+   * to speak for; the brain then stamps now.
+   */
+  advanceReviewLook(
+    input: ReviewThreadTarget & { digestAt?: string }
+  ): Promise<{ lastLookedAt: string }>;
+  /**
    * ADR-0036 D4 — this mission's cap and what it has spent, for the BOUND
    * chat. No chatId parameter: main supplies it from the selection, so the
    * renderer cannot read another mission's bill.
@@ -1262,6 +1479,8 @@ export type MuonBridge = {
   /** Memory's governing policy: TTL, which lifetime table is live, and the
    *  compaction window. Operator tier, machine-wide (not chat-scoped). */
   memoryGovernance(): Promise<MemoryGovernanceState>;
+  /** ADR-0061 D3 — the Memory page's cold-start card (see the type). */
+  memoryColdStart(): Promise<MemoryColdStartState>;
   setMemoryTtl(policy: MemoryTtlPolicy): Promise<MemoryTtlPolicy>;
   setMemoryMining(enabled: boolean): Promise<boolean>;
   setMemoryCompactionRetentionDays(days: number): Promise<number>;
@@ -1300,6 +1519,19 @@ export type MuonBridge = {
      * TTL) alongside an approved decision. Absent = today's decision exactly.
      */
     receiptTtlMs?: number;
+    /**
+     * ADR-0056: the GRADED form of the same opt-in — a grade, never a number,
+     * because the expiry is computed server-side from the protocol's TTL table.
+     * `always` mints the chat-scoped 7-day `ApprovalGrant`; `session` is the
+     * receipt at the graded TTL; `once` mints nothing.
+     *
+     * MUTUALLY EXCLUSIVE with `receiptTtlMs` — the backend 400s on both, so
+     * main refuses the pair before it can get that far. The renderer cannot
+     * express the pair at all (it holds one `GateDurableChoice` union), which
+     * is where the guarantee actually lives; the check in main is the fence
+     * for anything that is not the gate surface.
+     */
+    grantDuration?: ApprovalGrantDuration;
     /** Exact operator attestation for a freshly loaded REVIEW BLIND artifact. */
     manualReview?: ManualReviewAttestation;
   }): Promise<ResolveApprovalResult>;
@@ -1618,6 +1850,28 @@ export type TaskHandoffView = {
  * three separate reads could land in three different states — a retention
  * window from before a change beside a TTL from after it.
  */
+/**
+ * ADR-0061 D3 — the cold-start card's one read. Three-class vocabulary:
+ * what THIS workspace holds (active), what policy currently suppresses
+ * there and why (paused / expired-hidden / stale), and the FENCE class as
+ * partition totals only — counts and paths, never cross-partition content.
+ * Composed in MAIN against the BOUND workspace (ADR-0026 §9: the renderer
+ * cannot widen the partition by construction).
+ */
+export type MemoryColdStartState = {
+  workspacePath: string | null;
+  /** The policy classes the card renders. The expired class deliberately
+   *  is NOT here: the library empty state already owns its probe and its
+   *  "Show expired" affordance, and a second derivation would drift. */
+  held: {
+    paused: number;
+    stale: number;
+  };
+  /** Machine-wide partition totals (fence class, counts only). `null`
+   *  workspacePath = the unscoped residue. */
+  partitions: { workspacePath: string | null; total: number }[];
+};
+
 export type MemoryGovernanceState = {
   /**
    * The flat TTL, or NULL when it is not the policy in force.
@@ -1659,6 +1913,37 @@ export type McpProbeReport = {
   mode: string;
   verdict: McpProbeVerdict;
   failure: string | null;
+  /**
+   * ADR-0052 — whether the server that answered is IDENTITY-LOCKED.
+   *
+   * A gated `muon-mcp` answers `initialize` and `tools/list` in full by design,
+   * so a report that stopped at the verdict said "ok, N tools" about a server
+   * that will refuse all N. `null` is the honest "not measured" (an old build
+   * with no `whoami`, or one that never answered) — an unknown, never a "no".
+   */
+  identityGate: IdentityGateState | null;
+  /**
+   * The refusal copy to SHOW when locked, already rendered — null otherwise.
+   *
+   * Carried as data for the same reason `McpStatusReport` is: the renderer is
+   * an esbuild BROWSER bundle and `@muon/client/github-identity-gate` reaches
+   * `node:fs`, so `githubIdentityGateRefusal` runs in MAIN and only its string
+   * crosses the bridge. That keeps the ONE refusal copy (ADR-0052 Decision 5)
+   * the single author for the desk as well as for `muon mcp probe` — the
+   * renderer never retypes the sentence, because it never composes it.
+   */
+  identityGateRefusal: string | null;
+  /**
+   * The gate value this build does NOT recognise, when the server sent one.
+   *
+   * Separate from `identityGate` deliberately: that field stays
+   * recognised-only, so no consumer can mistake a future state for a known one
+   * by widening a comparison. A server reporting `identityGate: "locked-until-x"`
+   * from a newer MUON is neither locked nor open as far as THIS build can tell,
+   * and rendering it as healthy is the failure `muon mcp probe` was fixed for —
+   * the desk dropped the field entirely and said "ok, N tools".
+   */
+  unknownIdentityGate: string | null;
 };
 
 /**

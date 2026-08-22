@@ -2,16 +2,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { buildOnboardingState } from "@muon/client/onboarding";
 import { buildObjectiveLoopStatusForTask } from "@muon/client/loop-status";
+// H10 — the ONE session-slug projection, via the renderer-safe subpath (the
+// `@muon/client` barrel drags `node:fs` into an esbuild browser target).
+import { sessionSlug } from "@muon/client/session-slug";
 import type { ApprovalRequest } from "@muon/client/types";
 import type {
   GitHubReview,
   ManualReviewAttestation,
 } from "@muon/client";
 import type {
+  CliLinkStatusReport,
   CrewRoleLaneIpc,
   GitNexusIndexStatus,
   McpInstallReport,
   McpStatusReport,
+  ReviewThreadTarget,
+  TaskHandoffView,
   UpdateStatus,
   VendorModelResolutionIpc,
 } from "../shared/ipc.js";
@@ -39,6 +45,9 @@ import { parseModelCommand, resolveModelChange } from "./lib/chat-model.js";
 // separate `?? "claude-code"` spellings of it.
 import {
   defaultCoordinatorVendor,
+  publicVendorIds,
+  vendorLabel,
+  vendorRoleCeiling,
   type VendorId,
 } from "@muon/client/vendors";
 import { scopeDesktopStateToChat } from "../lib/chat-scope.js";
@@ -97,15 +106,21 @@ import {
   LiveDispatchHero,
   SystemsStatusButton,
 } from "./cockpit.js";
+import type { GateDurableChoice } from "./review-gate.js";
 import { IconChevron, IconClose } from "./ui-icons.js";
 import { ReconCard } from "./recon-card.js";
 import {
   RightPanel,
+  type ContinueOnLaneProps,
+  type DockMergeProps,
   type RightPanelTab,
   type ShipOutcome,
   type ShipRequest,
   type ShipTarget,
 } from "./right-panel.js";
+import type { ForkMissionProps } from "./fork-mission-section.js";
+import { ReviewDigestStrip } from "./review-digest.js";
+import { buildDockShipTarget } from "./lib/dock-ship-target.js";
 import { PresetsBar } from "./presets-bar.js";
 import { Onboarding } from "./onboarding.js";
 import {
@@ -126,7 +141,7 @@ import { gcParkedTerminalsAtBoot } from "./lib/parked-terminal-store.js";
 import { CrewPanel, GitHubConnectPanel, Sidebar } from "./sidebar.js";
 import type { GitHubConnectionStatus } from "@muon/client";
 import { SettingsPanel } from "./settings-panel.js";
-import { pickRunnerOrStopNotice } from "./system-notice.js";
+import { noticeExpiryMs, pickRunnerOrStopNotice } from "./system-notice.js";
 import {
   deriveMissionTurnState,
   pinLiveTurnRoots,
@@ -185,6 +200,20 @@ const GLOBAL_PANEL_KINDS: ReadonlySet<WorkspacePanelKind> = new Set([
 ]);
 
 const POLL_INTERVAL_MS = 2000;
+
+/**
+ * H12 — the EXECUTION lanes, derived from the registry by a positive predicate
+ * (a lane that may hold `implementer`, which is the role an un-planned dispatch
+ * resolves to). Used ONLY as the fallback list when the readiness probe cannot
+ * answer at all: never as a hard-coded pair, and never as a claim that these
+ * lanes are ready — the gesture re-checks, and the dispatch route decides.
+ *
+ * `publicVendorIds()` keeps the test vendor out; ADR-0022's rule that absence
+ * means "holds nothing" makes this fail-closed as new lanes are registered.
+ */
+const EXECUTION_LANES: string[] = publicVendorIds().filter((vendor) =>
+  vendorRoleCeiling(vendor).includes("implementer")
+);
 
 export type PaletteApprovalTarget = {
   approval: ApprovalRequest | null;
@@ -413,6 +442,25 @@ export function App() {
   /** Chat-level cancel: which chat is stopping, and what the last stop achieved. */
   const [cancellingChatId, setCancellingChatId] = useState<string | null>(null);
   const [cancelNotice, setCancelNotice] = useState<string | null>(null);
+
+  // Stop/cancel confirmations EXPIRE (see noticeExpiryMs): they are receipts
+  // for a moment, and left alone they squat in the header's system line and
+  // the sidebar indefinitely. Keyed on the notice text, so a new stop restarts
+  // the clock and an in-flight "Stopping…" (null expiry) is never dismissed.
+  useEffect(() => {
+    if (!stopNotice) return;
+    const ttl = noticeExpiryMs(stopNotice);
+    if (ttl === null) return;
+    const timer = setTimeout(() => setStopNotice(null), ttl);
+    return () => clearTimeout(timer);
+  }, [stopNotice]);
+  useEffect(() => {
+    if (!cancelNotice) return;
+    const ttl = noticeExpiryMs(cancelNotice);
+    if (ttl === null) return;
+    const timer = setTimeout(() => setCancelNotice(null), ttl);
+    return () => clearTimeout(timer);
+  }, [cancelNotice]);
   /** Chats hidden immediately on archive click until the next authoritative tick. */
   const [pendingArchivedIds, setPendingArchivedIds] = useState<string[]>([]);
   const [focusedApprovalId, setFocusedApprovalId] = useState<string | null>(
@@ -460,6 +508,16 @@ export function App() {
   const [mcpStatus, setMcpStatus] = useState<McpStatusReport | null>(null);
   const [mcpStatusLoading, setMcpStatusLoading] = useState(false);
   const [mcpStatusError, setMcpStatusError] = useState<string | null>(null);
+  // Settings -> Command Line Tools. Same three-state shape as Connections
+  // above, for the same reason: "still reading" and "read and it failed"
+  // are different sentences the panel has to be able to tell apart.
+  const [cliLinkStatus, setCliLinkStatus] = useState<CliLinkStatusReport | null>(
+    null
+  );
+  const [cliLinkStatusLoading, setCliLinkStatusLoading] = useState(false);
+  const [cliLinkStatusError, setCliLinkStatusError] = useState<string | null>(
+    null
+  );
   // Live GitNexus index status. Pushed from main via `muon:gitnexus` for instant
   // transitions; falls back to the polled DesktopState.gitnexus until the first
   // push arrives.
@@ -1285,6 +1343,27 @@ export function App() {
     []
   );
 
+  // Settings -> Command Line Tools. Lazy, same reasoning as Connections:
+  // this is a diagnostic the operator asks for by opening Settings, not
+  // something the mission view needs, and it never throws into render.
+  const onRefreshCliLinkStatus = useCallback(async () => {
+    setCliLinkStatusLoading(true);
+    setCliLinkStatusError(null);
+    try {
+      setCliLinkStatus(await window.muon.cliLinkStatus());
+    } catch (error) {
+      setCliLinkStatusError(
+        error instanceof Error
+          ? error.message
+          : "Could not read the command-line tools' link status."
+      );
+    } finally {
+      setCliLinkStatusLoading(false);
+    }
+  }, []);
+  const onCliLink = useCallback(() => window.muon.cliLink(), []);
+  const onCliUnlink = useCallback(() => window.muon.cliUnlink(), []);
+
   // The LIVE surface check. Deliberately NOT wired into the status refresh
   // above: that one is cheap and runs when the panel opens, while this spawns
   // a real MCP server process. An operator asks for it.
@@ -1356,13 +1435,24 @@ export function App() {
     }
   }, []);
 
+  // H1 — bumped whenever something OTHER than the digest strip advanced the
+  // review-look cursor (today: a merge decision). The strip re-reads on the
+  // change, so the delta it shows is the one that survived the decision.
+  // Opening the dock never touches this.
+  const [reviewLookVersion, setReviewLookVersion] = useState(0);
+
   const onResolveApproval = useCallback(
     async (
       approvalId: string,
       status: "approved" | "rejected",
-      receiptTtlMs?: number,
+      // ADR-0056: ONE optional durable choice, not one per grade. Every gate
+      // surface funnels through here, so this is the seam where "a receipt AND
+      // a grade" has to be unrepresentable — `buildApprovalDecision` refuses
+      // that pair, and an unreachable refusal is the only kind worth having.
+      durable?: GateDurableChoice,
       manualReview?: ManualReviewAttestation
     ) => {
+      const decided = (state?.approvals ?? []).find((a) => a.id === approvalId);
       // Fail-closed SHIP gate (ROADMAP 4.3): a merge cannot be approved while
       // the change is REVIEW BLIND — some changed file is unindexed or the
       // index is stale, so the affected-flow evidence is incomplete and "0
@@ -1370,9 +1460,7 @@ export function App() {
       // surface (can't approve → can't merge), not merely in the orchestrator
       // prompt. Missing/degraded review evidence blocks too.
       if (status === "approved") {
-        const approval = (state?.approvals ?? []).find(
-          (a) => a.id === approvalId
-        );
+        const approval = decided;
         if (approval?.kind === "merge") {
           // MCP/CLI/TUI ship approvals historically omit jobId. Resolve the
           // newest same-task job in the selected chat so the real workflow
@@ -1412,12 +1500,48 @@ export function App() {
       await window.muon.resolveApproval({
         approvalId,
         status,
-        receiptTtlMs,
+        // The union collapses into the bridge's two named fields HERE and only
+        // here. Exactly one can be set, because exactly one union member was
+        // chosen; the plain approve sets neither, which is the `once` grade.
+        receiptTtlMs:
+          durable?.grade === "session" ? durable.receiptTtlMs : undefined,
+        grantDuration:
+          durable?.grade === "always" ? durable.grantDuration : undefined,
         manualReview,
       });
       setFocusedApprovalId((current) =>
         current === approvalId ? null : current
       );
+      // H1 — a MERGE DECISION is one of exactly two acts that advance the
+      // review-look cursor (the other is the strip's explicit "Mark reviewed").
+      // It runs AFTER the governed resolve landed, and it is BEST-EFFORT by
+      // construction: the cursor is display state, so a failed stamp must never
+      // turn a decision that already happened into an error. The worst case is
+      // that the next open shows a delta the operator has already seen, which
+      // is the safe direction to be wrong in.
+      //
+      // `try` and not only `.catch`: a bridge that throws SYNCHRONOUSLY (an
+      // older/partial preload, a getter that raises) never produces a promise
+      // to catch on, and would take the landed decision down with it
+      // (adversarial review, 2026-08-17). Best-effort has to mean best-effort
+      // against every failure shape, not just the rejected-promise one.
+      if (decided?.kind === "merge" && decided.taskId) {
+        try {
+          const stamp = window.muon?.advanceReviewLook;
+          if (typeof stamp === "function") {
+            // No `digestAt` here, deliberately: this path renders from the
+            // merge dialog, not the strip — often no digest was ever fetched.
+            // Every BLOCKING fact (degraded/unverifiable packet, gate, open
+            // question) rides the cursor independently, so a NOW stamp can
+            // consume only informational delta on the one task the operator
+            // just decided with its evidence on screen.
+            await stamp({ targetKind: "task", targetId: decided.taskId });
+            setReviewLookVersion((count) => count + 1);
+          }
+        } catch {
+          // The cursor did not move. The merge still did.
+        }
+      }
       await storeRef.current?.tick();
     },
     [effectiveChatId, state?.approvals, state?.dispatchJobs]
@@ -1851,6 +1975,22 @@ export function App() {
     }
     void onRefreshMcpStatus();
   }, [activePanelTab, mcpStatus, mcpStatusError, onRefreshMcpStatus]);
+  // Same lazy-load shape, for Command Line Tools.
+  useEffect(() => {
+    if (
+      activePanelTab !== "settings" ||
+      cliLinkStatus !== null ||
+      cliLinkStatusError
+    ) {
+      return;
+    }
+    void onRefreshCliLinkStatus();
+  }, [
+    activePanelTab,
+    cliLinkStatus,
+    cliLinkStatusError,
+    onRefreshCliLinkStatus,
+  ]);
   // A human terminal tab (vendor CLI / shell) is its own surface: never a
   // panel, never a job — so it can never bind a governance banner either.
   const activeHumanTerminal = isChatTerminalSessionId(activeWorkspaceTab)
@@ -1908,7 +2048,17 @@ export function App() {
     agents.find((agent) => agent.id === job.agentId) ?? {
       id: job.agentId ?? job.id,
       vendor: job.vendor,
-      name: `${job.vendor}-${job.id.slice(-4)}`,
+      // H10 — a session stub is NAMED, not coordinate-fragmented. `codex-3f2a`
+      // is unspeakable and its four trailing characters are not the four the
+      // rest of MUON prints; the slug is the one projection every surface
+      // derives from the same id, so the pane header, the rail row and
+      // `dispatch status` agree. The full id stays on the pane's own facts.
+      // The name is the SLUG ALONE: every consumer that wants the vendor
+      // prefixes `vendorLabel(vendor)` itself (the session header does), and
+      // baking the raw vendor id into the name rendered as
+      // "Codex · codex · quiet-heron-cmb4" — the vendor twice, once as a
+      // label and once as an id (dogfood item D1).
+      name: sessionSlug(job.id),
       ordinal: 0,
       status: job.status === "running" ? "working" : "idle",
       currentTaskId: job.taskId,
@@ -2093,9 +2243,16 @@ export function App() {
     }
     return ids;
   }, [activeChat, chatScope.jobs]);
-  const openChatQuestions = (state?.questions ?? []).filter((question) =>
-    activeChatTaskIds.has(question.taskId)
-  ).length;
+  // H15: the mission's OPEN questions, as rows (not just a count) — the rail's
+  // inbox now names the blocked agent, so it needs the question itself.
+  const chatQuestions = useMemo(
+    () =>
+      (state?.questions ?? []).filter((question) =>
+        activeChatTaskIds.has(question.taskId)
+      ),
+    [state?.questions, activeChatTaskIds]
+  );
+  const openChatQuestions = chatQuestions.length;
   // A blocking question IS a pending human decision — same badge as gates.
   const pendingDecisions =
     chatScope.approvals.length +
@@ -2330,6 +2487,22 @@ export function App() {
     }
   }, [controlDockTab, focusedApproval, layout]);
 
+  // H15 — the rail names the blocked agent; THIS reveals the surface that can
+  // actually answer it. Same route the focused-approval effect above takes:
+  // open the Control dock on its Review tab, where QuestionsInbox is mounted.
+  // Scrolling happens after React has committed that mount, and degrades to
+  // "the panel is simply open" if the node is not there — never a broken jump.
+  const onFocusQuestions = useCallback(() => {
+    setControlDockTab("review");
+    layout.navigate("control");
+    requestAnimationFrame(() => {
+      const inbox = document.querySelector<HTMLElement>(".questions-inbox");
+      if (!inbox) return;
+      inbox.scrollIntoView({ block: "start" });
+      inbox.querySelector<HTMLElement>("summary")?.focus();
+    });
+  }, [layout]);
+
   const dockPanel = layout.panel;
   const dockSection = dockPanel ? DOCK_SECTION[dockPanel] : null;
 
@@ -2381,40 +2554,67 @@ export function App() {
       ? dockWorkspaceReview.workspacePath
       : (dockReviewJob?.workspacePath ?? activeChat?.workspacePath ?? null);
 
+  // H2 — the WRAP PACKET is evidence the ship control has to obey.
+  //
+  // A `typed_degraded` / `packet_parse_failed` packet declares that the work's
+  // own checks are missing or unreadable, and until now the dock's "Land this
+  // work" button did not know that: it read the tree and offered to file a
+  // merge gate over a change nobody could vouch for. One bounded read per task
+  // (the same `taskHandoffs` leg the Handoff panel uses), newest-first.
+  const dockShipTaskId = dockReviewJob?.taskId ?? null;
+  // The mission task the REVIEW tab is bound to (H1's thread, H12's
+  // continuation). The shown dispatch's task when the dock has one; otherwise
+  // the chat's active task, so the digest and the continue gesture still have a
+  // subject before any tree has been reviewed.
+  const dockReviewTaskId = dockShipTaskId ?? activeTaskId ?? null;
+  const [dockHandoffs, setDockHandoffs] = useState<{
+    taskId: string;
+    items: TaskHandoffView[];
+  } | null>(null);
+  useEffect(() => {
+    if (!dockShipTaskId) {
+      setDockHandoffs(null);
+      return;
+    }
+    // An older preload has no handoff leg at all. Absence of the READ is not
+    // evidence of a degraded packet, so the gate stays where it already is —
+    // at the merge approval, which is fail-closed server-side.
+    const read = window.muon?.taskHandoffs;
+    if (typeof read !== "function") return;
+    let active = true;
+    void read({ taskId: dockShipTaskId })
+      .then((page) => {
+        if (active) setDockHandoffs({ taskId: dockShipTaskId, items: page.items });
+      })
+      .catch(() => {
+        // A FAILED read is not a clean packet either — but it is also not a
+        // packet that declared itself degraded, and manufacturing a refusal
+        // from an unreachable brain would block every ship whenever the
+        // handoff leg hiccups. Leave the target unblocked and let the merge
+        // gate (which cannot be reached without the brain) do its job.
+        if (active) setDockHandoffs(null);
+      });
+    return () => {
+      active = false;
+    };
+    // Re-read when the dispatch changes too: a second run on the same task
+    // wraps again, and the newest packet is the one the button must obey.
+  }, [dockShipTaskId, dockReviewJob?.id, dockReviewJob?.status]);
+
   // "Land this work" (Changes panel): the governed desktop `muon ship`.
   // Everything here is a fact the dock already holds — the shown job, the tree
   // its review was READ FROM, and the lane that ran it (lane keys are vendor
   // ids, so `job.vendor` is the same author `muon ship --lane` would name).
-  const dockShipTarget: ShipTarget | null = dockReviewJob
-    ? {
-        jobId: dockReviewJob.id,
-        taskId: dockReviewJob.taskId ?? null,
-        laneKey: dockReviewJob.vendor ?? null,
-        status: dockReviewJob.status ?? "",
-        tree:
-          // The truthiness guard is deliberate: a review from an older main
-          // carries no `tree`, and "which tree is this" must then read as
-          // unknown — never crash, never assume the canonical checkout.
-          dockWorkspaceReview?.status === "available" && dockWorkspaceReview.tree
-            ? {
-                status: "resolved",
-                kind: dockWorkspaceReview.tree.kind,
-                path: dockWorkspaceReview.tree.path,
-              }
-            : dockWorkspaceReview?.status === "degraded"
-              ? {
-                  status: "unresolved",
-                  reason: dockWorkspaceReview.reason,
-                  action: dockWorkspaceReview.action,
-                }
-              : {
-                  status: "unresolved",
-                  reason: "This dispatch's tree has not been read yet.",
-                  action: "Landing unlocks once the workspace review loads.",
-                },
-        fullAuto: state?.fullAuto ?? false,
-      }
-    : null;
+  const dockShipTarget: ShipTarget | null = buildDockShipTarget({
+    job: dockReviewJob,
+    review: dockWorkspaceReview,
+    fullAuto: state?.fullAuto ?? false,
+    // Only THIS task's packets may speak for this task.
+    handoffs:
+      dockHandoffs && dockHandoffs.taskId === dockShipTaskId
+        ? dockHandoffs.items
+        : null,
+  });
   // jobId → the merge gate this window filed for it. Kept OUTSIDE the panel so
   // a decided outcome (below) can be matched back after tab switches.
   const [shipFiledByJob, setShipFiledByJob] = useState<Record<string, string>>(
@@ -2445,6 +2645,205 @@ export function App() {
     dockShipApprovalId && dockShipMerge
       ? { approvalId: dockShipApprovalId, pending: false, merge: dockShipMerge }
       : null;
+
+  // H3 — the merge gate the dock may decide: the PENDING `merge` approval filed
+  // against the very task whose tree the Changes tab is showing. Anything else
+  // (another task's gate, a decided one) is not this screen's decision to make.
+  //
+  // Read from `chatScope.approvals`, NOT the machine-wide list: the dock's
+  // "open evidence" route focuses the approval, and the dialog that route
+  // opens resolves the id out of the chat scope. A gate outside it would give
+  // the operator a button that opens nothing — so a gate this window cannot
+  // fully serve is not offered here at all.
+  const dockMergeApproval =
+    dockShipTaskId === null
+      ? null
+      : (chatScope.approvals.find(
+          (approval) =>
+            approval.kind === "merge" &&
+            approval.taskId === dockShipTaskId &&
+            approval.status === "pending"
+        ) ?? null);
+  const dockMerge: DockMergeProps | undefined = dockMergeApproval
+    ? {
+        approval: dockMergeApproval,
+        // The SAME certification leg the modal loads from; `undefined` on an
+        // older preload, which the section reports rather than failing open.
+        loadCertification:
+          typeof window.muon?.reviewApproval === "function"
+            ? (approvalId) => window.muon.reviewApproval(approvalId)
+            : undefined,
+        // The ONE governed resolve — it still runs the fail-closed ship gate
+        // before it sends, and throws the refusal the dock then renders.
+        onResolve: (approvalId, status) =>
+          onResolveApproval(approvalId, status),
+        // The REVIEW BLIND attestation stays modal-only. Focusing the approval
+        // opens the dialog through the existing effect (which also pulls the
+        // dock to its Review tab), so there is exactly one attestation surface.
+        onOpenEvidence: (approvalId) => setFocusedApprovalId(approvalId),
+        autoApproving:
+          (state?.fullAutoVendors?.length ?? 0) > 0 &&
+          (state?.fullAutoCoveredApprovalIds ?? []).includes(
+            dockMergeApproval.id
+          ) &&
+          !(state?.fullAutoUncoveredApprovalIds ?? []).includes(
+            dockMergeApproval.id
+          ),
+      }
+    : undefined;
+
+  // H12 — the lanes "Continue on <lane>" may offer.
+  //
+  // The dispatch-ready set is read from the state snapshot's OWN capability
+  // preflight, which is the same `buildCapabilityPreflight` derivation main
+  // uses to answer the gesture. Deriving it a second way here is how a button
+  // appears for a lane that always refuses (or fails to appear for one that
+  // would have run). When the probe could not answer at all
+  // (`source: "unavailable"`), the registry's execution lanes are listed
+  // instead and the section SAYS so — MUON re-checks on the press, and the
+  // dispatch route is the authority either way.
+  //
+  // "Not loaded yet" is NOT "could not check" (adversarial review, 2026-08-17):
+  // the first paints have no `state` at all, and saying "readiness could not be
+  // checked" there is a claim about the machine MUON has not made yet. Only a
+  // preflight that ARRIVED and reported `source: "unavailable"` earns that line.
+  const continueLaneReadiness = state?.preflight?.readiness;
+  const continueLaneReadinessUnknown =
+    continueLaneReadiness !== undefined &&
+    continueLaneReadiness.source !== "backend";
+  const continueLaneVendors =
+    continueLaneReadiness?.source === "backend"
+      ? continueLaneReadiness.readyVendors
+      : EXECUTION_LANES;
+  const onContinueOnLane = useCallback(
+    async (vendor: string) => {
+      if (!dockReviewTaskId) {
+        return {
+          ok: false as const,
+          reason:
+            "This dock is not showing a mission task yet, so there is nothing to continue.",
+        };
+      }
+      const call = window.muon?.continueOnLane;
+      if (typeof call !== "function") {
+        return {
+          ok: false as const,
+          reason:
+            "This build cannot continue a mission on another lane. Restart MUON; if it persists, update the app.",
+        };
+      }
+      const outcome = await call({
+        taskId: dockReviewTaskId,
+        ...(effectiveChatId ? { chatId: effectiveChatId } : {}),
+        vendor,
+      });
+      if (outcome.ok) {
+        // The successor is a real dispatch: pull it onto the desk now rather
+        // than waiting for the next poll.
+        void storeRef.current?.tick();
+      }
+      return outcome;
+    },
+    [dockReviewTaskId, effectiveChatId]
+  );
+  const continueOnLane: ContinueOnLaneProps | undefined = dockReviewTaskId
+    ? {
+        taskId: dockReviewTaskId,
+        currentVendor: dockReviewJob?.vendor ?? null,
+        vendors: continueLaneVendors,
+        laneLabel: (vendor) => vendorLabel(vendor as VendorId),
+        slugOf: sessionSlug,
+        readinessUnknown: continueLaneReadinessUnknown,
+        onContinue: onContinueOnLane,
+      }
+    : undefined;
+
+  // ADR-0044/0071 — the fork gesture, on the step the dock is reviewing.
+  // Offered only for a SETTLED job (done/failed/interrupted): a live step is
+  // not a recorded one, and the route would refuse it in those words anyway —
+  // this filter just keeps the dead gesture off the screen. Whether the job is
+  // the task's LATEST settled step stays the server's call; its refusal
+  // renders verbatim in the section.
+  const dockForkSourceJobId =
+    dockReviewJob &&
+    (dockReviewJob.status === "done" ||
+      dockReviewJob.status === "failed" ||
+      dockReviewJob.status === "interrupted")
+      ? dockReviewJob.id
+      : null;
+  const onForkMission = useCallback(
+    async (input: { vendor: string; brief: string; title?: string }) => {
+      if (!dockForkSourceJobId) {
+        return {
+          ok: false as const,
+          reason:
+            "This dock is not showing a settled step, so there is nothing to fork.",
+        };
+      }
+      const call = window.muon?.forkMission;
+      if (typeof call !== "function") {
+        return {
+          ok: false as const,
+          reason:
+            "This build cannot fork a mission. Restart MUON; if it persists, update the app.",
+        };
+      }
+      const outcome = await call({
+        sourceJobId: dockForkSourceJobId,
+        ...input,
+      });
+      if (outcome.ok) {
+        // The fork's root is a real dispatch and its chat is a real mission:
+        // pull both onto the desk now rather than waiting for the next poll.
+        void storeRef.current?.tick();
+      }
+      return outcome;
+    },
+    [dockForkSourceJobId]
+  );
+  const forkMission: ForkMissionProps | undefined = dockForkSourceJobId
+    ? {
+        sourceJobId: dockForkSourceJobId,
+        sourceVendor: dockReviewJob?.vendor ?? null,
+        vendors: continueLaneVendors,
+        laneLabel: (vendor) => vendorLabel(vendor as VendorId),
+        slugOf: sessionSlug,
+        readinessUnknown: continueLaneReadinessUnknown,
+        onFork: onForkMission,
+      }
+    : undefined;
+
+  // H1 — the review thread this dock is bound to. A TASK when the dock has one,
+  // because that is the exact thread a merge decision belongs to; otherwise the
+  // chat, so a mission that has not dispatched yet still gets a bounded digest
+  // rather than a blank strip.
+  const reviewLookTarget: ReviewThreadTarget | null = useMemo(
+    () =>
+      dockReviewTaskId
+        ? { targetKind: "task", targetId: dockReviewTaskId }
+        : effectiveChatId
+          ? { targetKind: "chat", targetId: effectiveChatId }
+          : null,
+    [dockReviewTaskId, effectiveChatId]
+  );
+  // Stable identities: the strip re-reads whenever `read` changes, and an
+  // inline arrow would make every App render look like a new review thread.
+  // `undefined` on an older preload, which the strip reports as a build
+  // limitation instead of rendering a false "nothing changed".
+  const reviewThreadRead = useMemo(
+    () =>
+      typeof window.muon?.reviewThread === "function"
+        ? (input: ReviewThreadTarget) => window.muon.reviewThread(input)
+        : undefined,
+    []
+  );
+  const advanceReviewLook = useMemo(
+    () =>
+      typeof window.muon?.advanceReviewLook === "function"
+        ? (input: ReviewThreadTarget) => window.muon.advanceReviewLook(input)
+        : undefined,
+    []
+  );
 
   const onCreateGitHubPullRequest = useCallback(async () => {
     if (!dockReviewJob) {
@@ -2577,6 +2976,12 @@ export function App() {
     auditEvents: chatScope.auditEvents,
     receipts: state?.activeReceipts,
     workspaceReview: dockWorkspaceReview,
+    // H15 — blocking questions are part of "what needs you". They are counted
+    // and named here; they are ANSWERED in QuestionsInbox, which is the only
+    // surface with an answer control (answering confers no authority).
+    questions: chatQuestions,
+    questionsUnavailable: state?.questionsUnavailable ?? false,
+    onFocusQuestions,
     focusApprovalId: focusedApprovalId,
     onReviewApproval: (approvalId) => {
       setFocusedApprovalId(approvalId);
@@ -2616,10 +3021,17 @@ export function App() {
           </p>
           <GitHubConnectPanel
             status={(state.github ?? null) as GitHubConnectionStatus | null}
+            gateLocked
             onStart={onStartGitHub}
             onPoll={onPollGitHub}
             onDisconnect={onDisconnectGitHub}
             onOpenUrl={onOpenGitHubUrl}
+            {...(state.githubGate.recordDisclosure
+              ? { gateRecordDisclosure: state.githubGate.recordDisclosure }
+              : {})}
+            {...(state.githubGate.registration
+              ? { gateRegistration: state.githubGate.registration }
+              : {})}
           />
           <p className="github-gate-note">
             While locked, observation, stops, approvals, and updates stay
@@ -3220,6 +3632,14 @@ export function App() {
                           mcpAttachedByVendor={mcpAttachedByVendor}
                           onAttachMcp={onAttachMcp}
                           onDetachMcp={onDetachMcp}
+                          cliLinkStatus={cliLinkStatus}
+                          cliLinkStatusLoading={cliLinkStatusLoading}
+                          cliLinkStatusError={cliLinkStatusError}
+                          onRefreshCliLinkStatus={() =>
+                            void onRefreshCliLinkStatus()
+                          }
+                          onCliLink={onCliLink}
+                          onCliUnlink={onCliUnlink}
                         />
                       );
                     default: {
@@ -3556,6 +3976,12 @@ export function App() {
                     // tab; "Review & decide" opens the same governed dialog the rail
                     // uses (focusApprovalId), never a second resolve path.
                     approvals={chatScope.approvals}
+                    // H6: the DECIDED tail, machine-wide and bounded — the
+                    // header filters it to this pane's own task. Not chat-
+                    // scoped here on purpose: `chatScope` is built from the
+                    // PENDING list, and a decided gate must still be nameable
+                    // after the thing that made it chat-visible has finished.
+                    decidedApprovals={state?.decidedApprovals ?? []}
                     // P0-1: with standing consent on, a gate MUON is about to
                     // grant must not wear the fail-closed "you are blocking me"
                     // copy — and the reverse: only an id main's approver tick
@@ -3650,6 +4076,12 @@ export function App() {
               mcpAttachedByVendor={mcpAttachedByVendor}
               onAttachMcp={onAttachMcp}
               onDetachMcp={onDetachMcp}
+              cliLinkStatus={cliLinkStatus}
+              cliLinkStatusLoading={cliLinkStatusLoading}
+              cliLinkStatusError={cliLinkStatusError}
+              onRefreshCliLinkStatus={() => void onRefreshCliLinkStatus()}
+              onCliLink={onCliLink}
+              onCliUnlink={onCliUnlink}
             />
           </div>
         ) : (
@@ -3725,6 +4157,17 @@ export function App() {
               onShip: onShipDispatch,
               outcome: dockShipOutcome,
             }}
+            merge={dockMerge}
+            continueOnLane={continueOnLane}
+            forkMission={forkMission}
+            reviewDigest={
+              <ReviewDigestStrip
+                target={reviewLookTarget}
+                read={reviewThreadRead}
+                advance={advanceReviewLook}
+                refreshKey={reviewLookVersion}
+              />
+            }
             reviewLocked={Boolean(focusedApproval)}
             githubConnected={state?.github?.connected ?? false}
             githubPublicationKey={dockReviewJob?.id}

@@ -42,11 +42,21 @@ export type ProcessStepRow = {
   entryPointId?: string;
 };
 
-/** Whether the graph's indexed commit is behind the diff's HEAD. */
+/**
+ * Whether the graph's indexed commit is behind the diff's HEAD.
+ *
+ * THREE-STATE, and the third state is the point: `true` = provably behind,
+ * `false` = provably current, `null`/absent = COULD NOT BE MEASURED (the store's
+ * indexed commit or the diff's own commit was unreadable). A required boolean
+ * forced every producer to spell an unmeasurable index as `false`, i.e. as
+ * "verified current" — so a graph nobody could read scored as a completed look,
+ * and `ship` hung a merge gate off it. Absence of evidence gets its own value
+ * here rather than borrowing the confident one.
+ */
 export type IndexFreshness = {
   graphCommit?: string;
   headCommit?: string;
-  stale: boolean;
+  stale?: boolean | null;
 };
 
 export type DiffImpactInput = {
@@ -215,16 +225,33 @@ export function buildDiffImpact(input: DiffImpactInput): DiffImpact {
   if (changedPaths.length === 0) {
     verdict = "no-op";
     notes.push("No changed files — nothing to review.");
-  } else if (blindFiles.length > 0 || stale) {
+    // `stale !== false` and not `stale === true`: unmeasured is not a pass. The
+    // only way to earn `flows-resolved` is a freshness reading that came back
+    // provably current.
+  } else if (blindFiles.length > 0 || stale !== false) {
     verdict = "review-blind";
     if (blindFiles.length > 0) {
       notes.push(
         `REVIEW BLIND: ${blindFiles.length}/${changedPaths.length} changed file(s) are not in the graph (new or unindexed) — the affected-flow evidence is INCOMPLETE. Review these files manually; do NOT read "0 processes affected" as an all-clear.`
       );
     }
-    if (stale) {
+    if (stale === true) {
       notes.push(
         `Index is STALE (graph at ${input.indexFreshness.graphCommit ?? "unknown"}, diff at ${input.indexFreshness.headCommit ?? "HEAD"}) — re-index before trusting the flow evidence.`
+      );
+    } else if (stale !== false) {
+      // NOT the STALE sentence: that one quotes two commits, and here at least
+      // one of them is exactly what could not be read. Naming which half is
+      // missing is what makes this actionable rather than ominous.
+      const missing =
+        input.indexFreshness.graphCommit === undefined &&
+        input.indexFreshness.headCommit === undefined
+          ? "neither the graph's indexed commit nor the diff's commit could be read"
+          : input.indexFreshness.graphCommit === undefined
+            ? "the graph's indexed commit could not be read"
+            : "the diff's commit could not be read";
+      notes.push(
+        `Index freshness UNKNOWN — ${missing}, so this review cannot tell a current graph from a stale one. Treat the flow evidence as incomplete: re-index (\`muon graph reindex\`), or wait for a rebuild already in flight rather than starting a second one.`
       );
     }
   } else {

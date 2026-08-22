@@ -1,9 +1,13 @@
 import type {
+  ApprovalGrant,
   GitHubConnectionStatus,
   GitHubDeviceFlowStart,
 } from "@muon/client";
 import type { VendorId } from "@muon/client/vendors";
 import type {
+  CliLinkResult,
+  CliLinkStatusReport,
+  CliUnlinkResult,
   DesktopState,
   GitHubDeviceFlowUiPoll,
   McpAttachResult,
@@ -17,8 +21,10 @@ import { useState } from "react";
 import { DiagnosticsStrip } from "./cockpit.js";
 import type { AutonomyCommitment } from "@muon/client/autonomy-commitments";
 import { CommitmentsPanel } from "./commitments-panel.js";
+import { ApprovalGrantsPanel } from "./approval-grants-panel.js";
 import {
   AutoContinuePanel,
+  CliLinkPanel,
   GitHubConnectPanel,
   McpConnectionsPanel,
   PortPreviewPanel,
@@ -51,6 +57,12 @@ export function SettingsPanel(props: {
   /** P0-5: local diagnostics recording consent (no egress exists). */
   onToggleTelemetry?: (enabled: boolean) => void;
   onTogglePortPreview?: (enabled: boolean) => void;
+  /** ADR-0056 D8.1 — injectable for tests; production falls through to the
+   *  preload bridge so neither SettingsPanel call site has to thread them. */
+  onListGrants?: (filter?: {
+    activeOnly?: boolean;
+  }) => Promise<ApprovalGrant[]>;
+  onRevokeGrant?: (grantId: string) => Promise<ApprovalGrant>;
   /** TODO 5.17: pause a listed autonomy commitment without deleting it. */
   onPauseCommitment?: (commitment: AutonomyCommitment) => Promise<void>;
   /** P9: resume a paused loop dispatch from Orchestration. */
@@ -87,6 +99,17 @@ export function SettingsPanel(props: {
   >;
   onAttachMcp?: (vendor: VendorId) => Promise<McpAttachResult>;
   onDetachMcp?: (vendor: VendorId) => Promise<McpDetachResult>;
+  /**
+   * Settings -> Command Line Tools. Same optionality contract as the
+   * Connections trio above: an older render/test that omits these still
+   * mounts, showing the panel's "Not checked yet" state.
+   */
+  cliLinkStatus?: CliLinkStatusReport | null;
+  cliLinkStatusLoading?: boolean;
+  cliLinkStatusError?: string | null;
+  onRefreshCliLinkStatus?: () => void;
+  onCliLink?: () => Promise<CliLinkResult>;
+  onCliUnlink?: () => Promise<CliUnlinkResult>;
 }) {
   return (
     <div className="settings-workspace">
@@ -117,12 +140,22 @@ export function SettingsPanel(props: {
         <div className="side-heading">
           <span>GitHub</span>
         </div>
+        {/* ADR-0052 — the SAME disclosure the gate screen carries. Connecting
+            from Settings is the same act and files the same record, so the
+            sentence has to be here too; a review found this path registering an
+            install with nothing on screen naming it. */}
         <GitHubConnectPanel
           status={(props.state?.github ?? null) as GitHubConnectionStatus | null}
           onStart={props.onStartGitHub}
           onPoll={props.onPollGitHub}
           onDisconnect={props.onDisconnectGitHub}
           onOpenUrl={props.onOpenGitHubUrl}
+          {...(props.state?.githubGate?.recordDisclosure
+            ? { gateRecordDisclosure: props.state.githubGate.recordDisclosure }
+            : {})}
+          {...(props.state?.githubGate?.registration
+            ? { gateRegistration: props.state.githubGate.registration }
+            : {})}
         />
       </section>
 
@@ -160,6 +193,36 @@ export function SettingsPanel(props: {
         />
       </section>
 
+      {/* Founder request, 2026-08-17 — the DMG side of curl<->desktop parity:
+          the app carries muon/muon-tui/muon-mcp, this is the affordance that
+          links them onto PATH. Sits right after Connections: both are "what
+          this install exposes to a terminal you drive", one quiet row each. */}
+      <section className="side-section" id="settings-cli-tools">
+        <div className="side-heading">
+          <span>Command Line Tools</span>
+        </div>
+        <CliLinkPanel
+          status={props.cliLinkStatus ?? null}
+          loading={props.cliLinkStatusLoading ?? false}
+          error={props.cliLinkStatusError ?? null}
+          onRefresh={() => props.onRefreshCliLinkStatus?.()}
+          onLink={() =>
+            props.onCliLink
+              ? props.onCliLink()
+              : Promise.reject(
+                  new Error("Linking is unavailable. Restart MUON; if it persists, reinstall.")
+                )
+          }
+          onUnlink={() =>
+            props.onCliUnlink
+              ? props.onCliUnlink()
+              : Promise.reject(
+                  new Error("Unlinking is unavailable. Restart MUON; if it persists, reinstall.")
+                )
+          }
+        />
+      </section>
+
       <section className="side-section" id="settings-orchestration">
         <div className="side-heading">
           <span>Orchestration</span>
@@ -183,7 +246,7 @@ export function SettingsPanel(props: {
             consent-gated PostHog US uploader — this comment used to say "no
             uploader exists" eighteen lines above the copy that correctly names
             it), and the spool holds only closed-vocabulary events. Deliberately NOT the
-            `.full-auto-toggle` idiom (armed = red, "this disables a gate") —
+            `.full-auto-btn` idiom (armed = red, "this disables a gate") —
             it reads as the quiet checkbox its two neighbours use, because
             recording a launch code disables nothing. */}
         <div className="updates-panel">
@@ -195,14 +258,18 @@ export function SettingsPanel(props: {
               }
               type="checkbox"
             />
-            Share anonymous diagnostics (launch, crash codes, milestones)
+            Share anonymous usage (launches, crash codes, milestones, sign-in
+            gate outcomes, MUON tool-call counts)
           </label>
           <div className="update-note">
             Off by default. When on: the same closed-vocabulary events written
             to this profile&apos;s local spool are also sent to PostHog (US)
             under a random per-consent id — never a name, email, path, prompt,
-            or repo. Turning it off stops uploads immediately and discards the
-            id.
+            repo, or IP. This one switch covers every MUON surface on this
+            machine: the app, the <code>muon</code> CLI, and the MCP server
+            your coding agents attach to (which records which MUON tools were
+            called and how they ended — never their arguments or results).
+            Turning it off stops uploads immediately and discards the id.
           </div>
           <ObservatorySummaryBlock />
         </div>
@@ -228,6 +295,17 @@ export function SettingsPanel(props: {
           onSave={props.onSaveSettings}
         />
       </section>
+
+      <ApprovalGrantsPanel
+        listGrants={
+          props.onListGrants ??
+          ((filter) => window.muon.listApprovalGrants(filter))
+        }
+        revokeGrant={
+          props.onRevokeGrant ??
+          ((grantId) => window.muon.revokeApprovalGrant(grantId))
+        }
+      />
 
       <section className="side-section">
         <div className="side-heading">
@@ -255,6 +333,9 @@ function ObservatorySummaryBlock() {
     crashes: Record<string, number>;
     updateChecks: number;
     updatesApplied: number;
+    gatePassed: number;
+    gateRefused: number;
+    mcpToolCalls: number;
     consentGrantedAt?: string;
     funnel: Record<string, string | undefined>;
     spoolBytes: number;
@@ -287,6 +368,13 @@ function ObservatorySummaryBlock() {
           <div>
             Launches {summary.launches} · crashes {crashCount} · update checks{" "}
             {summary.updateChecks} · updates applied {summary.updatesApplied}
+          </div>
+          <div>
+            {/* ADR-0095: the audit view counts EVERYTHING the spool holds —
+                a summary that under-reports is the audit lying. */}
+            Gate passed {summary.gatePassed ?? 0} · gate refused{" "}
+            {summary.gateRefused ?? 0} · MUON tool calls{" "}
+            {summary.mcpToolCalls ?? 0}
           </div>
           <div>
             First chat {day(summary.funnel.first_chat)} · first dispatch{" "}

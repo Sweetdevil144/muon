@@ -18,6 +18,12 @@ import { GRAPH_MIRROR_FAILED_EVENT_KIND } from "@muon/client";
 import { describeSandboxAvailability } from "@muon/adapters";
 import {
   MuonApiClient,
+  booleanEnvFlag,
+  // ADR-0056: the ONE place a governed approval decision's payload is built.
+  // Main used to hand-assemble `{ decisionNotes: "decided from MUON desktop" }`
+  // per branch; the graded opt-in adds a third branch, and a third hand-built
+  // dialect is how the attribution sentence (and now the grade) drifts.
+  buildApprovalDecision,
   buildCapabilityPreflight,
   buildRedispatchInput,
   classifyVendorFailure,
@@ -31,6 +37,7 @@ import {
   type DispatchJobRecord,
   type GitHubConnectionStatus,
   type GitHubCredential,
+  type ApprovalGrantDuration,
   type ManualReviewAttestation,
   type PreflightSupervisorEvidence,
   type ReviewCoverageCertification,
@@ -65,6 +72,15 @@ import {
   readMcpStatus,
   probeMcpServer,
 } from "./lib/mcp-bridge.js";
+// Settings -> Command Line Tools (founder request, 2026-08-17): the DMG-side
+// half of curl<->desktop parity. Same shape as the MCP bridge above — the
+// decision lives in ./lib, this file only supplies the real io.
+import {
+  applyCliLink,
+  applyCliUnlink,
+  defaultCliLinkIo,
+  readCliLinkStatus,
+} from "./lib/cli-link-bridge.js";
 import {
   loadMemoryLibrary,
   type MemoryLibraryQuery,
@@ -73,6 +89,7 @@ import {
   createApprovalsMonitor,
   decideApproval,
   mergeOutcomesSnapshot,
+  onMergeLanded,
   recordMergeOutcome,
   type MonitorState,
 } from "./lib/approvals-monitor.js";
@@ -172,6 +189,36 @@ import {
   installGitHubIpcGate,
   type GitHubGateState,
 } from "./lib/github-gate.js";
+// ADR-0052 — the install record. Registration only; the desktop's arming and
+// satisfaction rules stay in github-gate.ts where they already were.
+import {
+  desktopGateActive,
+  desktopInstallGrantPresent,
+  ensureDesktopInstallRegistered,
+  guardDesktopRegistration,
+  shouldRetryRegistration,
+} from "./lib/install-registration.js";
+// ADR-0052 — one sign-in per machine: adopt the shared credential `muon login`
+// writes, so a CLI sign-in unlocks the desktop too (founder bug, 2026-08-19).
+import { adoptableSharedCredential } from "./lib/adopt-identity.js";
+// Update-all (founder, 2026-08-19): an app update refreshes the machine's
+// npm-global CLI so no surface ages out of step with the embedded brain.
+import {
+  cliRefreshPlan,
+  readGlobalCliVersion,
+  resolveNpmGlobalRootAsync,
+  runCliRefresh,
+} from "./lib/cli-refresh.js";
+// The disclosure sentence has exactly one author (@muon/client). Composed here,
+// in main, because the renderer is a browser bundle and that module reaches
+// node:fs — the same boundary readMcpStatus and the probe refusal already use.
+import {
+  clearIdentityCredential,
+  githubIdentityGateDoorMissing,
+  githubIdentityGateDoorMissingWarning,
+  installRecordDisclosure,
+  readIdentityCredential,
+} from "@muon/client/github-identity-gate";
 import {
   hydrateBakedEnv,
   readBakedBuildConfig,
@@ -188,12 +235,14 @@ import {
 } from "./lib/observatory-upload.js";
 import {
   FULL_AUTO_SELECTABLE_VENDORS,
+  decideBrainCoordsApply,
   isGlobalStandingConsent,
   loadSettings,
   normalizeFullAutoVendors,
   persistableSettings,
   saveSettings as persistSettings,
   toRendererSettings,
+  trySaveSettings,
   type DesktopSettings,
 } from "./lib/settings.js";
 import {
@@ -253,14 +302,22 @@ import {
   resolveJobTree,
   type JobTreeDependencies,
 } from "./lib/job-tree.js";
+import { continueOnLane } from "./lib/continue-on-lane.js";
+import { forkMissionFromStep } from "./lib/fork-mission.js";
+import { resolveReviewThreadTarget } from "./lib/review-thread-scope.js";
 import { loadCoordination, loadCrewRoles } from "./lib/crew-topology.js";
 import { loadReconMap } from "./lib/recon-map.js";
 import { loadDataBoundaries } from "./lib/data-boundaries.js";
 import type {
   TaskHandoffPage,
+  ContinueOnLaneResult,
+  ForkMissionResult,
+  ReviewThreadDigest,
+  ReviewThreadTarget,
   MissionCapState,
   McpProbeReport,
   MemoryGovernanceState,
+  MemoryColdStartState,
   ApplyDesktopPresetResult,
   DesktopState,
   FirstTaskResult,
@@ -291,6 +348,9 @@ import type {
   McpDetachResult,
   McpInstallReport,
   McpStatusReport,
+  CliLinkResult,
+  CliLinkStatusReport,
+  CliUnlinkResult,
 } from "./shared/ipc.js";
 
 // MUON desktop: a real windowed app (chat + fleet + agent panes) with the
@@ -615,6 +675,31 @@ function ensureGitNexusIndex(): GitNexusIndexSupervisor {
   return gitnexusIndex;
 }
 
+// ADR-0054 — the post-merge catch-up, wired where the DESKTOP observes the
+// landing, never inside the governed route.
+//
+// The backend has no event bus and the merge is executed in another OS process,
+// so nothing pushes the fact here. What main does hold, synchronously and with
+// the sha in hand, is the resolve response — and `recordMergeOutcome` is the one
+// funnel every resolve path already flows through. Registered once here so the
+// governed route stays a governed route: the merge's own transaction, audit
+// event and response are untouched, and a code-graph catch-up can never delay
+// or fail a gate decision.
+//
+// Best-effort by construction: no await, no throw, no spawn of its own. If no
+// workspace is bound (nothing to catch up) it does nothing at all.
+onMergeLanded(() => {
+  try {
+    gitnexusIndex?.catchUpAfterMerge();
+  } catch (error) {
+    console.warn(
+      `[gitnexus] post-merge catch-up skipped: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+});
+
 /** Point the index at a workspace (never throws). */
 function bindWorkspace(workspacePath: string | null | undefined): void {
   if (isQuitting) return;
@@ -651,6 +736,16 @@ let mainWindow: BrowserWindow | null = null;
 let ipcHandlersRegistered = false;
 let tray: Tray | null = null;
 let monitorState: MonitorState = { online: false, pending: [], lastError: null };
+/**
+ * The supervisor's own reason the brain is not there, when it has one.
+ *
+ * A brain that never becomes ready leaves the approvals poll failing with
+ * "fetch failed" — true, and useless. This is the one place that has the real
+ * story, so it replaces that message on the two surfaces already built to show
+ * it (the tray's brain line and the renderer's offline banner). Cleared the
+ * moment any coordinates arrive.
+ */
+let brainUnavailableNotice: string | null = null;
 
 // Full-Auto standing consent: ids currently being auto-resolved, so overlapping
 // poll cycles never double-resolve the same approval. Inert when fullAuto is OFF
@@ -803,6 +898,17 @@ const LIVE_STATUS_RESULT_CHARS = 8_192;
  */
 const MEMORY_NEIGHBORS_HOPS = 1;
 const MEMORY_NEIGHBORS_LIMIT = 24;
+
+/**
+ * H6 — how much DECIDED gate history rides in the state snapshot.
+ *
+ * The header asks one question ("what did the last gate on this task
+ * conclude?"), so this only has to be deep enough that a task's newest decision
+ * survives a busy machine's other missions. It is a WINDOW, not a history: an
+ * id absent from it means "not decided recently", never "never decided", and
+ * the header simply omits the line rather than asserting the negative.
+ */
+const DECIDED_APPROVAL_WINDOW = 20;
 
 function relayStatusDetail(
   detail: LiveStatusDetail | undefined
@@ -1127,6 +1233,32 @@ function persistUserSettings(): void {
   );
 }
 
+/**
+ * The same persist, for a caller a FAILURE MUST NOT KILL.
+ *
+ * `persistUserSettings` deliberately still throws: every one of its IPC callers
+ * is a human pressing Save, and an invoke that rejects is how the renderer tells
+ * them the save did not happen. A BACKGROUND persist has no such reader —
+ * `applyBrainCoords` runs off a supervisor callback nobody clicked, its writer is
+ * synchronous (`writeFileSync` + `chmodSync`), and the throw travelled up a
+ * `void`ed async call into an unhandled rejection. With no `unhandledRejection`
+ * handler in this app that exits main, so an unwritable settings.json (ENOSPC, a
+ * root-owned file) took the window and every runner-hosted vendor session down
+ * with it. Reported loudly here, and the rest of the fan-out still runs.
+ */
+function persistUserSettingsBestEffort(context: string): boolean {
+  return trySaveSettings(
+    app.getPath("userData"),
+    persistableSettings(settings, userApiToken),
+    (reason) =>
+      console.error(
+        `[settings] could not persist settings (${context}): ${safeLine(
+          reason
+        )} — MUON keeps running on the coordinates it just adopted; this launch's change will not survive a restart.`
+      )
+  );
+}
+
 function storedGitHubStatus(): GitHubConnectionStatus {
   const credential = settings.githubCredential;
   const now = Date.now();
@@ -1155,8 +1287,16 @@ function persistGitHubCredential(credential: GitHubCredential): void {
   persistUserSettings();
   // The job monitor snapshots autoContinueEnabled at build time; crossing the
   // gate boundary must rebuild it so auto-continue resumes/stops accordingly.
-  if (wasGated && !githubGateActive() && jobMonitor) {
-    restartJobMonitor();
+  if (wasGated && !githubGateActive()) {
+    // ADR-0095 — the human just passed the gate mid-run (sign-in completed).
+    observatory?.record({
+      name: "identity.gate_passed",
+      surface: "desktop",
+      trigger: "signin",
+    });
+    if (jobMonitor) {
+      restartJobMonitor();
+    }
   }
 }
 
@@ -1171,15 +1311,283 @@ const githubGateIsRequired = githubGateRequired({
   isPackaged: app.isPackaged,
 });
 
+// ADR-0052 — only an EXPLICITLY FORCED gate also demands the registry grant.
+// The packaged desktop keeps credential-only satisfaction on purpose: an
+// installed base that is already signed in must not lock itself out because a
+// central service is unreachable. See lib/install-registration.ts for the full
+// reasoning; the CLI and muon-mcp take the hard form.
+const githubGateForcesGrant =
+  booleanEnvFlag(process.env.MUON_REQUIRE_GITHUB_LOGIN) === true;
+
+// The SAME policy, moved into lib/install-registration.ts so it can be tested as
+// a truth table instead of asserted about by grepping this file. Signature and
+// semantics unchanged — `grantPresent` stays a thunk, so the grant file is still
+// read only when the answer depends on it (this runs on every IPC call).
 function githubGateActive(): boolean {
-  return githubGateIsRequired && !settings.githubCredential;
+  return desktopGateActive({
+    required: githubGateIsRequired,
+    forcesGrant: githubGateForcesGrant,
+    hasCredential: Boolean(settings.githubCredential),
+    grantPresent: () => desktopInstallGrantPresent(desktopDataDir()),
+  });
+}
+
+/**
+ * ADR-0052 — adopt the credential `muon login` left for this machine.
+ *
+ * Founder bug (2026-08-19): `muon login` verified the identity, registered the
+ * install, wrote the shared `github-identity.json` — and the desktop still
+ * demanded a sign-in, while its gate screen showed the LIVE brain as
+ * "Connected". One machine, one data dir, two stores that never met. This is
+ * the missing carry: when the desktop has no credential of its own but the
+ * shared file holds a valid one, take it.
+ *
+ * Best-effort by design: it runs from the gate-state poll (so a `muon login`
+ * typed while the gate screen is up unlocks the running app on the next tick,
+ * no restart) and from boot. A failed settings persist keeps the adopted
+ * credential for this run and logs; nothing here may throw into a poll.
+ */
+function adoptSharedIdentityCredential(context: string): boolean {
+  if (!settings) return false;
+  try {
+    const adopted = adoptableSharedCredential({
+      hasSettingsCredential: Boolean(settings.githubCredential),
+      read: () => readIdentityCredential(desktopDataDir()),
+    });
+    if (!adopted) return false;
+    const wasGated = githubGateActive();
+    settings = { ...settings, githubCredential: adopted };
+    persistUserSettingsBestEffort(`adopt-shared-identity:${context}`);
+    console.log(
+      `[github-gate] adopted this machine's verified GitHub identity (${
+        adopted.login ?? "unknown login"
+      }) from \`muon login\` (${context})`
+    );
+    // Same boundary crossing persistGitHubCredential handles: leaving the
+    // gate rebuilds the job monitor so auto-continue resumes.
+    if (wasGated && !githubGateActive()) {
+      // ADR-0095 — a `muon login` in another terminal opened THIS surface.
+      observatory?.record({
+        name: "identity.gate_passed",
+        surface: "desktop",
+        trigger: "signin",
+      });
+      if (jobMonitor) {
+        restartJobMonitor();
+      }
+    }
+    return true;
+  } catch (error) {
+    console.error(
+      `[github-gate] could not adopt the shared identity credential: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return false;
+  }
 }
 
 function githubGateState(): GitHubGateState {
+  // While LOCKED, every state poll first checks whether `muon login` has opened
+  // this machine since the last tick. Only while locked — one boolean guard —
+  // so the steady state costs nothing and disconnect is never fought: the
+  // disconnect handler clears the shared file along with settings.
+  if (githubGateIsRequired && githubGateActive()) {
+    adoptSharedIdentityCredential("gate-poll");
+  }
   return {
     required: githubGateIsRequired,
-    satisfied: Boolean(settings.githubCredential),
+    // Kept consistent with ENFORCEMENT when the gate is armed — a renderer that
+    // hid the gate screen while every IPC channel refused would be the worse
+    // failure. Unarmed, this reports exactly what it always did.
+    satisfied: githubGateIsRequired
+      ? !githubGateActive()
+      : Boolean(settings.githubCredential),
+    // ADR-0052 Decision 5 — the consent sentence, from its one author. Sent
+    // only when the gate is armed, because that is exactly when connecting
+    // GitHub files an install record (see `registerDesktopInstall`).
+    ...(githubGateIsRequired
+      ? { recordDisclosure: installRecordDisclosure({ surface: "desktop" }) }
+      : {}),
+    // ADR-0052 F3 — the deferred registration, made VISIBLE. Only when the gate
+    // is armed: an unarmed build registers nothing, and reporting a state for a
+    // record it never files would be an invented fact.
+    ...(githubGateIsRequired && installRegistration
+      ? { registration: installRegistration }
+      : {}),
   };
+}
+
+// ── ADR-0052 — the install record's own state ────────────────────────────────
+
+/**
+ * What the last registration attempt did, for the renderer.
+ *
+ * It used to be a `console.warn` and nothing else, which is the same as nothing:
+ * an operator whose first sign-in happened offline had a desktop that worked
+ * (credential-only satisfaction) and dispatched agents whose MCP sessions were
+ * locked, with no surface on the machine connecting the two facts. Undefined
+ * until an attempt has actually been made — "not yet asked" is not "deferred".
+ */
+let installRegistration: GitHubGateState["registration"];
+
+/** The bounded retry. Cleared the moment registration lands. */
+let installRegistrationTimer: ReturnType<typeof setInterval> | undefined;
+let installRegistrationAttempts = 0;
+
+/**
+ * How hard the desktop retries a deferred registration.
+ *
+ * Relaunch-only was the whole retry policy, which on a long-lived desktop means
+ * "never": the app that stays open for a week is exactly the one whose first
+ * sign-in was offline. Bounded on purpose — a 15-minute interval capped at 8
+ * tries is two hours of patience and then silence, rather than a background
+ * loop hitting a central service for the life of the process. The state stays
+ * visible in the UI after the cap, so the operator can still see it and
+ * `muon login` still fixes it.
+ */
+const INSTALL_REGISTRATION_RETRY_MS = 15 * 60_000;
+const INSTALL_REGISTRATION_MAX_ATTEMPTS = 8;
+
+/** The desktop's ledger profile — the one dir every surface reads (ADR-0050). */
+function desktopDataDir(): string {
+  return app.getPath("userData");
+}
+
+/**
+ * ADR-0052 — register this install, best effort, ONLY WHEN THE GATE IS ARMED.
+ *
+ * THE GUARD IS THE POINT, and it was missing (found by adversarial review). This
+ * fires from the device-flow handler and from boot, and neither asked whether
+ * the gate was armed at all — so:
+ *
+ *  - every developer run that connected GitHub POSTed to the central registry,
+ *    from a checkout, unasked;
+ *  - every existing installed-base credential registered RETROACTIVELY on the
+ *    first boot after this shipped, with no disclosure ever having been on the
+ *    screen that collected it;
+ *  - connecting GitHub in Settings purely for pull-request review — a feature
+ *    that has nothing to do with installs — filed an "install" record.
+ *
+ * `githubGateIsRequired` is the arming fact (ADR-0052 Decision 2: packaged, or
+ * flag-forced; dev checkouts stay out). Guarding HERE rather than at the two
+ * call sites is deliberate: a third caller cannot slip past a guard that lives
+ * inside the only function that registers. Combined with the disclosure now
+ * carried by both consent screens (the gate screen and the Settings connect
+ * panel), the rule is the simple honest one — registration only ever fires when
+ * the gate is armed, and an armed build always shows the disclosure.
+ *
+ * Idempotent: a grant for this surface AND version already on disk
+ * short-circuits before anything is sent.
+ */
+function registerDesktopInstall(credential: GitHubCredential): void {
+  // `guardDesktopRegistration` is the arming guard as a tested function. Silent
+  // on an unarmed build on purpose: a dev run is not a defect.
+  if (
+    !guardDesktopRegistration({
+      gateArmed: githubGateIsRequired,
+      hasCredential: Boolean(credential.accessToken),
+    }).proceed
+  ) {
+    return;
+  }
+  installRegistrationAttempts += 1;
+  void ensureDesktopInstallRegistered({
+    token: credential.accessToken,
+    version: app.getVersion(),
+    dataDir: desktopDataDir(),
+    // The CONNECTED login, so a second GitHub account registers as itself rather
+    // than inheriting the first account's grant (ADR-0052 F5, second pass).
+    ...(credential.login ? { login: credential.login } : {}),
+  })
+    .then((outcome) => {
+      if (outcome.state === "registered" || outcome.state === "already") {
+        installRegistration = { state: "open" };
+        stopInstallRegistrationRetry();
+      }
+      if (outcome.state === "registered") {
+        console.log(`[install-registry] registered desktop as ${outcome.login}`);
+        // Crossing OUT of a forced gate: rebuild the auto-continue snapshot the
+        // same way persisting a credential does.
+        if (githubGateForcesGrant && jobMonitor) {
+          restartJobMonitor();
+        }
+      } else if (outcome.state === "deferred") {
+        // WHAT IS ON DISK decides the reported state, not what THIS attempt did.
+        // A deferred outcome covers two different machines: one that has never
+        // registered (genuinely waiting, and every other surface is locked), and
+        // one that is registered and was only refreshing its record after an app
+        // update. Reporting the second as `locked-unregistered` told an operator
+        // whose registry blipped during an update that the CLI and `muon-mcp`
+        // were locked while both were wide open. `desktopInstallGrantPresent` is
+        // the same live credential read `githubGateActive` decides openness with,
+        // so the renderer cannot disagree with the enforcement.
+        const registered = desktopInstallGrantPresent(desktopDataDir());
+        installRegistration = registered
+          ? { state: "open" }
+          : {
+              state: "locked-unregistered",
+              detail: outcome.reason,
+            };
+        console.warn(
+          `[install-registry] desktop registration deferred (${outcome.reason}); ${
+            registered
+              ? "this install is already registered, so nothing is locked — MUON refreshes the record by itself."
+              : "MUON retries by itself."
+          }`
+        );
+        // Retried either way: a stale record is still a record MUON owes the
+        // registry, and the retry is bounded (see INSTALL_REGISTRATION_MAX_ATTEMPTS).
+        startInstallRegistrationRetry();
+      }
+    })
+    // `ensureDesktopInstallRegistered` documents that it never throws, and this
+    // is here anyway: an unhandled rejection in main is a crash on modern node,
+    // and "documented not to throw" is a claim, not a guarantee.
+    .catch((error: unknown) => {
+      console.warn(
+        `[install-registry] registration attempt failed unexpectedly: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    });
+}
+
+/** ADR-0052 F3 — the bounded retry, so a deferred registration is not
+ *  relaunch-only on an app that stays open for a week. */
+function startInstallRegistrationRetry(): void {
+  if (installRegistrationTimer) return;
+  if (installRegistrationAttempts >= INSTALL_REGISTRATION_MAX_ATTEMPTS) return;
+  installRegistrationTimer = setInterval(() => {
+    const credential = settings.githubCredential;
+    if (
+      !credential ||
+      !shouldRetryRegistration({
+        gateArmed: githubGateIsRequired,
+        hasCredential: true,
+        attempts: installRegistrationAttempts,
+        maxAttempts: INSTALL_REGISTRATION_MAX_ATTEMPTS,
+      })
+    ) {
+      if (credential && installRegistrationAttempts >= INSTALL_REGISTRATION_MAX_ATTEMPTS) {
+        console.warn(
+          `[install-registry] giving up after ${installRegistrationAttempts} attempts; the state stays visible and \`muon login\` still fixes it.`
+        );
+      }
+      stopInstallRegistrationRetry();
+      return;
+    }
+    registerDesktopInstall(credential);
+  }, INSTALL_REGISTRATION_RETRY_MS);
+  // Never hold the process open for this: a retry timer that keeps Electron's
+  // event loop alive would outlive the window it exists for.
+  installRegistrationTimer.unref?.();
+}
+
+function stopInstallRegistrationRetry(): void {
+  if (!installRegistrationTimer) return;
+  clearInterval(installRegistrationTimer);
+  installRegistrationTimer = undefined;
 }
 
 async function syncGitHubCredential(): Promise<void> {
@@ -1223,7 +1631,8 @@ function noteHumanPresentNow(): void {
  * coordinates. Same remedy as the MCP server and for the same reason — on a
  * CONNECTION-refused failure the client re-reads the lockfile, retries once,
  * and a real move also resyncs `settings`/monitors/runner off the hot path.
- * An EXPLICIT operator-entered base opts out: the human said where to talk.
+ * An EXPLICIT operator-entered base opts out — here AND in `applyBrainCoords`,
+ * so neither producer can un-pin it: the human said where to talk.
  */
 let brainDataDir: string | null = null;
 let apiBaseExplicit = false;
@@ -1288,29 +1697,125 @@ const readinessCache: ReadinessCache = createReadinessCache({
       .catch(() => null),
 });
 
+/**
+ * H12 — the dispatch-ready lane keys, from the SAME derivation the state
+ * snapshot publishes as `preflight.readiness.readyVendors`.
+ *
+ * Deliberately `buildCapabilityPreflight` and not a second filter: the buttons
+ * the renderer offers are drawn from that field, so deriving the gesture's
+ * verdict any other way is how a lane gets a button that always refuses (or,
+ * worse, no button for a lane that would have run).
+ *
+ * `undefined` means readiness is UNREADABLE right now, and it is passed
+ * through as such — the composer then skips its readiness check and the
+ * dispatch route (the real authority, which is un-cached) answers instead. The
+ * alternative, treating "could not check" as "not ready", would refuse a
+ * perfectly good lane in the composer's voice, which is a lie about the
+ * machine.
+ */
+async function dispatchReadyVendorKeys(): Promise<string[] | undefined> {
+  const report =
+    readinessCache.read().report ??
+    (await client.getFleetReadinessReport().catch(() => null));
+  if (!report) return undefined;
+  return buildCapabilityPreflight({
+    brain: { reachable: true },
+    readiness: report,
+    // Seat counts and runner health do not decide lane readiness; passing them
+    // would only add degradations this caller never reads.
+    runner: null,
+  }).readiness.readyVendors;
+}
+
+/**
+ * Has the boot sequence WIRED the subsystems applyBrainCoords fans out to?
+ *
+ * `monitor`, `jobMonitor` and the runner are all created late in `whenReady()`,
+ * but a coordinate change can arrive long before that: the late-readiness
+ * watch's first tick lands at T+17s and `rebaseFromLockfile` schedules its own
+ * apply on a timer, while boot itself can sit in `syncGitHubCredential` for up
+ * to the client's full 120s settle window. Fanning out before the wiring exists
+ * threw (`monitor.stop()` on `undefined`) from inside an interval body, which
+ * — with no `unhandledRejection` handler in this app — took main down with it.
+ *
+ * So a PRE-WIRING change updates only `settings` + `client`, which is exactly
+ * what the boot sequence below reads when it builds the rest.
+ */
+let bootWired = false;
+/** How many coordinate changes have been applied, so boot can tell whether one
+ *  landed while it was mid-wiring and rebuild what it had already built. */
+let brainCoordsApplied = 0;
+
 // Point every subsystem at the embedded brain's current loopback coordinates.
 // Called at boot and again if the supervised brain restarts on a new port.
 function applyBrainCoords(coords: BrainCoords): void {
+  // WHETHER TO APPLY AT ALL, decided before anything is touched. Applying is
+  // destructive — it ends with `restartRunner()`, which SIGTERMs every vendor
+  // session the runner hosts — so the two "don't" answers are as load-bearing as
+  // the apply itself. Truth table in lib/settings.ts.
+  const decision = decideBrainCoordsApply({ current: settings, coords });
+  if (decision.action === "skip") {
+    if (decision.reason === "pinned") {
+      // The operator TYPED a base (an editable field in Settings). Overriding it
+      // redirected them at the embedded brain AND cleared the pin on disk, so
+      // the next launch could not restore it either. Logged, never silent: the
+      // honest statement is that MUON found a brain and is not using it.
+      console.log(
+        `[brain] brain reported ${coords.base}, but this desktop is pinned to ${settings.apiBase} by an operator-entered API base — leaving it alone. Clear the base in Settings to follow the embedded brain again.`
+      );
+      return;
+    }
+    // Same base, same tokens. Both producers (the supervisor's late-readiness
+    // watch and rebaseFromLockfile's scheduled apply) can deliver the SAME
+    // coordinates, and a redundant re-apply was a free runner restart. The one
+    // thing still worth doing: the brain ANSWERED, so a stale "unavailable"
+    // notice from the supervisor is no longer true.
+    brainUnavailableNotice = null;
+    return;
+  }
   apiBaseExplicit = false;
+  brainCoordsApplied += 1;
+  // The brain answered, so whatever the supervisor last said about it being
+  // unavailable is stale.
+  brainUnavailableNotice = null;
   settings = {
     ...settings,
-    // Cleared on disk too, or the next launch would restore an opt-out this
-    // call just superseded.
+    // Written, not cleared: a pinned base returned above, so this can only ever
+    // restate "not pinned" — and it keeps the persisted record explicit rather
+    // than absent.
     apiBaseExplicit: false,
     apiBase: coords.base,
     apiToken: coords.token ?? settings.apiToken,
     agentToken: coords.agentToken ?? settings.agentToken,
   };
+  // THE LIVE CLIENT FIRST, the disk second. `settings` above already names the
+  // new brain while `client` still talks to the old one, and the supervisor
+  // clears its late-readiness watch BEFORE calling us — so a persist that threw
+  // here left the desktop pointing at a dead brain with its only retry path
+  // already gone. Rebuilding first means the worst a failed write can cost is
+  // one launch's memory of the change.
   client = makeClient();
+  // persistableSettings drops the runtime-adopted `apiBase` (it is re-derived
+  // from the lockfile each boot), so this writes almost nothing new — and it must
+  // never be what takes the app down: see persistUserSettingsBestEffort.
+  persistUserSettingsBestEffort("brain coordinates moved");
   // A restarted brain is a different control plane: drop the old verdict rather
   // than showing it against the new one, then prime so the first Crew/Status
   // paint after the restart already has real evidence instead of a spinner.
   readinessCache.clear();
   readinessCache.prime();
+  if (!bootWired) {
+    return; // boot applies the rest, against the coordinates just set
+  }
   void syncGitHubCredential();
   restartMonitor();
   restartJobMonitor();
-  restartRunner();
+  // NEVER on top of live work, exactly as restartRunnerForEnvPreference already
+  // refuses to: a respawn SIGTERMs the runner and the runner's children are the
+  // vendor sessions (a live coordinator died with exit 143 that way). The jobs in
+  // flight keep their old coordinates for as long as they last; the deferred
+  // respawn lands on the first idle poll, and reads the fresh base then.
+  restartRunnerForEnvPreference("the brain moved to new coordinates");
 }
 
 // The MUON app icon. Packaged builds carry Resources/icon.icns; in dev it sits
@@ -1711,6 +2216,26 @@ async function collectState(): Promise<DesktopState> {
       fleet,
       chats,
       approvals: approvals.filter((entry) => entry.status === "pending"),
+      // H6 — the DECIDED tail, so a session header can say what the last gate
+      // on this task actually concluded.
+      //
+      // A separate field on purpose. `approvals` above is pending-only and a
+      // long list of consumers (the inbox card, the badge count, Full Auto
+      // coverage, the session governance banner) all read it as "what still
+      // needs a human". Unfiltering it to serve one header would silently hand
+      // every one of them a pile of already-answered gates.
+      //
+      // Bounded and ordered by DECISION time, which is the question being
+      // asked — the server orders by creation, and an old gate decided a
+      // moment ago is the newer decision.
+      decidedApprovals: approvals
+        .filter((entry) => entry.status !== "pending")
+        .sort((left, right) =>
+          (right.decidedAt ?? right.createdAt ?? "").localeCompare(
+            left.decidedAt ?? left.createdAt ?? ""
+          )
+        )
+        .slice(0, DECIDED_APPROVAL_WINDOW),
       // OPEN blocking questions, machine-wide (a pending human decision, like
       // an approval — the Control badge counts both).
       questions: openQuestions.questions,
@@ -1760,7 +2285,10 @@ async function collectState(): Promise<DesktopState> {
     const message = error instanceof Error ? error.message : "unreachable";
     return {
       online: false,
-      lastError: message,
+      // The SUPERVISOR's reason wins when it has one: "fetch failed" against a
+      // brain that never became ready is the symptom, not the story, and this
+      // banner is the only place a human sees either.
+      lastError: brainUnavailableNotice ?? message,
       // The brain is UNREACHABLE, which is not the same fact as "memory is
       // degraded" — `online: false` already says the stronger thing, and
       // asserting a degradation we could not observe would be a guess.
@@ -1868,7 +2396,13 @@ function rebuildTrayMenu(): void {
 function makeMonitor() {
   return createApprovalsMonitor(client, {
     onState: (next) => {
-      monitorState = next;
+      // When the supervisor has told us WHY the brain is not there, that is the
+      // honest offline reason — not the poll's own "fetch failed", which is the
+      // symptom and says nothing a human can act on.
+      monitorState =
+        !next.online && brainUnavailableNotice
+          ? { ...next, lastError: brainUnavailableNotice }
+          : next;
       rebuildTrayMenu();
       // BUG 2: forget notified ids once they leave the pending set, so the
       // dedup set stays bounded and only holds live approvals.
@@ -1958,7 +2492,11 @@ function makeMonitor() {
   });
 }
 
-let monitor: ReturnType<typeof makeMonitor>;
+// `undefined` until the boot sequence wires it, and typed as such: it was
+// declared non-optional but assigned only late in `whenReady()`, so every
+// `monitor.stop()` on the restart path was a crash waiting for a coordinate
+// change to arrive first (finding H1). The quit path was already defensive here.
+let monitor: ReturnType<typeof makeMonitor> | undefined;
 let portMonitor: ReturnType<typeof startPortMonitor> | null = null;
 
 /**
@@ -1989,7 +2527,7 @@ function approvalPollIntervalMs(): number {
 }
 
 function restartMonitor(): void {
-  monitor.stop();
+  monitor?.stop();
   monitor = makeMonitor();
   monitor.start(approvalPollIntervalMs());
 }
@@ -2266,7 +2804,8 @@ function makeJobMonitor() {
   );
 }
 
-let jobMonitor: ReturnType<typeof makeJobMonitor>;
+// Same as `monitor` above: wired late in `whenReady()`, so the type says so.
+let jobMonitor: ReturnType<typeof makeJobMonitor> | undefined;
 
 // The spawn door's actual backing (real node-pty vs echo diagnostic), set when
 // terminal IPC registers. `realPty` in DesktopState reads THIS, not the env:
@@ -2291,7 +2830,7 @@ function terminalRealPty(): boolean {
 }
 
 function restartJobMonitor(): void {
-  jobMonitor.stop();
+  jobMonitor?.stop();
   jobMonitor = makeJobMonitor();
   jobMonitor.start(settings.pollIntervalMs);
 }
@@ -2766,6 +3305,25 @@ function registerIpcHandlers(): void {
     }
   );
 
+  // ADR-0056 D8.1 — the operator's view of every durable grant, and the kill
+  // switch beside it. Both are operator-only at the route (`requireOperator`),
+  // so this handler adds no authority of its own; it exists so a grant minted
+  // by clicking "always" in this window can also be revoked in this window.
+  ipcMain.handle(
+    "muon:listApprovalGrants",
+    async (
+      _event,
+      input: { activeOnly?: boolean; workspacePath?: string; taskId?: string }
+    ) => client.listApprovalGrants(input ?? {})
+  );
+  ipcMain.handle(
+    "muon:revokeApprovalGrant",
+    async (_event, input: { grantId: string }) =>
+      client.revokeApprovalGrant(
+        requireRendererRecordId(input.grantId, "grant")
+      )
+  );
+
   // TODO 5.17 — Pause from the commitments screen. Operator-local surface: any
   // live record in this brain is pausable without deleting it. Dispatch still
   // goes through interrupt; workflow → paused; loop → aborted.
@@ -3066,6 +3624,42 @@ function registerIpcHandlers(): void {
       installMcpForVendor(input.vendor)
   );
 
+  // Settings -> Command Line Tools. `defaultCliLinkIo` is built FRESH on
+  // every call (never cached at boot) — `app.isPackaged`/`resourcesPath`
+  // never change within a run, but re-deriving costs one `fs.existsSync`
+  // walk and keeps this handler honest about what it is reading, the same
+  // reasoning `readMcpStatus` above is built on.
+  ipcMain.handle(
+    "muon:cliLinkStatus",
+    (): CliLinkStatusReport =>
+      readCliLinkStatus(
+        defaultCliLinkIo({
+          resourcesPath: process.resourcesPath,
+          isPackaged: app.isPackaged,
+        })
+      )
+  );
+  ipcMain.handle(
+    "muon:cliLink",
+    (): CliLinkResult =>
+      applyCliLink(
+        defaultCliLinkIo({
+          resourcesPath: process.resourcesPath,
+          isPackaged: app.isPackaged,
+        })
+      )
+  );
+  ipcMain.handle(
+    "muon:cliUnlink",
+    (): CliUnlinkResult =>
+      applyCliUnlink(
+        defaultCliLinkIo({
+          resourcesPath: process.resourcesPath,
+          isPackaged: app.isPackaged,
+        })
+      )
+  );
+
   // ADR-0028 Tier C — the desktop half of `muon mcp attach | detach`. Both
   // bodies are in ./lib/mcp-bridge.ts, which delegates to the SAME
   // `attachCoordinatorFlow`/`detachCoordinatorFlow` the CLI calls: no
@@ -3172,6 +3766,179 @@ function registerIpcHandlers(): void {
   );
 
   /**
+   * H12 — CONTINUE THIS MISSION ON ANOTHER LANE (one gesture).
+   *
+   * Fenced exactly like `muon:taskHandoffs`: the renderer may only continue a
+   * task on its own bound chat, and the chat it names must be that chat. The
+   * successor is an ORDINARY dispatch — this handler files no approval, raises
+   * no budget and names no role, so nothing about the mission's authority is
+   * different afterwards except that a second lane is now working on it.
+   */
+  ipcMain.handle(
+    "muon:continueOnLane",
+    async (
+      _event,
+      input: { taskId: string; chatId?: string; vendor: string }
+    ): Promise<ContinueOnLaneResult> => {
+      const chatId = boundChatId;
+      const selectionVersion = boundChatSelectionVersion;
+      if (!chatId) {
+        return {
+          ok: false,
+          reason: "Select a mission before continuing it on another lane.",
+        };
+      }
+      if (input.chatId && input.chatId !== chatId) {
+        return {
+          ok: false,
+          reason:
+            "That mission is not the selected one. Open it first, then continue it on another lane.",
+        };
+      }
+      await requireRendererTask(client, chatId, input.taskId);
+      const readyVendors = await dispatchReadyVendorKeys();
+      const result = await continueOnLane(
+        client,
+        { taskId: input.taskId, chatId, vendor: input.vendor },
+        // `undefined` = readiness unreadable; forwarded as absent so the
+        // composer defers to the dispatch route rather than manufacturing a
+        // refusal out of a probe outage.
+        readyVendors,
+        () => {
+          if (
+            selectionVersion !== boundChatSelectionVersion ||
+            chatId !== boundChatId
+          ) {
+            throw new Error(
+              "The selected mission changed before the continuation was filed."
+            );
+          }
+        }
+      );
+      // No monitor wake here, deliberately: this files a DISPATCH, not a gate.
+      // `muon:resumeObjectiveLoop` — the other IPC handler that enqueues one —
+      // does the same, and the renderer ticks its own state store on success,
+      // so the successor reaches the desk without poking the approvals monitor
+      // for a decision that was never filed.
+      return result;
+    }
+  );
+
+  /**
+   * ADR-0044/0071 — FORK A NEW MISSION FROM A RECORDED STEP (one gesture).
+   *
+   * Fenced like `muon:continueOnLane`, but by the SOURCE JOB: the renderer
+   * may only fork a job whose task belongs to its own bound chat, so a
+   * window can never branch a mission it is not looking at. Everything that
+   * makes a fork a fork — the latest-settled-step guard, gesture-time
+   * capture, authority re-derivation, offer-prefix inheritance,
+   * compensation — is enforced at the fork route; a refusal resolves as
+   * `{ok:false, reason}` with the route's own sentence, never a rephrase.
+   */
+  ipcMain.handle(
+    "muon:forkMission",
+    async (
+      _event,
+      input: {
+        sourceJobId: string;
+        brief: string;
+        vendor: string;
+        title?: string;
+      }
+    ): Promise<ForkMissionResult> => {
+      const chatId = boundChatId;
+      const selectionVersion = boundChatSelectionVersion;
+      // The workflow lives in lib/fork-mission.ts (Electron-free, tested
+      // directly); this adapter only supplies the bound chat and the
+      // selection-stability check, like `muon:continueOnLane`'s. No monitor
+      // wake, deliberately: this files a DISPATCH (the fork's root), not a
+      // gate — the renderer ticks its own store, which is also how the
+      // fork's new chat reaches the mission list.
+      return forkMissionFromStep(client, input, chatId, () => {
+        if (
+          selectionVersion !== boundChatSelectionVersion ||
+          chatId !== boundChatId
+        ) {
+          throw new Error(
+            "The selected mission changed before the fork was filed."
+          );
+        }
+      });
+    }
+  );
+
+  /**
+   * H1 — READ the bound review thread. This NEVER advances the cursor: that is
+   * the entire mechanism by which closing a review without deciding leaves the
+   * next open showing the same digest instead of a fresh archaeology.
+   */
+  ipcMain.handle(
+    "muon:reviewThread",
+    async (
+      _event,
+      input: ReviewThreadTarget
+    ): Promise<ReviewThreadDigest> => {
+      const chatId = boundChatId;
+      const selectionVersion = boundChatSelectionVersion;
+      // Kind ENUMERATED and id bounded before either reaches a request path.
+      const scope = resolveReviewThreadTarget(input, chatId);
+      if (scope.kind === "task") {
+        await requireRendererTask(client, chatId, scope.taskId);
+      }
+      // Re-checked AFTER the await, like every neighbouring handler: a mission
+      // switch mid-read must not paint chat A's digest under chat B's name.
+      if (
+        selectionVersion !== boundChatSelectionVersion ||
+        chatId !== boundChatId
+      ) {
+        throw new Error("The selected mission changed before the digest read.");
+      }
+      return client.getReviewThread(
+        scope.target.targetKind,
+        scope.target.targetId
+      );
+    }
+  );
+
+  /**
+   * H1 — ADVANCE the cursor. Called on a DECISION or an explicit acknowledge,
+   * never on open. Same scope fence as the read: a surface may only mark a
+   * thread on its own mission as seen.
+   */
+  ipcMain.handle(
+    "muon:advanceReviewLook",
+    async (
+      _event,
+      input: ReviewThreadTarget & { digestAt?: string }
+    ): Promise<{ lastLookedAt: string }> => {
+      const chatId = boundChatId;
+      const selectionVersion = boundChatSelectionVersion;
+      const scope = resolveReviewThreadTarget(input, chatId);
+      if (scope.kind === "task") {
+        await requireRendererTask(client, chatId, scope.taskId);
+      }
+      // A cursor stamped for a thread the window no longer shows is a look the
+      // operator never took.
+      if (
+        selectionVersion !== boundChatSelectionVersion ||
+        chatId !== boundChatId
+      ) {
+        throw new Error("The selected mission changed before the cursor moved.");
+      }
+      // `digestAt` rides through unvalidated ON PURPOSE, and it is safe to:
+      // the brain refuses an unreadable stamp, clamps a future one to its own
+      // clock, and never moves the cursor BACKWARD past where it already is.
+      // So the worst a wrong value can do is show the operator MORE than they
+      // needed to see, never less — it is not an authority field.
+      return client.advanceReviewLook(
+        scope.target.targetKind,
+        scope.target.targetId,
+        typeof input?.digestAt === "string" ? { digestAt: input.digestAt } : {}
+      );
+    }
+  );
+
+  /**
    * The per-run bound, REFUSED rather than clamped.
    *
    * Clamping would run a different amount of work than the operator asked
@@ -3215,6 +3982,72 @@ function registerIpcHandlers(): void {
           : null,
         compactionRetentionDays,
         memoryMining,
+      };
+    }
+  );
+
+  /**
+   * ADR-0061 D3 — the cold-start card's ONE read, composed in main against
+   * the BOUND workspace (§9: the renderer cannot widen the partition).
+   * The workspace's policy classes come from the SAME filtered library
+   * totals the page already trusts (`listMemoryLibrary` computes `total`
+   * respecting status/stale/showExpired + the workspace fence); the fence
+   * class is partition totals only, from the operator-only /partitions
+   * read. the EXPIRED class is deliberately absent: the
+   * library empty state already owns its probe and its "Show expired"
+   * affordance.
+   */
+  ipcMain.handle(
+    "muon:memoryColdStart",
+    async (): Promise<MemoryColdStartState> => {
+      // The SAME fences as `muon:memoryLibrary` (review finding: a second
+      // library reader must not quietly drop them): the bound chat is
+      // forced, and a selection switch mid-read refuses rather than
+      // labelling one workspace's totals as another's.
+      const chatId = boundChatId;
+      const selectionVersion = boundChatSelectionVersion;
+      if (!chatId) {
+        throw new Error("Select a chat before opening memory.");
+      }
+      const workspace = boundWorkspace;
+      // TYPED against the same MemoryLibraryQuery the bound-library handler
+      // uses (review finding: an untyped wrapper at a security-sensitive
+      // boundary invites inconsistent future changes).
+      const library = (query: MemoryLibraryQuery) =>
+        loadMemoryLibrary({
+          apiBase: settings.apiBase,
+          apiToken:
+            settings.apiToken ??
+            process.env.MUON_OPERATOR_TOKEN ??
+            process.env.MUON_API_TOKEN,
+          query: {
+            limit: 1,
+            ...query,
+            chatId,
+            ...(workspace ? { workspace } : {}),
+          },
+        });
+      const [paused, stale, partitions] = await Promise.all([
+        library({ status: "paused" }),
+        library({
+          status: "active",
+          filter: { field: "stale", op: "eq", value: true },
+        }),
+        client.listMemoryPartitionTotals(),
+      ]);
+      if (
+        selectionVersion !== boundChatSelectionVersion ||
+        chatId !== boundChatId
+      ) {
+        throw new Error("The selected chat changed while memory was loading.");
+      }
+      return {
+        workspacePath: workspace ?? null,
+        held: {
+          paused: paused.total,
+          stale: stale.total,
+        },
+        partitions,
       };
     }
   );
@@ -3404,6 +4237,7 @@ function registerIpcHandlers(): void {
         approvalId: string;
         status: "approved" | "rejected";
         receiptTtlMs?: number;
+        grantDuration?: ApprovalGrantDuration;
         manualReview?: ManualReviewAttestation;
       }
     ): Promise<ResolveApprovalResult> => {
@@ -3440,20 +4274,58 @@ function registerIpcHandlers(): void {
           "Manual review attestation is valid only for merge approvals."
         );
       }
-      // P0.4 + BUG 1: an explicit receipt opt-in rides the SAME operator
-      // decision (mint at operator tier). The approve/reject decision ALWAYS
-      // lands: if the action can't be remembered the server soft-skips the mint
-      // (200, no red 400), so here we surface a gentle, non-error note rather
-      // than failing the decision. No opt-in = today's path exactly.
-      if (input.receiptTtlMs !== undefined && input.status === "approved") {
-        const resolved = await client.resolveApproval({
-          approvalId: input.approvalId,
-          status: input.status,
-          decisionNotes: "decided from MUON desktop",
-          receipt: { ttlMs: input.receiptTtlMs },
-        });
+      // ADR-0056 D4: ONE decision carries ONE durable authority. The gate
+      // surface holds a single `GateDurableChoice` union and therefore cannot
+      // send this pair at all; the check exists for anything that is not the
+      // gate surface, and it says so in the operator's words rather than
+      // letting the shared builder raise its library-level message.
+      if (
+        input.receiptTtlMs !== undefined &&
+        input.grantDuration !== undefined
+      ) {
+        throw new Error(
+          "One decision carries one durable authority: send either a remembered-action receipt or a durable grade, never both."
+        );
+      }
+      if (input.grantDuration !== undefined && input.status !== "approved") {
+        throw new Error("A rejection cannot be remembered.");
+      }
+      if (input.manualReview && input.grantDuration !== undefined) {
+        throw new Error(
+          "Merge review and durable approval grants cannot be combined."
+        );
+      }
+      // P0.4 + BUG 1 + ADR-0056: an explicit durable opt-in — raw receipt TTL
+      // or graded — rides the SAME operator decision (mint at operator tier).
+      // The approve/reject decision ALWAYS lands: if the action can't be
+      // remembered the server soft-skips the mint (200, no red 400), so here we
+      // surface a gentle, non-error note rather than failing the decision. No
+      // opt-in = today's path exactly.
+      //
+      // The payload is built by `buildApprovalDecision`, not by hand: the
+      // attribution sentence it produces for each branch below is byte-identical
+      // to the strings this handler used to inline ("decided from MUON desktop",
+      // "manually reviewed from MUON desktop"), and routing through it is what
+      // stops the third grade from arriving with a fourth dialect.
+      const durable =
+        input.status === "approved"
+          ? input.receiptTtlMs !== undefined
+            ? { receiptTtlMs: input.receiptTtlMs }
+            : input.grantDuration !== undefined
+              ? { grantDuration: input.grantDuration }
+              : undefined
+          : undefined;
+      if (durable) {
+        const resolved = await client.resolveApproval(
+          buildApprovalDecision({
+            approvalId: input.approvalId,
+            status: input.status,
+            surface: "MUON desktop",
+            ...durable,
+          })
+        );
         recordMergeOutcome(resolved.id, resolved.merge);
-        void monitor.poll();
+        void monitor?.poll();
         if (resolved.receiptSkipped) {
           // Soft surface: the decision succeeded; the action just can't be
           // remembered. Informational, never an error dialog.
@@ -3468,21 +4340,41 @@ function registerIpcHandlers(): void {
             receiptSkippedReason: resolved.receiptSkippedReason,
           };
         }
+        if (resolved.grant) {
+          // ADR-0056 D8: a grant that resolves something invisibly IS the
+          // failure mode. Say out loud what it covers, in which chat, until
+          // when — and name the exact verb that kills it — the moment it is
+          // minted. The revoke gesture is deliberately the CLI's, because that
+          // is the only surface that has one today; pointing at a desktop
+          // screen that does not list grants yet would be a lie in UI copy.
+          new Notification({
+            title: "Approved — and remembered for this chat",
+            body: `${resolved.grant.toolName} on ${
+              resolved.grant.resolvedTarget ?? "this exact payload"
+            } will not ask again in this chat until ${new Date(
+              resolved.grant.expiresAt
+            ).toLocaleString()}. Revoke it any time: muon policy revoke --grant-id ${
+              resolved.grant.id
+            }`,
+          }).show();
+        }
         return {};
       }
       if (input.manualReview !== undefined && input.status === "approved") {
-        const resolved = await client.resolveApproval({
-          approvalId: input.approvalId,
-          status: input.status,
-          decisionNotes: "manually reviewed from MUON desktop",
-          manualReview: input.manualReview,
-        });
+        const resolved = await client.resolveApproval(
+          buildApprovalDecision({
+            approvalId: input.approvalId,
+            status: input.status,
+            surface: "MUON desktop",
+            manualReview: input.manualReview,
+          })
+        );
         recordMergeOutcome(resolved.id, resolved.merge);
-        void monitor.poll();
+        void monitor?.poll();
         return {};
       }
       await decideApproval(client, input.approvalId, input.status);
-      void monitor.poll();
+      void monitor?.poll();
       return {};
     }
   );
@@ -3521,7 +4413,7 @@ function registerIpcHandlers(): void {
       });
       // Wake the monitor so the new gate reaches Review (and, under Full
       // Auto, the auto-approver) without waiting a full poll interval.
-      void monitor.poll();
+      void monitor?.poll();
       return result;
     }
   );
@@ -3654,6 +4546,9 @@ function registerIpcHandlers(): void {
         return result;
       }
       persistGitHubCredential(result.credential);
+      // ADR-0052: the device flow is the consent moment for the install record.
+      // Best-effort and not awaited — the sign-in must complete at UI speed.
+      registerDesktopInstall(result.credential);
       return {
         status: "connected",
         ...(result.login ? { login: result.login } : {}),
@@ -3665,6 +4560,31 @@ function registerIpcHandlers(): void {
     const status = await client.disconnectGitHub();
     settings = { ...settings, githubCredential: undefined };
     persistUserSettings();
+    // ADR-0052 — DISCONNECT CLEARS THE SHARED CREDENTIAL TOO.
+    //
+    // It did not, and the gap was the mirror image of the `muon logout` copy fix:
+    // "Disconnect" removed the credential from the desktop's own settings and
+    // left `github-identity.json` — access token included — sitting 0600 in the
+    // shared data dir, so the CLI and `muon-mcp` on the same machine stayed
+    // signed in on an identity the operator had just disconnected. An operator
+    // who disconnects because they are handing the laptop over, or because the
+    // wrong account was linked, has every reason to believe the token is gone.
+    //
+    // The pending marker goes with it for the same reason it goes on logout: a
+    // marker outliving its identity leaves every surface reporting "verified,
+    // waiting to register" about nobody.
+    const cleared = clearIdentityCredential(desktopDataDir());
+    if (!cleared.ok) {
+      // Logged, not thrown: the desktop half of the disconnect has already
+      // happened and must not be rolled back. But it is not silent — this is a
+      // credential that is still on disk.
+      console.error(
+        `[github-gate] disconnect could not remove the shared identity credential: ${cleared.detail}`
+      );
+    }
+    // The record's state was about a registration for an identity that is gone.
+    installRegistration = undefined;
+    stopInstallRegistrationRetry();
     // Crossing INTO the gate: rebuild the job monitor (auto-continue snapshot)
     // and close any live human terminals — a locked app must not keep hosting
     // an interactive shell with workspace access after its UI has unmounted.
@@ -4176,13 +5096,23 @@ function registerIpcHandlers(): void {
         userApiToken = entered;
         settings = { ...settings, apiToken: entered };
       }
+      // Compared BEFORE the assignment below overwrites it: the Settings form
+      // pre-fills the CURRENT (often runtime-adopted) base, so a Save that
+      // leaves the field untouched is not the human naming a base — pinning
+      // the adopted port as "explicit" is exactly the stale-apiBase seed the
+      // 2026-08-17 review traced (an explicit pin stands down lockfile rebase
+      // forever).
+      const baseChanged =
+        Boolean(requestedBase) && requestedBase !== settings.apiBase;
       settings = {
         ...settings,
         apiBase: requestedBase || settings.apiBase,
       };
-      // The human named a base: automatic lockfile rebase stands down until a
-      // brain-coords change (applyBrainCoords) supersedes it.
-      if (requestedBase) {
+      // The human named a NEW base: automatic lockfile rebase stands down until
+      // they say otherwise HERE. A brain-coords change no longer supersedes it —
+      // `applyBrainCoords` used to clear the flag and persist the clear, which
+      // un-pinned an explicit instruction durably and silently.
+      if (baseChanged) {
         apiBaseExplicit = true;
         // PERSISTED as well as held: a flag that only lived in memory made the
         // opt-out last until the next launch, and no further.
@@ -4434,7 +5364,7 @@ function registerIpcHandlers(): void {
     // approvals too (the approver keys on the selection, not the derived
     // ALL-lanes boolean; see the makeMonitor onState wiring).
     if (normalized.length > 0) {
-      void monitor.poll();
+      void monitor?.poll();
     }
     // The LEASE tracks the global boolean: it is the unscoped machine-wide
     // "an operator-tier decider is watching" statement, so a drop out of
@@ -4524,6 +5454,10 @@ if (!hasLock) {
     // macOS, but an Electron userData override must win here.
     setCustomAgentLookup((id) => findCustomAgentById(id, dataDir));
     settings = loadSettings(dataDir);
+    // ADR-0052 — a `muon login` that happened while the app was closed opens
+    // this launch too. Before anything reads the gate, so the first paint of a
+    // signed-in machine is the app, not the lock.
+    adoptSharedIdentityCredential("boot");
     // Restore the operator's "talk to THIS brain" decision across restarts.
     apiBaseExplicit = settings.apiBaseExplicit === true;
     setAutoContinueEnvironment(settings.autoContinue);
@@ -4579,6 +5513,33 @@ if (!hasLock) {
           from: boot.from,
         });
         observatory?.record({ name: "update.applied" });
+        // Founder requirement (2026-08-19): an app update pulls the machine's
+        // npm-global CLI along, so no surface ages out of step with the brain
+        // this app now carries. Best-effort, never awaited — a launch must not
+        // wait on npm — and only a PRESENT, OLDER global install is touched.
+        void (async () => {
+          // ASYNC probe on purpose: the shared `resolveNpmGlobalRootSync`
+          // (@muon/client/gitnexus-reindex) is spawnSync, and sync blocks this
+          // thread no matter where it sits in an async function — the launch
+          // must not wait on npm.
+          //
+          // NO HOST OVERRIDE, structurally (cubic pass-3 #2, pass-4 #1):
+          // this npm install runs with no prompt and no UI, so
+          // `cliRefreshPlan` is PINNED to the canonical download host — it
+          // takes no host input at all, so no call site (and no env var) can
+          // point a silent `npm install -g` anywhere else. Staging overrides
+          // stay on the explicit, typed-out surfaces: `muon update --host`
+          // and install.sh.
+          const outcome = await runCliRefresh(
+            cliRefreshPlan({
+              appVersion: app.getVersion(),
+              globalCliVersion: readGlobalCliVersion(
+                await resolveNpmGlobalRootAsync()
+              ),
+            })
+          );
+          console.log(`[update] global CLI refresh: ${outcome}`);
+        })();
       }
       if (settings.lastRunVersion !== app.getVersion()) {
         settings.lastRunVersion = app.getVersion();
@@ -4588,38 +5549,31 @@ if (!hasLock) {
       // Boot confirmation is hygiene; it must never block launch.
     }
 
-    // Start (or adopt) the embedded brain, then target it. If it can't start,
-    // the app still launches (offline) against the configured settings default.
-    brainDataDir = dataDir;
-    brain = new BrainSupervisor({
-      dataDir,
-      onChange: applyBrainCoords,
-      onLog: (line) => console.log(`[brain] ${line}`),
-      // Debug mode: pretty-print the brain's pino JSON to the terminal. Without
-      // this the backend's logs only ever reach brain.log, which is why a dev
-      // run looked like it produced "no logs" at all.
-      teeToTerminal: childTee(formatBrainLine),
-    });
-    const coords = await brain.start();
-    printDebugBanner(dataDir, coords);
-    if (coords) {
-      settings = {
-        ...settings,
-        apiBase: coords.base,
-        apiToken: coords.token ?? settings.apiToken,
-        agentToken: coords.agentToken ?? settings.agentToken,
-      };
-    }
-
+    // ── PAINT FIRST ───────────────────────────────────────────────────────────
+    //
+    // Everything below this line up to `createWindow()` is synchronous, so the
+    // window is on screen within a frame of `whenReady`. It used to sit behind
+    // `await brain.start()` (a 15s bound) and `await syncGitHubCredential()` (up
+    // to the client's settle window) — and the slow case is exactly FIRST LAUNCH
+    // OF A PACKAGED BUILD, which runs database migrations and builds the code
+    // graph. The dock icon bounced and nothing appeared, with no splash: a
+    // consumer reads that as an app that failed to open.
+    //
+    // Safe because nothing here needs the brain. The window's first state read
+    // finds no coordinates and reports the control plane offline for a few
+    // seconds — the same state it already showed while the monitors and the
+    // runner were built after `createWindow()` — and the supervisor's own
+    // late-readiness watch is what recovers a brain that was not ready yet
+    // (`applyBrainCoords` re-points every subsystem when it lands). What that
+    // first read must NOT find is an undefined `client`, so build one now,
+    // against whatever `settings` names.
     client = makeClient();
-    // Kick the ~3.8s vendor-CLI probe NOW, in parallel with everything below,
-    // and never await it. By the time the window paints and the human can reach
-    // Crew / Status the lane lights are usually already real — and if they are
-    // not, those surfaces say "Checking providers…" instead of stalling.
-    readinessCache.prime();
-    await syncGitHubCredential();
-    monitor = makeMonitor();
-    jobMonitor = makeJobMonitor();
+    // The tray's brain line and the offline banner both read this, so give them
+    // the true sentence for the state the app is actually in rather than letting
+    // the first poll's "fetch failed" stand as the explanation. Cleared the
+    // moment coordinates arrive, below or via applyBrainCoords.
+    brainUnavailableNotice =
+      "MUON's brain is starting. A first launch runs database migrations and builds the code graph.";
 
     // Dock icon: the MUON mark (needed in dev; packaged reads the .icns).
     const dockIcon = nativeImage.createFromPath(appIconPath());
@@ -4639,10 +5593,99 @@ if (!hasLock) {
         "[github-gate] RELEASE DEFECT: packaged build has no MUON_GITHUB_CLIENT_ID — the identity gate cannot arm and is DISABLED for this run."
       );
     }
+    // ADR-0052 F14 — the opposite mistake: armed BY FLAG with no client id, so
+    // the gate is ON and its device flow does not exist. The gate screen already
+    // says so on screen (`status.configured === false` disables Connect and
+    // names the variable), and this is the same line the CLI, the TUI and
+    // `muon-mcp` print — so a headless dev launch reading logs is told the same
+    // thing as a person looking at the window.
+    if (
+      githubIdentityGateDoorMissing({
+        env: process.env,
+        distributed: app.isPackaged,
+      })
+    ) {
+      console.error(githubIdentityGateDoorMissingWarning("desktop"));
+    }
     installGitHubIpcGate(ipcMain, githubGateActive);
+    // ADR-0095 — ONE gate event per launch, and only when a gate actually
+    // ran: an ungated dev run records neither verdict. A gated boot can only
+    // mean "no registered identity stands on this machine" (the desktop gate
+    // is credential + grant presence; expiry and network never decide it), so
+    // the refusal reason is the coarse "unregistered", never prose.
+    if (githubGateIsRequired) {
+      observatory?.record(
+        githubGateActive()
+          ? {
+              name: "identity.gate_refused",
+              surface: "desktop",
+              reason: "unregistered",
+              trigger: "launch",
+            }
+          : { name: "identity.gate_passed", surface: "desktop", trigger: "launch" }
+      );
+    }
     registerIpcHandlers();
     ipcHandlersRegistered = true;
     createWindow();
+
+    // Start (or adopt) the embedded brain, then target it. If it can't start,
+    // the app still launches (offline) against the configured settings default.
+    brainDataDir = dataDir;
+    brain = new BrainSupervisor({
+      dataDir,
+      onChange: applyBrainCoords,
+      // The supervisor stood down without coordinates. Put its reason where the
+      // human already looks for one: the tray's brain line (monitorState) and
+      // the renderer's "Control plane offline" banner (collectState's catch).
+      // Both otherwise show the poll's own "fetch failed", which is the symptom.
+      onStatus: (status) => {
+        brainUnavailableNotice = status.detail;
+        if (!monitorState.online) {
+          monitorState = { ...monitorState, lastError: status.detail };
+        }
+        rebuildTrayMenu();
+      },
+      onLog: (line) => console.log(`[brain] ${line}`),
+      // Debug mode: pretty-print the brain's pino JSON to the terminal. Without
+      // this the backend's logs only ever reach brain.log, which is why a dev
+      // run looked like it produced "no logs" at all.
+      teeToTerminal: childTee(formatBrainLine),
+    });
+    const coords = await brain.start();
+    printDebugBanner(dataDir, coords);
+    if (coords) {
+      settings = {
+        ...settings,
+        apiBase: coords.base,
+        apiToken: coords.token ?? settings.apiToken,
+        agentToken: coords.agentToken ?? settings.agentToken,
+      };
+      // It is here, so stop saying it is starting. (A null `coords` keeps the
+      // notice standing: the supervisor's late-readiness watch now REFRESHES it
+      // with the elapsed time, and clearing it would hand the banner back to the
+      // poll's own "fetch failed".)
+      brainUnavailableNotice = null;
+    }
+
+    client = makeClient();
+    // Kick the ~3.8s vendor-CLI probe NOW, in parallel with everything below,
+    // and never await it. By the time the human can reach Crew / Status the lane
+    // lights are usually already real — and if they are not, those surfaces say
+    // "Checking providers…" instead of stalling.
+    readinessCache.prime();
+    await syncGitHubCredential();
+    // ADR-0052 — the launch retry. An operator who signed in before the
+    // registry existed (or while offline) is registered here, once, with
+    // nothing to do; a grant already on disk makes this a single file read.
+    if (settings.githubCredential) {
+      registerDesktopInstall(settings.githubCredential);
+    }
+    // The monitors are built at their START sites below, not here: both capture
+    // `client` at construction, and a coordinate change arriving mid-boot (the
+    // late-readiness watch, or a lockfile rebase) replaces it. This records the
+    // generation so the tail of this sequence can tell whether that happened.
+    const wiringGeneration = brainCoordsApplied;
 
     // TODO 7.9 — global hotkey focuses the window and opens ⌘K even when
     // another app is frontmost. Soft-fail if the OS refuses the accelerator
@@ -4664,7 +5707,8 @@ if (!hasLock) {
     tray.setTitle("◌");
     rebuildTrayMenu();
 
-    monitor.start(approvalPollIntervalMs());
+    // Construct + start, via the one pair the restart path also uses.
+    restartMonitor();
     portMonitor = startPortMonitor({
       listChats: () => client.listChats(),
       listActiveJobs: () =>
@@ -4685,7 +5729,7 @@ if (!hasLock) {
     });
     // S4: watch dispatched workers so an idle orchestrator chat is reconciled
     // when they land (bounded auto-continue / [Continue] affordance).
-    jobMonitor.start(settings.pollIntervalMs);
+    restartJobMonitor();
     scheduleExecutor.start();
     // BUG 1(b): retire a quickstart first-task stranded QUEUED in an earlier
     // session (its non-terminal jobs + pending approvals) BEFORE the runner
@@ -4709,6 +5753,26 @@ if (!hasLock) {
     }
     // Host the runner so dispatched work actually executes while the app runs.
     startRunner();
+    // Every fan-out target now exists, so a coordinate change may reach them.
+    bootWired = true;
+    if (brainCoordsApplied !== wiringGeneration) {
+      // One landed while this sequence was still wiring: it updated `settings` +
+      // `client` only, and the monitors above may have been built against the
+      // client it replaced. `startRunner` read the fresh coordinates itself.
+      console.log(
+        "[brain] coordinates moved during boot — rebuilding the monitors on the current ones"
+      );
+      restartMonitor();
+      restartJobMonitor();
+      // AND THE CREDENTIAL. `applyBrainCoords` re-sends it on every later move
+      // and skipped it here only because `bootWired` was still false, while
+      // boot's own send above went to the client that was then replaced. So the
+      // new brain never received the operator's GitHub credential for the whole
+      // session — Settings still read "connected" while PR review and every
+      // GitHub-backed dispatch refused. Same `void` as the fan-out's: the send
+      // logs its own failures and must never hold boot open.
+      void syncGitHubCredential();
+    }
 
     // Best-effort: bind the local index to the newest workspace. Fire-and-forget
     // AFTER the window — must never block or wedge startup.

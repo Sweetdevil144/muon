@@ -53,6 +53,43 @@ export const DEFAULT_HARNESSES: SeededHarness[] = [
     }),
   },
   {
+    // WAVE 1B — the SOLO posture. Everything else in this library is
+    // worker-shaped: a harness describes how a DISPATCHED child behaves in the
+    // worktree it was given. Nothing described the case the founder's own
+    // measurement found most common and most expensive — one operator, one
+    // module, one instruction — so a single-unit ask inherited `implement`,
+    // which means a worktree, a repo-wide `npm test`, and a shape that reads
+    // as "a mission".
+    //
+    // This is the analogue of a named context profile: a compact posture whose
+    // job is to make the cheap path cheap. It is NOT a permission change —
+    // `permissionMode` and `sandbox` match `implement` exactly, and the same
+    // preflight tools are required, because a solo edit is governed no more
+    // loosely than a dispatched one.
+    //
+    // What it changes is scope and expectation:
+    //  - `worktree: false` — a one-module change in the operator's own
+    //    checkout is the point; a worktree here is ceremony that then needs a
+    //    merge to undo.
+    //  - no `checks` — a repo-wide `npm test` is the wrong success signal for
+    //    a one-function edit and the slowest possible one. The loop's
+    //    derived-checks path (derived-checks.ts) already computes the changed
+    //    packages' own scripts from the manifests, which is the right check
+    //    for this shape and is what an empty `checks` list falls through to.
+    key: "solo",
+    name: "Solo",
+    config: harnessConfigSchema.parse({
+      description:
+        "One operator, one module: edit directly in this checkout, no crew and no worktree. Preflight still applies.",
+      profileOverlay: { permissionMode: "default", sandbox: "workspace-write" },
+      requires: {
+        interactive: false,
+        worktree: false,
+        tools: ["preflight_edit", "memory_preedit"],
+      },
+    }),
+  },
+  {
     key: "review",
     name: "Review",
     config: harnessConfigSchema.parse({

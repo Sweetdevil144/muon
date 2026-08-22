@@ -22,6 +22,7 @@ describe("canonical MUON MCP tool inventory", () => {
       "memory_delete",
       "memory_clone",
       "memory_add",
+      "memory_ground",
       "memory_preedit",
       "impact_memory",
       "preflight_edit",
@@ -34,8 +35,19 @@ describe("canonical MUON MCP tool inventory", () => {
       "review_diff",
       "data_boundaries",
       "flow_scope",
+      // ADR-0053 §8: the repository's own markdown corpus as three READS. A
+      // deliberate widening of the base tier by three — no write verb, no new
+      // grant, doc prose carried as DATA — and this pin is where that decision
+      // is recorded.
+      "docs_query",
+      "docs_context",
+      "docs_impact",
       "capability_preflight",
       "whoami",
+      // H5: pending gates + pending unconfirmed memory as COORDINATES. A
+      // deliberate widening of the base tier by one READ — it carries no
+      // confirm/reject verb, and this pin is where that decision is recorded.
+      "review_queue",
     ]);
   });
 
@@ -52,6 +64,7 @@ describe("canonical MUON MCP tool inventory", () => {
       // budget) — updated here consciously, which is this pin's whole job.
       "question_ask",
       "question_status",
+      "question_withdraw",
       "crew_roles",
     ]);
   });
@@ -72,6 +85,9 @@ describe("canonical MUON MCP tool inventory", () => {
       "interrupt",
       "propose_workflow",
       "apply_workflow",
+      // A14 / ADR-0045: the PROPOSE half of plan amendment. No apply sibling
+      // exists at any tier — the human approves the amendment gate.
+      "propose_amendment",
       "workflow_status",
       "ship",
       "check_approval",
@@ -100,18 +116,23 @@ describe("canonical MUON MCP tool inventory", () => {
     expect(MUON_CONTROL_TOOL_NAMES).toContain("assign_roles");
   });
 
-  it("combines 47 unique exact identifiers without broad or wildcard entries", () => {
+  it("combines 54 unique exact identifiers without broad or wildcard entries", () => {
     expect(MUON_ORCHESTRATOR_TOOL_NAMES).toEqual([
       ...MUON_CONTEXT_TOOL_NAMES,
       ...MUON_COORDINATION_TOOL_NAMES,
       ...MUON_CONTROL_TOOL_NAMES,
     ]);
-    expect(MUON_CONTEXT_TOOL_NAMES).toHaveLength(21);
-    // 9 = 6 + ADR-0043's question_ask/question_status + publish_finding (deliberate widening).
-    expect(MUON_COORDINATION_TOOL_NAMES).toHaveLength(9);
-    expect(MUON_CONTROL_TOOL_NAMES).toHaveLength(17);
-    expect(MUON_ORCHESTRATOR_TOOL_NAMES).toHaveLength(47);
-    expect(new Set(MUON_ORCHESTRATOR_TOOL_NAMES).size).toBe(47);
+    // 26 = 25 + ADR-0058's memory_ground (propose-class, like memory_add).
+    // The 25 was 22 + ADR-0053's docs trio; the 22 was 21 + H5's review_queue.
+    expect(MUON_CONTEXT_TOOL_NAMES).toHaveLength(26);
+    // 10 = 9 + ADR-0069's question_withdraw (the asker's own typed terminal
+    // verb). The 9 was 6 + ADR-0043's question_ask/question_status +
+    // publish_finding (deliberate widening).
+    expect(MUON_COORDINATION_TOOL_NAMES).toHaveLength(10);
+    // 18 = 17 + A14's propose_amendment (ADR-0045's MCP wire; apply stays gated).
+    expect(MUON_CONTROL_TOOL_NAMES).toHaveLength(18);
+    expect(MUON_ORCHESTRATOR_TOOL_NAMES).toHaveLength(54);
+    expect(new Set(MUON_ORCHESTRATOR_TOOL_NAMES).size).toBe(54);
     expect(
       MUON_ORCHESTRATOR_TOOL_NAMES.every((name) =>
         /^[a-z][a-z0-9_]*$/.test(name)
@@ -170,6 +191,10 @@ describe("ADR-0028 Tier C: the attached coordinator", () => {
       "ship",
       "assign_roles",
       "propose_workflow",
+      // A14: granted because PROPOSING changes nothing. The remainder below is
+      // unchanged — `apply_workflow` is still absent, and this must not become
+      // the way around it.
+      "propose_amendment",
     ]);
     // `crew_roles` intentionally repeats (it lives in both the base
     // coordination tier and the observer tier by design — see

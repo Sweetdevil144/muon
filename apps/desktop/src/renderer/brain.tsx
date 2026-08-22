@@ -1068,6 +1068,15 @@ export function EvidencePanel(props: {
 
   return (
     <div className="workspace-panel-scroll evidence-workspace">
+      {/* The same page hero every other center tab opens with — Evidence used
+          to open on a bare search box, the one tab with no name on it. */}
+      <header className="workspace-page-head">
+        <strong>Evidence</strong>
+        <span>
+          What this mission actually did — jobs, gates, and audit events, with
+          the ids the review dock cites.
+        </span>
+      </header>
       <form
         className="brain-search"
         onSubmit={(event) => {

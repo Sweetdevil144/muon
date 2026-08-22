@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createObservatoryUploader,
   FLUSH_AT_COUNT,
+  OBSERVATORY_UPLOAD_PROVIDER,
 } from "../src/lib/observatory-upload.js";
 import type { ObservatoryRecord } from "../src/lib/observatory.js";
 
@@ -77,13 +78,16 @@ describe("ADR-0031 observatory uploader", () => {
     expect(entry.event).toBe("funnel.first_chat");
     expect(entry.distinct_id).toBe("device-1");
     expect(entry.timestamp).toBe("2026-08-07T00:00:00.000Z");
-    // Properties are the row minus name/at — and NOTHING extra.
+    // Properties are the row minus name/at, plus EXACTLY one deliberate key:
+    // `$ip: null`, which forbids PostHog's ingest from stamping the request's
+    // source IP onto the event (ADR-0095 D3; the review's F4).
     expect(entry.properties).toEqual({
       appVersion: "0.1.1",
       platform: "darwin",
       arch: "arm64",
       provider: "none",
       schema: 1,
+      $ip: null,
     });
   });
 
@@ -208,5 +212,106 @@ describe("revocation drops the buffer immediately, not at the next flush", () =>
     const h = harness();
     expect(() => h.uploader.discard()).not.toThrow();
     expect(h.uploader.pending()).toBe(0);
+  });
+});
+
+describe("v2 surface events on the wire (ADR-0095 shape pins)", () => {
+  // The appendix's discipline: assert the SHAPE of what leaves the machine.
+  // The wire payload is the spool row verbatim, so these pins are the egress
+  // audit for the three events the 2026-08-23 grant added.
+  const AT = "2026-08-23T00:00:00.000Z";
+  // The REAL configured provider (the review's F11: pinning "none" audited a
+  // payload production never emits).
+  const base = {
+    at: AT,
+    appVersion: "0.6.1",
+    platform: "darwin" as const,
+    arch: "arm64",
+    provider: OBSERVATORY_UPLOAD_PROVIDER,
+    schema: 2 as const,
+  };
+
+  async function send(record: ObservatoryRecord) {
+    const fetcher = vi.fn(async () => ({ ok: true }) as Response);
+    const up = makeUploader({ fetcher: fetcher as unknown as typeof fetch });
+    up.enqueue(record);
+    await up.flush();
+    const [, init] = fetcher.mock.calls[0]! as unknown as [string, RequestInit];
+    const body = String(init.body);
+    const parsed = JSON.parse(body) as {
+      batch: { event: string; distinct_id: string; properties: Record<string, unknown> }[];
+    };
+    return { body, entry: parsed.batch[0]! };
+  }
+
+  it("mcp.tool_call ships EXACTLY usage coordinates — never arguments or results", async () => {
+    const { body, entry } = await send({
+      name: "mcp.tool_call",
+      tool: "memory_search",
+      durationMs: 42,
+      error: "none",
+      client: "claude-code",
+      ...base,
+    } as ObservatoryRecord);
+    expect(entry.event).toBe("mcp.tool_call");
+    expect(entry.properties).toEqual({
+      tool: "memory_search",
+      durationMs: 42,
+      error: "none",
+      client: "claude-code",
+      appVersion: "0.6.1",
+      platform: "darwin",
+      arch: "arm64",
+      provider: OBSERVATORY_UPLOAD_PROVIDER,
+      schema: 2,
+      $ip: null,
+    });
+    for (const forbidden of ["query", "notes", "path", "token", "prompt", "arguments", "result"]) {
+      expect(body).not.toContain(`"${forbidden}"`);
+    }
+  });
+
+  it("identity gate events ship surface + coarse reason and NO identity coordinate", async () => {
+    const passed = await send({
+      name: "identity.gate_passed",
+      surface: "cli",
+      trigger: "command",
+      ...base,
+    } as ObservatoryRecord);
+    expect(passed.entry.properties).toEqual({
+      surface: "cli",
+      trigger: "command",
+      appVersion: "0.6.1",
+      platform: "darwin",
+      arch: "arm64",
+      provider: OBSERVATORY_UPLOAD_PROVIDER,
+      schema: 2,
+      $ip: null,
+    });
+    const refused = await send({
+      name: "identity.gate_refused",
+      surface: "mcp",
+      reason: "expired",
+      trigger: "tool_call",
+      ...base,
+    } as ObservatoryRecord);
+    expect(refused.entry.properties).toEqual({
+      surface: "mcp",
+      reason: "expired",
+      trigger: "tool_call",
+      appVersion: "0.6.1",
+      platform: "darwin",
+      arch: "arm64",
+      provider: OBSERVATORY_UPLOAD_PROVIDER,
+      schema: 2,
+      $ip: null,
+    });
+    // The 0052 rule, pinned at the egress boundary: no login, no id, no
+    // digest — the ONLY identifier on the wire is the anonymous device id.
+    for (const forbidden of ["login", "ghId", "ghLogin", "digest", "token", "email"]) {
+      expect(passed.body).not.toContain(`"${forbidden}"`);
+      expect(refused.body).not.toContain(`"${forbidden}"`);
+    }
+    expect(passed.entry.distinct_id).toBe("device-1");
   });
 });

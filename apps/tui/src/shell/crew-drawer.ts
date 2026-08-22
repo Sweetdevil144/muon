@@ -149,8 +149,17 @@ export class CrewDrawer implements Component {
       }
     });
 
+    // ADR-0087 M7: the detail is advertised where it is reachable — an
+    // unadvertised key is the inert-affordance defect inverted.
+    lines.push("");
+    lines.push(dimHint());
+
     return lines.map((line) => clip(line, width));
   }
+}
+
+function dimHint(): string {
+  return "  d roles + coordination detail · ⏎ attach · esc close";
 }
 
 function clip(line: string, width: number): string {

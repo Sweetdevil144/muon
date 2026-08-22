@@ -35,8 +35,21 @@ function fakeServer(body: string): string {
   return file;
 }
 
-/** A server that completes the handshake and lists exactly `tools`. */
-function listing(tools: readonly string[]): string {
+/**
+ * A server that completes the handshake and lists exactly `tools`.
+ *
+ * ADR-0052: when `whoami` is on offer the probe asks it for the gate state, so
+ * the fake answers that too — `gate` is what its `whoami` reports, and `null`
+ * models a server that lists `whoami` and never answers the call.
+ */
+function listing(
+  tools: readonly string[],
+  gate: string | null = "unarmed",
+  /** The WHOLE `structuredContent` whoami answers with, when the default
+   *  `{ identityGate: gate }` is not the shape under test — a build from before
+   *  the field existed answers the call and says nothing about the gate. */
+  structuredContent?: Record<string, unknown>
+): string {
   return `
 let buf = "";
 process.stdin.on("data", (chunk) => {
@@ -53,6 +66,11 @@ process.stdin.on("data", (chunk) => {
     if (msg.method === "tools/list") {
       process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: ${JSON.stringify(
         tools.map((name) => ({ name }))
+      )} } }) + "\\n");
+    }
+    if (msg.method === "tools/call" && ${JSON.stringify(gate !== null)}) {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { structuredContent: ${JSON.stringify(
+        structuredContent ?? { identityGate: gate }
       )} } }) + "\\n");
     }
   }
@@ -200,5 +218,139 @@ describe("the 2026-08-10 regression, end to end", () => {
       "question_ask",
       "question_status",
     ]);
+  });
+});
+
+/**
+ * ADR-0052. A gated `muon-mcp` answers `initialize` and `tools/list` in full —
+ * by design, so a vendor can still read the instructions that say it is locked.
+ * That is exactly what made the probe report `ok · 31 tools` about a server
+ * that would refuse all 31. The gate question closes that, and every case here
+ * is about it never costing the measurement the probe already made.
+ */
+describe("the probe reports whether the server is identity-locked", () => {
+  it("reads the state out of whoami's TYPED field", async () => {
+    for (const state of ["locked", "open", "unarmed"] as const) {
+      const outcome = await probeMcpToolNames({
+        command: NODE,
+        args: [fakeServer(listing(["whoami", "memory_search"], state))],
+        timeoutMs: 15_000,
+      });
+      expect(outcome.toolNames, state).toEqual(["whoami", "memory_search"]);
+      expect(outcome.identityGate, state).toBe(state);
+    }
+  });
+
+  it("a value this build does not recognise is NAMED, never a guess and never a null", async () => {
+    // THE THIRD OUTCOME. A newer server naming a fifth state must not be scored
+    // as one of the four — and it must not be folded into `null` either, which
+    // means "an older server never reported one" and is read by every caller as
+    // no lock. That fold is exactly how `muon mcp probe` printed `ok` and exited
+    // 0 against a server whose own permission state it could not read.
+    const outcome = await probeMcpToolNames({
+      command: NODE,
+      args: [fakeServer(listing(["whoami"], "quarantined"))],
+      timeoutMs: 15_000,
+    });
+    expect(outcome.toolNames).toEqual(["whoami"]);
+    expect(outcome.identityGate).toBeNull();
+    expect(outcome.unknownIdentityGate).toBe("quarantined");
+  });
+
+  it("bounds an unrecognised value so a verbose server cannot bury the refusal", async () => {
+    const outcome = await probeMcpToolNames({
+      command: NODE,
+      args: [fakeServer(listing(["whoami"], "z".repeat(5_000)))],
+      timeoutMs: 15_000,
+    });
+    expect(outcome.identityGate).toBeNull();
+    expect(outcome.unknownIdentityGate).toBe("z".repeat(64));
+  });
+
+  it("does not ask a server that does not list whoami", async () => {
+    // An older build, or a lapsed attached seat holding nothing. Calling an
+    // unlisted tool answers "unknown tool", which says nothing about the gate —
+    // and waiting for that answer would tax every probe of an old server.
+    const started = Date.now();
+    const outcome = await probeMcpToolNames({
+      command: NODE,
+      args: [fakeServer(listing(["memory_search"]))],
+      timeoutMs: 15_000,
+    });
+    expect(outcome.toolNames).toEqual(["memory_search"]);
+    expect(outcome.identityGate).toBeNull();
+    // ABSENT, not unreadable. This is the case that must keep exiting 0: an
+    // older server that never reports a gate state is an unknown, not a lock.
+    expect(outcome.unknownIdentityGate).toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("an answer with NO identityGate field at all stays a plain unknown", async () => {
+    // The `whoami` of a build from before the field existed: it answers the call
+    // and says nothing about the gate. Distinct from the case above (that server
+    // does not list `whoami` at all), and it must read the same way.
+    const outcome = await probeMcpToolNames({
+      command: NODE,
+      args: [fakeServer(listing(["whoami"], "unarmed", { agentId: "a-1" }))],
+      timeoutMs: 15_000,
+    });
+    expect(outcome.toolNames).toEqual(["whoami"]);
+    expect(outcome.identityGate).toBeNull();
+    expect(outcome.unknownIdentityGate).toBeUndefined();
+  });
+
+  it("ignores a stray stdout log line that happens to carry an id", async () => {
+    // REPRODUCED BEFORE THE FIX. A server is free to write structured logs on
+    // stdout — this suite already pins that it does — and pino-style lines
+    // carry an `id`. One `{"id":3,...}` finished the probe with
+    // `toolNames: null` and NO `failure` at all, which the CLI renders as
+    // `unevaluated` with no `why` line. A JSON-RPC response carries `result`
+    // or `error`; a log line carries neither, and that is the whole guard.
+    const noisy = `
+process.stdout.write(JSON.stringify({ id: 3, level: 30, msg: "req done" }) + "\\n");
+process.stdout.write(JSON.stringify({ id: 2, level: 30, msg: "listing" }) + "\\n");
+process.stdout.write(JSON.stringify({ id: 1, level: 30, msg: "hello" }) + "\\n");
+${listing(["whoami", "memory_search"], "locked")}`;
+    const outcome = await probeMcpToolNames({
+      command: NODE,
+      args: [fakeServer(noisy)],
+      timeoutMs: 15_000,
+    });
+    expect(outcome.toolNames).toEqual(["whoami", "memory_search"]);
+    // And the REAL answer survives: a stray id:3 must not be mistaken for the
+    // gate answer and blank out a genuine `locked`.
+    expect(outcome.identityGate).toBe("locked");
+    expect(outcome.failure).toBeUndefined();
+  });
+
+  it("does not turn a crash during the gate question into a clean probe", async () => {
+    // The regression the gate question introduced: before it existed, a server
+    // that died was `toolNames: null` → `unevaluated` → exit 1. Keeping the
+    // tool list is right, but it scores `ok`, so `failure` has to survive to
+    // the exit code — asserted in the CLI's own test.
+    const dies = `${listing(["whoami"], null)}
+setTimeout(() => process.exit(7), 300);`;
+    const outcome = await probeMcpToolNames({
+      command: NODE,
+      args: [fakeServer(dies)],
+      timeoutMs: 15_000,
+    });
+    expect(outcome.toolNames).toEqual(["whoami"]);
+    expect(outcome.identityGate).toBeNull();
+    expect(outcome.failure).toMatch(/exited .*before answering/);
+  });
+
+  it("still reports the TOOL LIST when the gate question goes unanswered", async () => {
+    // The tool list is the measurement this command exists for. A server that
+    // lists whoami and never answers the call must not turn a good probe into
+    // "the server did not answer tools/list", which scores as a stale build.
+    const outcome = await probeMcpToolNames({
+      command: NODE,
+      args: [fakeServer(listing(["whoami", "memory_search"], null))],
+      timeoutMs: 1_500,
+    });
+    expect(outcome.toolNames).toEqual(["whoami", "memory_search"]);
+    expect(outcome.identityGate).toBeNull();
+    expect(outcome.failure).toBeUndefined();
   });
 });

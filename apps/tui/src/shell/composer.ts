@@ -12,8 +12,8 @@ import { bold, cyan, dim, green, red, yellow } from "./theme.js";
  * terminal with governance bolted on and MUON's desk.
  *
  * IT DRIVES THE SHARED FORMS, NOT A PARALLEL PATH. `buildActionForm` and
- * `executeAction` (`lib/actions.ts`) are what the classic desk submits
- * through — same validation, same governed client calls, same error strings.
+ * `executeAction` (`lib/actions.ts`) carry the governed writes — same
+ * validation, same governed client calls, same error strings as the CLI.
  * A second implementation here would be a second dialect of a governed write,
  * which is the drift this repo has already paid for four times.
  *

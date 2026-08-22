@@ -8,6 +8,7 @@ import {
   summarizeLanes,
 } from "../src/renderer/lib/lane-status.js";
 import type { ReadinessSnapshotMeta } from "../src/shared/ipc.js";
+import { coordinatorVendorIds } from "@muon/client/vendors";
 
 /**
  * The three situations a human must act on DIFFERENTLY, and the trap that makes
@@ -205,7 +206,7 @@ describe("lane status — the roster comes from the registry", () => {
     expect(lanes.map((lane) => lane.vendor)).not.toContain("ollama");
   });
 
-  it("marks only claude-code and codex as coordinator-eligible", () => {
+  it("marks every fleet vendor coordinator-eligible, from the registry (ADR-0057)", () => {
     const lanes = buildLaneStatuses({
       vendors: fleetVendorIds(),
       readiness: null,
@@ -214,12 +215,25 @@ describe("lane status — the roster comes from the registry", () => {
       .filter((lane) => lane.coordinatorEligible)
       .map((lane) => lane.vendor)
       .sort();
-    expect(eligible).toEqual(["claude-code", "codex"]);
+    expect(eligible).toEqual(["claude-code", "codex", "cursor", "opencode"]);
+    // Eligibility must still be READ from the seat, not assumed for every lane
+    // the roster happens to hold — otherwise this assertion would keep passing
+    // for a vendor that lost its seat.
+    for (const lane of lanes) {
+      expect(lane.coordinatorEligible).toBe(
+        coordinatorVendorIds().includes(lane.vendor)
+      );
+    }
   });
 
-  it("keeps OpenCode's ceiling at scout alone", () => {
+  it("keeps OpenCode's WORKER ceiling at scout alone", () => {
     const lane = buildLaneStatus({ vendor: "opencode" });
-    expect(lane.roleScope.roles).toEqual(["scout"]);
+    // `orchestrator` is the seat ADR-0057 granted, not work MUON dispatches
+    // here; the lane copy is derived from the worker half (see `managedFor`).
+    expect(lane.roleScope.roles).toEqual(["orchestrator", "scout"]);
+    expect(lane.roleScope.managedFor).toBe("read-only crew roles only: scout");
+    expect(lane.roleScope.readOnly).toBe(true);
+    expect(lane.roleScope.coordinates).toBe(true);
     expect(lane.roleScope.takesUnplannedWork).toBe(false);
   });
 });

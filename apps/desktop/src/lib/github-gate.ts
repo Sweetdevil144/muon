@@ -20,20 +20,70 @@
  *    the explicit packaged-build escape hatch.
  */
 
-// One spelling of a boolean env flag, shared with the CLI's attach
-// requirement via @muon/client — two derivations of one policy switch is the
-// tier-derivation-drift pattern.
-import { booleanEnvFlag } from "@muon/client";
+/**
+ * ADR-0052 — THE ARMING POLICY IS NOT DEFINED HERE ANY MORE.
+ *
+ * It was, and then `@muon/client/github-identity-gate.ts` grew a byte-identical
+ * copy of it for the CLI and `muon-mcp` (same flag spelling, same 8–200 client
+ * id bounds, same degrade-ungated rule). Two implementations of one policy
+ * switch is the tier-derivation-drift pattern this repo has already paid for:
+ * the next person to widen the bounds, add a spelling, or change the degrade
+ * rule would have fixed one surface and shipped the other unchanged.
+ *
+ * So this file keeps only what is genuinely the DESKTOP's — the exempt channel
+ * list, the IPC wrapper, its refusal copy — and delegates the policy. The
+ * desktop's own vocabulary (`isPackaged`) is preserved at this boundary rather
+ * than pushed onto every call site: "a build somebody installed" is
+ * `app.isPackaged` here and a `muonDistributed` bake there, and one name for
+ * that fact per surface is correct. Behaviour is unchanged, which is what
+ * `tests/github-gate.test.ts` is for.
+ */
+import {
+  githubIdentityGateMisconfigured,
+  githubIdentityGateRequired,
+} from "@muon/client/github-identity-gate";
+import type { IdentityGateState } from "@muon/client/github-identity-gate";
 
 export type GitHubGateState = {
   /** The gate policy is armed for this build/run. */
   required: boolean;
   /** A device-flow credential is persisted; the gate is open. */
   satisfied: boolean;
+  /**
+   * ADR-0052 Decision 5 — the install-record consent sentence, composed in
+   * MAIN and carried over the bridge verbatim.
+   *
+   * It is not composed in the renderer for the same reason the probe refusal is
+   * not: `installRecordDisclosure()` lives in `@muon/client`, which reaches
+   * `node:fs`, and the renderer is a browser bundle. It is not RETYPED in the
+   * renderer for a better reason — this is consent text, and the review that
+   * added it found the desktop registering installs with no disclosure anywhere
+   * on the screen that collected the consent. One author, four surfaces.
+   *
+   * Absent when the gate is not armed, because an unarmed build records nothing
+   * and a disclosure about a record that is never filed is a false statement.
+   */
+  recordDisclosure?: string;
+  /**
+   * ADR-0052 F3 — the install RECORD's own state, surfaced to the renderer.
+   *
+   * The desktop registered installs in the background and reported failure with
+   * `console.warn`, which no operator has ever read: a machine whose first
+   * sign-in happened offline worked fine while every dispatched agent's MCP
+   * session was locked, with nothing on any screen connecting the two. Absent
+   * when the gate is not armed — an unarmed build registers nothing, so there is
+   * no state to report.
+   */
+  registration?: {
+    /** `open` = recorded. `locked-unregistered` = verified here, waiting. */
+    readonly state: Exclude<IdentityGateState, "unarmed">;
+    /** Why the last attempt did not land. Never a token, never a URL secret. */
+    readonly detail?: string;
+  };
 };
 
 /**
- * Whether this build ARMS the gate.
+ * Whether this build ARMS the gate. Delegates to the one evaluator.
  *
  * Packaged builds default ON — that is the launch requirement — but ONLY when
  * the GitHub App client id is actually configured: the device flow is the
@@ -49,11 +99,10 @@ export function githubGateRequired(input: {
   env: Readonly<Record<string, string | undefined>>;
   isPackaged: boolean;
 }): boolean {
-  const flag = booleanEnvFlag(input.env.MUON_REQUIRE_GITHUB_LOGIN);
-  if (flag !== undefined) return flag;
-  const clientId = input.env.MUON_GITHUB_CLIENT_ID?.trim() ?? "";
-  const clientConfigured = clientId.length >= 8 && clientId.length <= 200;
-  return input.isPackaged && clientConfigured;
+  return githubIdentityGateRequired({
+    env: input.env,
+    distributed: input.isPackaged,
+  });
 }
 
 /** True when a packaged build SHOULD be gated but cannot be (no client id) —
@@ -62,10 +111,10 @@ export function githubGateMisconfigured(input: {
   env: Readonly<Record<string, string | undefined>>;
   isPackaged: boolean;
 }): boolean {
-  const flag = booleanEnvFlag(input.env.MUON_REQUIRE_GITHUB_LOGIN);
-  if (flag !== undefined) return false; // explicit choice, not a mistake
-  const clientId = input.env.MUON_GITHUB_CLIENT_ID?.trim() ?? "";
-  return input.isPackaged && !(clientId.length >= 8 && clientId.length <= 200);
+  return githubIdentityGateMisconfigured({
+    env: input.env,
+    distributed: input.isPackaged,
+  });
 }
 
 /**

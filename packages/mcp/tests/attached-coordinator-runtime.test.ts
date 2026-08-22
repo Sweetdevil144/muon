@@ -28,6 +28,8 @@ import type { AttachedCoordinatorCapabilityFile } from "@muon/protocol";
 
 const capabilityConstructions: Array<{ apiBase: string; apiToken: string }> = [];
 const heartbeatCalls: string[] = [];
+const workflowListCalls: Array<{ filter: unknown; control: unknown }> = [];
+const budgetCalls: string[] = [];
 
 vi.mock("@muon/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@muon/client")>();
@@ -36,6 +38,30 @@ vi.mock("@muon/client", async (importOriginal) => {
       // @ts-expect-error forwarding a variadic constructor to the real class
       super(apiBase, fetcher, apiToken, ...rest);
       capabilityConstructions.push({ apiBase, apiToken: apiToken ?? "" });
+    }
+
+    override async getDispatchJob(jobId: string) {
+      return { id: jobId, chatId: "chat-attached", status: "running" } as DispatchJobRecord;
+    }
+
+    override async getDispatchBudget(jobId: string) {
+      budgetCalls.push(jobId);
+      return {
+        poolMs: 1,
+        reservedMs: 0,
+        consumedMs: 0,
+        remainingMs: 1,
+        children: [],
+      } as never;
+    }
+
+    override async listWorkflowRuns(filter?: unknown, control?: unknown) {
+      workflowListCalls.push({ filter, control });
+      return [];
+    }
+
+    override async listTasks() {
+      return [];
     }
 
     override async heartbeatAttachedCoordinator(jobId: string) {
@@ -86,6 +112,8 @@ beforeEach(() => {
   capabilityConstructions.length = 0;
   heartbeatCalls.length = 0;
   connectCalls.length = 0;
+  workflowListCalls.length = 0;
+  budgetCalls.length = 0;
   delete process.env.MUON_ATTACHED_CAPABILITY_FILE;
   delete process.env.MUON_MCP_MODE;
   process.env.MUON_AGENT_TOKEN = POISON_AGENT_TOKEN;
@@ -246,6 +274,84 @@ describe("runAttachedCoordinator", () => {
     ]) {
       expect(names).toContain(granted);
     }
+  });
+
+  it("a lane-scoped refusal from the REAL boot path names the seat, not a hand-launch", async () => {
+    // The seat marker is one line in index.ts (`seat: "attached-coordinator"`),
+    // and every other test that proves its effect hand-constructs the scope —
+    // so deleting that line kept the whole suite green while restoring the
+    // misdiagnosis measured live on 2026-08-13 ("This session was
+    // hand-launched", said to a seat holding a job). This walks the real
+    // `runAttachedCoordinator()` wiring instead.
+    const target = writeAttachedCoordinatorCapabilityFile(validCapability(), dir);
+    process.env.MUON_ATTACHED_CAPABILITY_FILE = target;
+
+    const before = trackedSignalListeners();
+    const { runAttachedCoordinator } = await import("../src/index.js");
+    await runAttachedCoordinator();
+    untrackNewSignalListeners(before);
+
+    const built = connectCalls[0] as { tools: Array<{ name: string; handler: (args: Record<string, unknown>) => Promise<{ isError?: boolean; content: Array<{ text?: string }> }> }> };
+    const remove = built.tools.find((tool) => tool.name === "memory_delete")!;
+
+    const refusal = await remove.handler({ noteId: "note-1" });
+    const text = refusal.content[0]?.text ?? "";
+
+    expect(refusal.isError).toBe(true);
+    expect(text).toMatch(/attached coordinator seat/i);
+    expect(text).not.toMatch(/hand-launched/i);
+    expect(text).not.toMatch(/runner's environment/i);
+  });
+
+  it("workflow_status from the REAL boot path carries the seat's caller-job capability", async () => {
+    // The other measured 2026-08-13 defect: the workflow routes authenticate
+    // the CALLER'S JOB, the seat's bearer carries one, and without these
+    // headers the read 403s — so the seat could `propose_workflow` and never
+    // read back its own run. `observer-tools.test.ts` proves the forwarding
+    // given a scope; this proves Tier C's factory actually populates that
+    // scope from the capability file, through main().
+    const target = writeAttachedCoordinatorCapabilityFile(validCapability(), dir);
+    process.env.MUON_ATTACHED_CAPABILITY_FILE = target;
+
+    const before = trackedSignalListeners();
+    const { runAttachedCoordinator } = await import("../src/index.js");
+    await runAttachedCoordinator();
+    untrackNewSignalListeners(before);
+
+    const built = connectCalls[0] as { tools: Array<{ name: string; handler: (args: Record<string, unknown>) => Promise<unknown> }> };
+    const status = built.tools.find((tool) => tool.name === "workflow_status")!;
+
+    await status.handler({ runId: "run-x" });
+
+    expect(workflowListCalls).toHaveLength(1);
+    expect(workflowListCalls[0]?.control).toEqual({
+      callerJobId: "job-attached-root",
+      delegationToken: "the-real-capability-token-from-the-file-not-ambient",
+    });
+  });
+
+  it("budget_status with NO argument reads the seat's own mission budget", async () => {
+    // Its description promises "omit it for this chat's mission", and the
+    // omission resolves from the orchestrator scope's jobId — which the
+    // observer wrapper used to drop, so a live seat was told "no jobId in
+    // scope" by a tool advertising exactly that call (30-tool sweep,
+    // 2026-08-13). Through the real boot path: the capability file's job must
+    // arrive at the budget read.
+    const target = writeAttachedCoordinatorCapabilityFile(validCapability(), dir);
+    process.env.MUON_ATTACHED_CAPABILITY_FILE = target;
+
+    const before = trackedSignalListeners();
+    const { runAttachedCoordinator } = await import("../src/index.js");
+    await runAttachedCoordinator();
+    untrackNewSignalListeners(before);
+
+    const built = connectCalls[0] as { tools: Array<{ name: string; handler: (args: Record<string, unknown>) => Promise<{ isError?: boolean; content: Array<{ text?: string }> }> }> };
+    const budget = built.tools.find((tool) => tool.name === "budget_status")!;
+
+    const result = await budget.handler({});
+
+    expect(result.isError).not.toBe(true);
+    expect(budgetCalls).toEqual(["job-attached-root"]);
   });
 
   it("persists each successful heartbeat expiry so a vendor restart can re-read the capability after the original lease", async () => {

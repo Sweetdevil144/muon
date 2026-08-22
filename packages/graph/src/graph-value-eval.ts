@@ -30,7 +30,7 @@ import type {
  * KG-12 GRAPH-VALUE ablation: does GRAPH STRUCTURE measurably beat flat hybrid
  * search on the SAME memory corpus?
  *
- * WHY THIS EXISTS. mem0 shipped a graph-memory subsystem, kept it for a year, and
+ * WHY THIS EXISTS. productM1 shipped a graph-memory subsystem, kept it for a year, and
  * deleted it (PR #4805) in favour of flat hybrid scoring. MUON carries the same
  * bet (`memoryNeighbors` N-hop traversal, a centrality ranking prior, provenance
  * paths), so before investing further we measure each signal's MARGINAL
@@ -43,7 +43,7 @@ import type {
  *                       text+kind+topics+MODULES. This arm is the honest control
  *                       for traversal: MUON already reads its anchors as TEXT.
  *   3. `+dense`         + semantic cosine candidates (the optional embeddings tier).
- *   4. `+entity`        + the R2 entity retriever (mem0 §5.3's signal, fused
+ *   4. `+entity`        + the R2 entity retriever (productM1 §5.3's signal, fused
  *                       through OUR RRF rather than their additive boost). A
  *                       FLAT signal: it adds candidates, so unlike the two arms
  *                       below it can move recall, not just order.
@@ -349,7 +349,7 @@ export function denseRank(
 
 /**
  * Entity candidates (R2) — mirrors the store's `entityCandidates`: extract the
- * query's entities (capped at 8, mem0 §5.3), find every ACTIVE note that MENTIONS
+ * query's entities (capped at 8, productM1 §5.3), find every ACTIVE note that MENTIONS
  * one, and rank by the summed class weight of the DISTINCT entities matched.
  *
  * The mirror is faithful in the two ways that matter. First, it consumes the same
@@ -371,7 +371,7 @@ export function entityRank(
     return [];
   }
   const rows: EntityMention[] = [];
-  // D-mem0-1: the eval computes the SAME corpus statistics the store queries for,
+  // D-productM1-1: the eval computes the SAME corpus statistics the store queries for,
   // over its own fixture corpus — `df` per key and N — so the ablation measures the
   // IDF-weighted arm the product actually ships. Deriving them here rather than
   // hard-coding them keeps the harness honest when the fixture grows.

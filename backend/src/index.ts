@@ -2,6 +2,11 @@ import {
   hydrateAttendanceFromStore,
   startUnattendedHorizonSweep,
 } from "./lib/unattended-horizon.js";
+import {
+  startForkSeedGc,
+  stopForkSeedGc,
+  sweepOrphanedForkSeeds,
+} from "./lib/fork-seed-gc.js";
 import { randomBytes } from "node:crypto";
 import { chmodSync } from "node:fs";
 import type { AddressInfo } from "node:net";
@@ -214,6 +219,19 @@ async function start() {
     await hydrateAttendanceFromStore();
     startUnattendedHorizonSweep();
 
+  // ADR-0071/0084 crash-window GC (D34): sweep fork seed stashes no task
+  // references. ONCE at startup — the moment after a crash is exactly when
+  // the artifact exists — then on a slow timer. Best-effort: a failed sweep
+  // degrades stated (logged) and never blocks the brain from serving.
+  void sweepOrphanedForkSeeds().catch((error) => {
+    console.error(
+      `fork-seed GC failed at startup: ${
+        error instanceof Error ? error.message : error
+      }`
+    );
+  });
+  startForkSeedGc();
+
   if (embedded) {
     // Loopback only, and on a STABLE port by default.
     //
@@ -314,6 +332,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // explicit used-signals accrued this session are not lost on restart (KG-2).
     await stopReinforcementFlush();
     stopAttachedCoordinatorSweep();
+    stopForkSeedGc();
     // Close the graph store cleanly so its lock/WAL release before restart (a
     // clean close means the next boot-probe never mistakes a live lock for
     // corruption).

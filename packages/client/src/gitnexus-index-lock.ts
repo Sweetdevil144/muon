@@ -33,8 +33,16 @@ export const GITNEXUS_INDEX_LOCK_FILE = "muon-index.lock";
  */
 export const GITNEXUS_INDEX_LOCK_MAX_HOLD_MS = 30 * 60_000;
 
-/** Which MUON surface holds the lock — for the refusal note, never for policy. */
-export type GitNexusIndexLockOwner = "desktop" | "mcp";
+/**
+ * Which MUON surface holds the lock — for the refusal note, never for policy.
+ *
+ * Safe to GROW: nothing validates a stored record's `owner` against this union
+ * (`readHolderAt` checks pid/startedAt/target/nonce only), and no branch is
+ * derived by subtracting from it. A lock written by a newer MUON with an owner
+ * this build has never heard of is still respected as held — which is the
+ * behaviour that matters, because the alternative is two indexers on one store.
+ */
+export type GitNexusIndexLockOwner = "desktop" | "mcp" | "cli";
 
 /** The complete record published in the lock file. Written in ONE atomic step. */
 export type GitNexusIndexLockHolder = {
@@ -123,6 +131,29 @@ export function readGitNexusIndexLock(
   repoRoot: string
 ): GitNexusIndexLockHolder | null {
   return readHolderAt(gitnexusIndexLockPath(repoRoot));
+}
+
+/**
+ * The MUON process rebuilding this store RIGHT NOW, or null.
+ *
+ * ADR-0054. Every surface needs to answer "is MUON already indexing this?" —
+ * the desktop masthead, `muon graph status`, a worker's brief, the reindex
+ * coordinator's own single-flight refusal — and until now only the process
+ * holding the in-memory flag could. A second channel (an IPC broadcast, a
+ * status file) would be a second thing to keep true; the lock file already IS
+ * the one cross-process record of an in-flight run, so this is a READ of it.
+ *
+ * Liveness-checked, unlike {@link readGitNexusIndexLock}: a lock file whose
+ * holder and analyze child are both dead is a corpse, and reporting it as
+ * "rebuilding now" would tell every surface to wait for a run that ended. The
+ * same `holderIsLive` the acquire path uses, so "held" and "in flight" can
+ * never mean two different things.
+ */
+export function readGitNexusIndexRebuild(
+  repoRoot: string
+): GitNexusIndexLockHolder | null {
+  const holder = readGitNexusIndexLock(repoRoot);
+  return holder && holderIsLive(holder) ? holder : null;
 }
 
 function readHolderAt(lockPath: string): GitNexusIndexLockHolder | null {

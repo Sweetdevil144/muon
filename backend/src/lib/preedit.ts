@@ -266,8 +266,10 @@ export type PreEditOptions = {
   injectionLimit?: number;
 };
 
-/** Standing kinds eligible for §3.3 path-triggered injection. */
-const PATH_INJECT_KINDS = ["constraint", "convention"] as const;
+/** Standing kinds eligible for §3.3 path-triggered injection. ADR-0091 D4:
+ *  ownership rides beside constraints — "whom to ask, why this shape" is
+ *  exactly the orientation a pre-edit read exists to force-surface. */
+const PATH_INJECT_KINDS = ["constraint", "convention", "ownership"] as const;
 /** Default per-preflight injection budget (substrate founder decision 2). */
 export const DEFAULT_INJECTION_LIMIT = 8;
 
@@ -285,6 +287,9 @@ export const MAX_ANCHOR_MODULES = 128;
  *  across tiers is decided by `onTarget`, never by this. */
 const KIND_PRIORITY: Record<MemoryKind, number> = {
   decision: 5,
+  // ADR-0091 D4: ownership surfaces beside constraints, so it shares their
+  // nudge tier.
+  ownership: 4,
   constraint: 4,
   convention: 3,
   attempt: 2,
@@ -390,7 +395,21 @@ export async function preEditContext(
     ...(target.symbol ? [target.symbol] : []),
     ...(radiusSymbols ?? []).filter((sym) => sym === target.symbol),
   ]);
-  const symbolModules = deriveModulesFromSymbols([...exactSymbolSet]);
+  // ONLY QUALIFIED SYMBOLS CARRY A MODULE. `moduleOfSymbol` returns an id
+  // without a `#` unchanged — correct for a module-shaped target, and wrong
+  // here: a bare symbol name like `resolveDataDir` became a module anchor
+  // literally called "resolveDataDir", a module that cannot exist. The gate
+  // then reported `requested 1, resolved 0`, indistinguishable from a real but
+  // barren module, and rendered as "nothing is recorded here yet, not even
+  // unconfirmed" — while two decision notes sat on the symbol's actual module.
+  //
+  // Filtered HERE rather than in `deriveModulesFromSymbols`, which is mirrored
+  // byte-for-byte in two packages and backs the ADR-0015 §3(f) never-widen
+  // filter. Narrowing that shared helper is a security-adjacent change for a
+  // presentation bug; this call site is the one that fabricates the anchor.
+  const symbolModules = deriveModulesFromSymbols(
+    [...exactSymbolSet].filter((sym) => sym.includes("#"))
+  );
 
   // ADR-0015 R3 (companion step 1), the REFERENCER symbols: radius symbols that are
   // NOT the exact target (CG-1's transitive referencers of the edit target). They

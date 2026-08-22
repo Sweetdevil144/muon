@@ -22,6 +22,7 @@ import {
   type AgentRole,
   type VendorEntry,
   type VendorId,
+  roleAuthorityOf,
 } from "@muon/protocol";
 import { createDefaultAdapters } from "@muon/adapters";
 import { buildApp } from "../src/app.js";
@@ -46,6 +47,8 @@ import { buildApp } from "../src/app.js";
 // and OpenCode must stay OUT of the coordinator seat and out of write roles.
 
 const prismaMock = vi.hoisted(() => ({
+  // The fork-pointer stamp reads the task on every create (D34).
+  task: { findUnique: vi.fn(async () => null) },
   dispatchJob: {
     create: vi.fn(),
     findFirst: vi.fn(),
@@ -103,10 +106,30 @@ vi.mock("../src/lib/graph.js", () => ({
   mirrorToGraph: () => undefined,
 }));
 
-/** Both positions, both vendors. The whole point of the file. */
-const COORDINATOR_CAPABLE = ["claude-code", "codex"] as const;
-/** Lanes that must NEVER reach the coordinator seat or a write role. */
-const NON_COORDINATOR = ["cursor", "opencode"] as const;
+/**
+ * THE TWO AXES THIS FILE KEEPS APART.
+ *
+ * Until ADR-0057 they were one list, and that conflation is the exact defect
+ * the ADR corrects: a coordinator SEAT is about MUON's own verbs (dispatch,
+ * steer, interrupt — all minted and gated by MUON), while a WRITE role is about
+ * the filesystem (enforced at the vendor boundary, because that is the only
+ * place it can be). A vendor can hold one without the other, and two of them
+ * now do. Every `it.each` below names which axis it is testing.
+ */
+
+/** May seat the super-orchestrator at ordinal 0 (`authority.coordinatorSeat`). */
+const SEAT_CAPABLE = ["claude-code", "codex", "cursor", "opencode"] as const;
+/**
+ * Holds NO seat. Empty among public vendors since ADR-0057. The refusal is
+ * still fail-closed machinery and is still proven — by `UNREGISTERED_VENDOR`
+ * ("is refused the coordinator seat") and by the zero-authority registered
+ * entry — so nothing here rests on an empty list.
+ */
+const NO_SEAT = [] as const;
+/** Ceiling includes a WRITE role, i.e. `implementer`. */
+const WRITE_CAPABLE = ["claude-code", "codex"] as const;
+/** Must NEVER hold a write role — seat or no seat. */
+const READ_ONLY_LANES = ["cursor", "opencode"] as const;
 
 /**
  * A vendor id MUON has never heard of. Used as the negative control on every
@@ -262,28 +285,55 @@ describe("the matrix is COMPLETE (a new vendor cannot skip stating its position)
     (id) => VENDOR_REGISTRY[id].authority.fleetSizeable
   );
 
-  it("COORDINATOR_CAPABLE ∪ NON_COORDINATOR === the public, fleet-sizeable vendors", () => {
-    const stated = [...COORDINATOR_CAPABLE, ...NON_COORDINATOR].sort();
-    expect(stated).toEqual([...fleetSizeable].sort());
+  it("BOTH axes partition the public, fleet-sizeable vendors", () => {
+    // A new vendor cannot skip stating its position on EITHER axis.
+    expect([...SEAT_CAPABLE, ...NO_SEAT].sort()).toEqual(
+      [...fleetSizeable].sort()
+    );
+    expect([...WRITE_CAPABLE, ...READ_ONLY_LANES].sort()).toEqual(
+      [...fleetSizeable].sort()
+    );
   });
 
-  it("states each vendor exactly once — no vendor is both", () => {
-    const stated = [...COORDINATOR_CAPABLE, ...NON_COORDINATOR];
-    expect(new Set(stated).size).toBe(stated.length);
+  it("states each vendor exactly once per axis — no vendor is both", () => {
+    for (const axis of [
+      [...SEAT_CAPABLE, ...NO_SEAT],
+      [...WRITE_CAPABLE, ...READ_ONLY_LANES],
+    ]) {
+      expect(new Set(axis).size).toBe(axis.length);
+    }
   });
 
   it("agrees with the registry about WHICH of them may seat the coordinator", () => {
-    // The two halves of the table are not free-standing opinions: they are the
+    // The halves of the table are not free-standing opinions: they are the
     // `coordinatorSeat` column, and a table that drifts from it would pin the
     // wrong boundary in every refusal below.
     expect(
       fleetSizeable.filter((id) => VENDOR_REGISTRY[id].authority.coordinatorSeat)
-    ).toEqual([...COORDINATOR_CAPABLE]);
+    ).toEqual([...SEAT_CAPABLE]);
     expect(
       fleetSizeable.filter(
         (id) => !VENDOR_REGISTRY[id].authority.coordinatorSeat
       )
-    ).toEqual([...NON_COORDINATOR]);
+    ).toEqual([...NO_SEAT]);
+  });
+
+  it("agrees with the registry about WHICH of them may hold a WRITE role", () => {
+    // The second axis, fenced as hard as the first. This is what makes the
+    // ADR-0057 seat grant provably NOT a write widening: if a future registry
+    // edit hands Cursor or OpenCode `implementer`, it fails HERE, and it fails
+    // for the right reason rather than as a side effect of a seat test.
+    expect(
+      fleetSizeable.filter((id) =>
+        VENDOR_REGISTRY[id].authority.supportedRoles.includes("implementer")
+      )
+    ).toEqual([...WRITE_CAPABLE]);
+    expect(
+      fleetSizeable.filter(
+        (id) =>
+          !VENDOR_REGISTRY[id].authority.supportedRoles.includes("implementer")
+      )
+    ).toEqual([...READ_ONLY_LANES]);
   });
 
   it("every ROLE_ONLY_REFUSAL really is capability-clean (the ceiling is the only net)", async () => {
@@ -309,7 +359,8 @@ describe("the matrix is COMPLETE (a new vendor cannot skip stating its position)
 });
 
 describe("vendor × position: SUPERAGENT (the Mission coordinator seat)", () => {
-  it.each(COORDINATOR_CAPABLE)(
+  // AXIS: the seat.
+  it.each(SEAT_CAPABLE)(
     "%s takes the coordinator seat with orchestrator mode, role, and authority",
     async (vendor) => {
       const app = buildApp();
@@ -342,33 +393,17 @@ describe("vendor × position: SUPERAGENT (the Mission coordinator seat)", () => 
     }
   );
 
-  it.each(NON_COORDINATOR)(
-    "%s is REFUSED the coordinator seat; nothing is enqueued",
-    async (vendor) => {
-      const app = buildApp();
-      const refused = await app.inject({
-        method: "POST",
-        url: "/api/dispatch",
-        payload: {
-          kind: "session",
-          vendor,
-          taskId: "task-chat-canonical",
-          brief: "run the mission",
-          chatId: "chat-1",
-          workspacePath: WORKSPACE,
-        },
-      });
-
-      expect(refused.statusCode).toBe(400);
-      expect(refused.json().message).toContain("orchestrator");
-      expect(prismaMock.dispatchJob.create).not.toHaveBeenCalled();
-      await app.close();
-    }
-  );
+  // The public no-seat half is EMPTY since ADR-0057, so an `it.each(NO_SEAT)`
+  // here would be a silent zero-test rather than a proof. The seat refusal
+  // itself is unchanged and is still proven twice, on ids that really do lack
+  // it: "a vendor MUON has never heard of … is refused the coordinator seat",
+  // and the zero-authority REGISTERED entry below it. Restore an each-block
+  // here the day a fifth public vendor lands without a seat.
 });
 
 describe("vendor × position: SUBAGENT (a plain dispatched worker)", () => {
-  it.each(COORDINATOR_CAPABLE)(
+  // AXIS: write. Holding a seat does NOT put a lane in this list.
+  it.each(WRITE_CAPABLE)(
     "%s dispatches as a worker with a write role and no coordinator authority",
     async (vendor) => {
       const app = buildApp();
@@ -396,11 +431,13 @@ describe("vendor × position: SUBAGENT (a plain dispatched worker)", () => {
 });
 
 describe("vendor × position: SUBAGENT (a delegated child)", () => {
-  // The full cross-product: EITHER coordinator vendor must be able to delegate
-  // to EITHER worker vendor. A same-vendor-only path would be exactly the
-  // silent second-class treatment this file exists to catch.
-  const pairs = COORDINATOR_CAPABLE.flatMap((parent) =>
-    COORDINATOR_CAPABLE.map((child) => [parent, child] as const)
+  // The full cross-product of the two axes: EVERY seat-holding vendor must be
+  // able to delegate a work-only child to EVERY write-capable vendor. A
+  // same-vendor-only path would be exactly the silent second-class treatment
+  // this file exists to catch — and after ADR-0057 the parent axis is wider
+  // than the child axis, which is the whole point: coordinating is not doing.
+  const pairs = SEAT_CAPABLE.flatMap((parent) =>
+    WRITE_CAPABLE.map((child) => [parent, child] as const)
   );
 
   it.each(pairs)(
@@ -443,7 +480,7 @@ describe("vendor × position: SUBAGENT (a delegated child)", () => {
     }
   );
 
-  it.each(COORDINATOR_CAPABLE)(
+  it.each(SEAT_CAPABLE)(
     "a %s coordinator can NEVER delegate the coordinator seat downward",
     async (parentVendor) => {
       prismaMock.dispatchJob.findUnique.mockResolvedValue(
@@ -470,7 +507,8 @@ describe("vendor × position: SUBAGENT (a delegated child)", () => {
     }
   );
 
-  it.each(NON_COORDINATOR)(
+  // AXIS: write. These two now HOLD a seat, and must still be refused here.
+  it.each(READ_ONLY_LANES)(
     "%s is REFUSED a delegated write role; nothing is enqueued",
     async (childVendor) => {
       prismaMock.dispatchJob.findUnique.mockResolvedValue(
@@ -610,11 +648,22 @@ describe("role admission: the refusals that rest ENTIRELY on `supportedRoles`", 
     // proves the wrong thing, so pin the positive half of each ceiling too.
     expect(VENDOR_REGISTRY.cursor.authority.supportedRoles).toContain("reviewer");
     expect(VENDOR_REGISTRY.opencode.authority.supportedRoles).toContain("scout");
-    // …and OpenCode's ceiling is EXACTLY that one role. Asserting the whole
-    // array (not just `toContain`) is what makes a future widening fail here.
+    // …and OpenCode's ceiling is EXACTLY these. Asserting the whole array (not
+    // just `toContain`) is what makes a future widening fail here.
     expect([...VENDOR_REGISTRY.opencode.authority.supportedRoles]).toEqual([
+      "orchestrator",
       "scout",
     ]);
+    // `orchestrator` is there for the SEAT and nothing else (ADR-0057 D4: a
+    // seat without it "would be a seat nothing can occupy"). So the tripwire
+    // that actually matters is the WORKER half of the ceiling — pin it
+    // separately, or the seat grant would have quietly bought a second role.
+    const workerRoles = (vendor: VendorId): AgentRole[] =>
+      VENDOR_REGISTRY[vendor].authority.supportedRoles.filter(
+        (role) => roleAuthorityOf(role) !== "coordinate"
+      );
+    expect(workerRoles("opencode")).toEqual(["scout"]);
+    expect(workerRoles("cursor")).not.toContain("implementer");
   });
 });
 

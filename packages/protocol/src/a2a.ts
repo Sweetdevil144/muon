@@ -208,11 +208,53 @@ export const peerMessageSchema = z
   .strict();
 export type PeerMessage = z.infer<typeof peerMessageSchema>;
 
+/**
+ * ADR-0065 — one cited note's verification against the offer ledger
+ * (ADR-0060): `offered: true` means MUON had put this note in front of the
+ * CITING chat before the citation. DERIVED at the receiving surface, never
+ * stored or caller-asserted; `offered: false` FLAGS (a D13 relay is
+ * legitimate), it never drops, and no surface resolves a cited id on trust
+ * either way (ADR-0035's ceiling, unchanged).
+ */
+export const citationAuditEntrySchema = z
+  .object({
+    noteId: recordId,
+    offered: z.boolean(),
+  })
+  .strict();
+export type CitationAuditEntry = z.infer<typeof citationAuditEntrySchema>;
+
+/** ADR-0065: per-message citation audits for a page of peer messages that
+ *  carry `refs.noteIds`, keyed by message id — a SIBLING field (the
+ *  message row schema is strict; the envelope is not) so rolling
+ *  upgrades strip it harmlessly. Audited against the SENDER's partition
+ *  at the message's own instant; absent when the ledger was unreadable.
+ *  ONE named schema on purpose (ADR-0086 D4): the agent inbox and the
+ *  operator transcript both carry it, and two inline spellings of the
+ *  same verdict shape is the drift the one-classifier doctrine forbids. */
+export const messageCitationAuditsSchema = z
+  .array(
+    z
+      .object({
+        messageId: recordId,
+        citations: z.array(citationAuditEntrySchema).max(MAX_PEER_REFS),
+      })
+      .strict()
+  )
+  // Bounded by the LARGEST envelope that carries it: the operator
+  // transcript pages up to MAX_PEER_MESSAGES_PER_JOB (the agent inbox's
+  // MAX_PEER_INBOX_PAGE is smaller and fits inside). A bound taken from
+  // the smaller page made a fully-citing operator page unparseable — the
+  // audit sibling would have REJECTED the transcript it exists to annotate.
+  .max(MAX_PEER_MESSAGES_PER_JOB);
+export type MessageCitationAudits = z.infer<typeof messageCitationAuditsSchema>;
+
 export const peerInboxSchema = z.object({
   messages: z.array(peerMessageSchema).max(MAX_PEER_INBOX_PAGE),
   /** Total undelivered count, so an agent knows it is truncated. */
   unread: z.number().int().min(0),
   truncated: z.boolean().default(false),
+  citationAudits: messageCitationAuditsSchema.optional(),
 });
 export type PeerInbox = z.infer<typeof peerInboxSchema>;
 
@@ -413,7 +455,7 @@ export const publishFindingSchema = z
   .object({
     /** The finding itself. Becomes an UNCONFIRMED note; no agent can vouch. */
     text: z.string().trim().min(1).max(4000),
-    kind: z.enum(["decision", "constraint", "convention", "attempt", "question"]),
+    kind: z.enum(["decision", "constraint", "convention", "attempt", "question", "ownership"]),
     /**
      * Where it applies: paths, `path#Symbol`, or modules. Resolved by MUON and
      * recorded as unresolved when it cannot be — never silently dropped.
@@ -435,6 +477,14 @@ export const publishFindingSchema = z
      * flight: it coordinates, and it is not settled knowledge.
      */
     outcome: z.enum(["worked", "abandoned", "superseded", "unknown"]).optional(),
+    /** ADR-0081: this finding DISPUTES another note (typically a sibling's
+     *  published finding). The server fences the target under the caller's
+     *  own read reach (forbidden reads as missing — existence is not
+     *  probeable), files a `contradicts` edge from the minted note, and
+     *  both surface together wherever contradiction edges already render
+     *  (preedit warnings, the dossier). Never destructive: the disputed
+     *  note stands until the confirm gate decides. */
+    contradictsNoteId: z.string().min(1).max(128).optional(),
   })
   .strict();
 export type PublishFinding = z.infer<typeof publishFindingSchema>;
@@ -446,6 +496,13 @@ export const publishFindingResultSchema = z.object({
   // path resolves anchors internally and does not report which ones failed, so
   // this could only have been filled with a guess. A field that looks like
   // evidence and is not is worse than its absence.
+  /** ADR-0065: the sender's own refs, audited — immediate feedback that a
+   *  cited id was (or was not) something the brain had offered this chat.
+   *  Absent when the ledger could not be read (an unreadable observation
+   *  must not accuse) and on pre-0065 servers. */
+  citations: z.array(citationAuditEntrySchema).max(MAX_PEER_REFS).optional(),
+  /** ADR-0081: echoed when the finding disputed a note — the edge landed. */
+  contradictsNoteId: recordId.optional(),
 });
 export type PublishFindingResult = z.infer<typeof publishFindingResultSchema>;
 

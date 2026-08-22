@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { readEnrolment, writeEnrolment } from "@muon/client/enrolment";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -615,10 +616,15 @@ describe("the muon mcp command surface", () => {
     expect(text).toContain(path.join(h.home, ".cursor", "mcp.json"));
     expect(text).toContain(MCP_BIN);
     expect(text).toContain("Tier this entry gets: agent");
-    expect(text).toContain("30 tools"); // +2: ADR-0043 question_ask/question_status
+    expect(text).toContain("36 tools"); // +1: ADR-0069 question_withdraw (was 35)
     expect(text).toContain("restart cursor-agent");
-    // §2.2: the two booleans, never conflated.
-    expect(text).toContain("holds NO coordinator seat");
+    // §2.2: the two booleans, never conflated — and since ADR-0057 Cursor's
+    // second boolean reads TRUE. The no-seat arm of `seatLine` is now
+    // unreachable for public vendors; it stays as fail-closed machinery and is
+    // fenced by "refuses a vendor with no coordinator seat" in
+    // mcp-attach.test.ts (which drives it with a mocked registry) and by the
+    // seat axis in backend's vendor-position matrix.
+    expect(text).toContain("holds the coordinator seat");
     // §3.1: the omissions are explained where the user reads them.
     expect(text).toContain("no MUON_API_BASE");
     expect(text).toContain("no MUON_MCP_MODE");
@@ -662,7 +668,7 @@ describe("the muon mcp command surface", () => {
     const text = out.mock.calls.map((call) => String(call[0])).join("");
     expect(text).toContain("MUON_MCP_MODE=observer");
     expect(text).toContain("MUON_CHAT_ID=chat-a");
-    expect(text).toContain("37 tools"); // +2: ADR-0043 question_ask/question_status
+    expect(text).toContain("43 tools"); // +1: ADR-0069 question_withdraw (was 42)
     expect(text).toContain("no dispatch, steer, interrupt");
   });
 
@@ -712,5 +718,74 @@ describe("the muon mcp command surface", () => {
     expect(process.exitCode).toBe(1);
     process.exitCode = 0;
     expect(fs.existsSync(path.join(h.home, ".cursor", "mcp.json"))).toBe(false);
+  });
+});
+
+describe("install merges into the recorded setup (founder, 2026-08-20)", () => {
+  function run(argv: string[], h: Harness, env: Record<string, string> = {}) {
+    const program = new Command();
+    program.exitOverride();
+    registerMcpCommands(program, { io: h.io, env });
+    return program.parseAsync(["node", "muon", ...argv]);
+  }
+
+  it("every install merges FAITHFULLY — each vendor records the mode it got", async () => {
+    const h = harness();
+    const dataDir = path.join(h.home, "muon-data");
+    // An observer-enrolled machine with claude-code already recorded…
+    writeEnrolment({ vendors: [{ id: "claude-code", mode: "observer" }] }, dataDir);
+
+    // …installs codex by hand in default (base) mode. Enrolment v2 carries
+    // the mode PER VENDOR, so this records exactly what happened: codex base,
+    // claude-code untouched — no machine-wide mode to lie about, and a later
+    // --repair restores each registration as it was made.
+    const argv = process.argv[1];
+    process.argv[1] = "/opt/muon/bin/muon";
+    try {
+      await run(["mcp", "install", "codex"], h, { MUON_DATA_DIR: dataDir });
+    } finally {
+      process.argv[1] = argv;
+    }
+
+    const stored = readEnrolment(dataDir);
+    expect(stored.ok).toBe(true);
+    if (!stored.ok) return;
+    expect(stored.enrolment.vendors).toEqual([
+      { id: "claude-code", mode: "observer" },
+      { id: "codex", mode: "base" },
+    ]);
+  });
+
+  it("a scoped or partitioned install is NOT recorded — repair could not honour it", async () => {
+    const h = harness();
+    const dataDir = path.join(h.home, "muon-data");
+    const argv = process.argv[1];
+    process.argv[1] = "/opt/muon/bin/muon";
+    try {
+      await run(["mcp", "install", "claude", "--scope", "project"], h, {
+        MUON_DATA_DIR: dataDir,
+      });
+    } finally {
+      process.argv[1] = argv;
+    }
+    // The enrolment re-applies at defaultScope with no chat; recording a
+    // project-scope install would make --repair rewrite a USER-scope entry
+    // the user never asked for.
+    expect(readEnrolment(dataDir).ok).toBe(false);
+  });
+
+  it("a dry run records nothing — it wrote nothing", async () => {
+    const h = harness();
+    const dataDir = path.join(h.home, "muon-data");
+    const argv = process.argv[1];
+    process.argv[1] = "/opt/muon/bin/muon";
+    try {
+      await run(["mcp", "install", "codex", "--dry-run"], h, {
+        MUON_DATA_DIR: dataDir,
+      });
+    } finally {
+      process.argv[1] = argv;
+    }
+    expect(readEnrolment(dataDir).ok).toBe(false);
   });
 });

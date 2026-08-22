@@ -13,6 +13,7 @@ import {
   languagesOf,
   type CypherRunner,
   type RepoSignals,
+  askIsSingleUnit,
 } from "../src/repo-map.js";
 
 // Fixtures shaped like the REAL local GitNexus graph (Community nodes with
@@ -659,5 +660,222 @@ describe("completenessCritique (Recon M5 — coverage diagnostic)", () => {
     // both repos are units → symbols fully covered
     expect(critique.symbolCoverage).toBe(1);
     expect(critique.recommendFollowUp).toBe(false);
+  });
+});
+
+/**
+ * Wave 1C (2026-08-20): crew sizing keyed ONLY on the repository, so a
+ * one-function fix in a 24k-symbol tree recommended the same crew as "audit
+ * the whole codebase". That is the measured reason a one-line instruction
+ * became a multi-agent mission — nothing in the recommendation had ever seen
+ * the instruction.
+ */
+describe("askIsSingleUnit", () => {
+  it("an explicit solo declaration is a fact, not a signal", () => {
+    expect(askIsSingleUnit({ solo: true })).toBe(true);
+    // Even alongside sweeping words — the caller has already decided.
+    expect(askIsSingleUnit({ solo: true, text: "audit the whole codebase" })).toBe(true);
+  });
+
+  it("recognises single-unit phrasing", () => {
+    for (const text of [
+      "do not dispatch, just fix the typo in repo-map.ts",
+      "rename one function in the CLI",
+      "fix this single file yourself",
+      "no crew — update the version string",
+      "fix this one file",
+      "do it yourself, no dispatch",
+    ]) {
+      expect(askIsSingleUnit({ text }), text).toBe(true);
+    }
+  });
+
+  it("does NOT fire on ordinary boilerplate that merely contains a narrow-sounding word", () => {
+    // Measured false positives (cubic pass-3): a silent crew shrink is the one
+    // outcome this design promises never to cause, so these fall back to
+    // repository sizing rather than claiming a single unit.
+    for (const text of [
+      "Familiarize yourself with the payment stack, then refactor the retry logic across the client and server",
+      "just fix all the failing handlers",
+      "just update every snapshot",
+      "just fix the failing assertion",
+    ]) {
+      expect(askIsSingleUnit({ text }), text).toBe(false);
+    }
+  });
+
+  it("an explicit declaration outranks a sweep word (real precedence, not tier-4 luck)", () => {
+    // Every input here MATCHES a sweep pattern, so it can only return true by
+    // EXPLICIT_SOLO being checked first. The previous version of this test used
+    // inputs that matched no sweep at all and passed via the single-target
+    // tier regardless of ordering — it asserted nothing about precedence.
+    for (const text of [
+      "audit this one file, do not dispatch", // `audit` is a STRONG_SWEEP
+      "sweep the retry helper, no crew", // `sweep` is a STRONG_SWEEP
+      "update all the callers, but do it yourself", // QUANTIFIED_SWEEP
+      "fix each handler, do not delegate", // QUANTIFIED_SWEEP
+    ]) {
+      expect(askIsSingleUnit({ text }), text).toBe(true);
+    }
+  });
+
+  it("a quantifier over FILLER is not a sweep — pronouns are not populations", () => {
+    // These over-dispatched: `all I`, `all tests`… the second IS a population
+    // and stays a sweep; the first is filler and must not override the single
+    // target the ask names.
+    expect(
+      askIsSingleUnit({ text: "fix the typo in this one file, that is all I need" })
+    ).toBe(true);
+    expect(
+      askIsSingleUnit({ text: "rename one function; make sure all tests still pass" })
+    ).toBe(false);
+  });
+
+  it("a CONNECTIVE between the quantifier and its population keeps the sweep", () => {
+    // The first version of the filler fix EXCLUDED the connectives, which threw
+    // away the population sitting behind them: each of these flipped from crew
+    // to solo, the dangerous direction per the module's own asymmetry rule.
+    for (const text of [
+      "update all of the callers of this function",
+      "fix every other caller in this file",
+      "update all those call sites in this file",
+      "fix all these bugs in this one module",
+    ]) {
+      expect(askIsSingleUnit({ text }), text).toBe(false);
+    }
+  });
+
+  it("…and the connective itself is never mistaken for the population", () => {
+    // The second version CONSUMED the connectives, which the engine could
+    // backtrack out of — letting "all of" match as if "of" were a population.
+    // Each of these names a single target, so a tier-3 misfire is visible as a
+    // wrong `false`.
+    for (const text of [
+      "that is all of it — just fix this one file",
+      "all of this is fine, only change this one function",
+      "all of you should know: rename this one symbol",
+    ]) {
+      expect(askIsSingleUnit({ text }), text).toBe(true);
+    }
+  });
+
+  it("a QUANTIFIED target is a crew even when it names one symbol", () => {
+    // "all the callers of this function" contains a single target and is still
+    // repo-wide work. Ambiguity resolves to false: a wrong `true` silently
+    // shrinks a crew, a wrong `false` only costs a recon pass.
+    for (const text of [
+      "update all the callers of this function",
+      "rename all the usages of this symbol",
+      "add this one line to every service",
+      "handle each edge case in this one function",
+    ]) {
+      expect(askIsSingleUnit({ text }), text).toBe(false);
+    }
+  });
+
+  it("breadth ALWAYS beats narrowness — 'just fix X in every service' is a sweep", () => {
+    expect(
+      askIsSingleUnit({ text: "just fix the auth bug in every service" })
+    ).toBe(false);
+    expect(askIsSingleUnit({ text: "audit one module at a time" })).toBe(false);
+    expect(
+      askIsSingleUnit({ text: "examine codebase for security issues" })
+    ).toBe(false);
+  });
+
+  it("an unrecognised ask falls back to repository sizing — never a silent shrink", () => {
+    expect(askIsSingleUnit({ text: "improve performance" })).toBe(false);
+    expect(askIsSingleUnit({ text: "" })).toBe(false);
+    expect(askIsSingleUnit(undefined)).toBe(false);
+  });
+});
+
+describe("recommendCrewSize honours the ask over the repository", () => {
+  const bigMap = {
+    workspacePath: "/ws",
+    confidence: "full" as const,
+    totals: { symbols: 24_745, clusters: 9, repos: 1, files: 900 },
+    repos: [],
+  } as unknown as Parameters<typeof recommendCrewSize>[0]["map"];
+  const caps = { maxChildren: 5, maxDescendants: 10 };
+
+  it("a 24k-symbol repo with a one-function ask returns 0", () => {
+    expect(
+      recommendCrewSize({
+        map: bigMap,
+        caps,
+        ask: { text: "rename one function in repo-map.ts, do not dispatch" },
+      })
+    ).toBe(0);
+  });
+
+  it("the SAME repo with a sweep ask still sizes a crew", () => {
+    expect(
+      recommendCrewSize({
+        map: bigMap,
+        caps,
+        ask: { text: "audit every module for security issues" },
+      })
+    ).toBeGreaterThan(0);
+  });
+
+  it("no ask at all behaves exactly as before", () => {
+    expect(recommendCrewSize({ map: bigMap, caps })).toBeGreaterThan(0);
+  });
+
+  it("an explicit solo beats load-bearing memory", () => {
+    expect(
+      recommendCrewSize({
+        map: bigMap,
+        caps,
+        ask: { solo: true },
+        memory: {
+          hotModules: [{ module: "auth", score: 0.9, noteCount: 5 }],
+          communities: [],
+        },
+      })
+    ).toBe(0);
+  });
+});
+
+
+/**
+ * Cubic pass-3 P1: once the ASK could produce a solo plan (Wave 1C), the
+ * completeness critique claimed `symbolCoverage: 1` over a 24k-symbol tree for
+ * "rename one function" — a fabricated evidence claim, which is the one thing
+ * a completeness critique must never emit.
+ */
+describe("completenessCritique never fabricates coverage for an ask-driven solo", () => {
+  const bigMap = {
+    workspacePath: "/ws",
+    confidence: "full" as const,
+    totals: { symbols: 24_745, clusters: 9, repos: 1, files: 900 },
+    repos: [],
+  } as unknown as Parameters<typeof planReconMission>[0]["map"];
+  const caps = { maxChildren: 5, maxDescendants: 10 };
+
+  it("reports ZERO coverage and says the rest is unexamined", () => {
+    const plan = planReconMission({
+      map: bigMap,
+      caps,
+      mission: "rename one function in repo-map.ts, do not dispatch",
+    });
+    expect(plan.strategy).toBe("solo");
+    expect(plan.soloReason).toBe("single-unit-ask");
+    const critique = completenessCritique(bigMap, plan);
+    expect(critique.symbolCoverage).toBe(0);
+    expect(critique.coveredSymbols).toBe(0);
+    expect(critique.totalSymbols).toBe(24_745);
+    expect(critique.gaps.join(" ")).toContain("UNEXAMINED");
+  });
+
+  it("the plan's own note no longer claims the repository is small", () => {
+    const plan = planReconMission({
+      map: bigMap,
+      caps,
+      mission: "fix this one file, no crew",
+    });
+    expect(plan.notes.join(" ")).not.toContain("small enough");
+    expect(plan.notes.join(" ")).toContain("single unit of work");
   });
 });

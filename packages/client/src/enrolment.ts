@@ -27,26 +27,63 @@ import { resolveDataDir } from "./paths.js";
  */
 export const ENROLMENT_FILE_NAME = "enrolment.json";
 
+const enrolmentModeSchema = z.enum(["base", "observer"]);
+
+/**
+ * v2 (2026-08-20): the MODE lives ON EACH VENDOR, not on the machine.
+ *
+ * v1 carried one machine-wide mode, and it could not tell the truth about a
+ * machine whose vendors were installed differently: a base `muon mcp install
+ * codex` on an observer-enrolled machine either had to be dropped from the
+ * record (repair then can't restore a successful install) or recorded under a
+ * mode it doesn't have (repair then rewrites it). Per-vendor mode is what the
+ * record was always claiming to be — the decision as made, per vendor.
+ */
 export const enrolmentSchema = z
   .object({
+    version: z.literal(2),
+    /**
+     * The vendors, in the order the human picked them, EACH with the mode it
+     * was registered in. An EMPTY array is a meaningful answer ("I chose
+     * none"), which is why absence of the file and an empty list are
+     * different states everywhere below.
+     */
+    vendors: z
+      .array(
+        z
+          .object({
+            id: z.string().min(1).max(64),
+            /**
+             * `base` is the durable full registration — no capability file,
+             * no token, no lease. `observer` is the read-only variant of the
+             * same durability.
+             */
+            mode: enrolmentModeSchema.default("base"),
+          })
+          .strict()
+      )
+      .max(32),
+    updatedAt: z.string().datetime(),
+  })
+  .strict();
+
+/** The v1 shape, still READ (and upgraded in memory) — never written. */
+const enrolmentV1Schema = z
+  .object({
     version: z.literal(1),
-    /**
-     * The vendors, in the order the human picked them. An EMPTY array is a
-     * meaningful answer ("I chose none"), which is why absence of the file and
-     * an empty list are different states everywhere below.
-     */
     vendors: z.array(z.string().min(1).max(64)).max(32),
-    /**
-     * The registration mode. `base` is the durable one — no capability file,
-     * no token, no lease, so it survives every restart and reboot on its own.
-     * `observer` is the read-only variant of the same durability.
-     */
-    mode: z.enum(["base", "observer"]).default("base"),
+    mode: enrolmentModeSchema.default("base"),
     updatedAt: z.string().datetime(),
   })
   .strict();
 
 export type Enrolment = z.infer<typeof enrolmentSchema>;
+export type EnrolmentVendor = Enrolment["vendors"][number];
+
+/** The ids alone, for every consumer that only asks WHICH vendors. */
+export function enrolledVendorIds(enrolment: Enrolment): string[] {
+  return enrolment.vendors.map((vendor) => vendor.id);
+}
 
 export function enrolmentFilePath(dataDir: string = resolveDataDir()): string {
   return path.join(dataDir, ENROLMENT_FILE_NAME);
@@ -71,7 +108,22 @@ export function readEnrolment(
     return { ok: false, reason: "absent" };
   }
   try {
-    return { ok: true, enrolment: enrolmentSchema.parse(JSON.parse(raw)) };
+    const parsed = JSON.parse(raw) as { version?: unknown };
+    // v1 upgrades IN MEMORY: each vendor inherits the machine-wide mode it was
+    // recorded under. The file is rewritten as v2 on the next write, not here
+    // — a read must never mutate the record it reports on.
+    if (parsed?.version === 1) {
+      const v1 = enrolmentV1Schema.parse(parsed);
+      return {
+        ok: true,
+        enrolment: enrolmentSchema.parse({
+          version: 2,
+          vendors: v1.vendors.map((id) => ({ id, mode: v1.mode })),
+          updatedAt: v1.updatedAt,
+        }),
+      };
+    }
+    return { ok: true, enrolment: enrolmentSchema.parse(parsed) };
   } catch (error) {
     return {
       ok: false,
@@ -86,18 +138,24 @@ export function readEnrolment(
  * enrolment is exactly the state `--fix` would then restore from.
  */
 export function writeEnrolment(
-  input: { vendors: readonly string[]; mode?: "base" | "observer" },
+  input: {
+    vendors: readonly { id: string; mode?: "base" | "observer" }[];
+  },
   dataDir: string = resolveDataDir(),
   now: Date = new Date()
 ): Enrolment {
+  // De-duplicated BY ID, order preserved, LAST mode wins: the list is a set,
+  // and a vendor named twice must not be installed twice or reported as two
+  // rows — but a re-record of the same vendor in a new mode is an update.
+  const byId = new Map<string, "base" | "observer">();
+  for (const vendor of input.vendors) {
+    const id = vendor.id.trim();
+    if (!id) continue;
+    byId.set(id, vendor.mode ?? "base");
+  }
   const enrolment = enrolmentSchema.parse({
-    version: 1,
-    // De-duplicated, order preserved: the list is a set, and a vendor named
-    // twice must not be installed twice or reported as two rows.
-    vendors: [...new Set(input.vendors.map((vendor) => vendor.trim()))].filter(
-      Boolean
-    ),
-    mode: input.mode ?? "base",
+    version: 2,
+    vendors: [...byId.entries()].map(([id, mode]) => ({ id, mode })),
     updatedAt: now.toISOString(),
   });
   const filePath = enrolmentFilePath(dataDir);

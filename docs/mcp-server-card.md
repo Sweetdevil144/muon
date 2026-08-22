@@ -69,13 +69,14 @@ Three properties define it:
 
 ## Tool tiers
 
-### Context — every governed session (21 tools)
+### Context — every governed session (26 tools)
 
 `memory_search`, `memory_recall`, `memory_neighbors`, `memory_explain`,
-`memory_delete`, `memory_clone`, `memory_add`, `memory_preedit`,
+`memory_delete`, `memory_clone`, `memory_add`, `memory_ground`, `memory_preedit`,
 `impact_memory`, `preflight_edit`, `task_context`, `handoff_read`, `code_query`,
 `code_context`, `code_impact`, `repo_map`, `review_diff`, `data_boundaries`,
-`flow_scope`, `capability_preflight`, `whoami`.
+`flow_scope`, `docs_query`, `docs_context`, `docs_impact`,
+`capability_preflight`, `whoami`, `review_queue`.
 
 The hero is `preflight_edit`: code-graph blast radius fused with governed
 memory, prior decisions, live sibling activity, and coverage telemetry, at
@@ -83,11 +84,26 @@ the edit boundary, in one read. Memory reads are workspace-partitioned
 (ADR-0026) and trust-gated (only human-confirmed memory reaches the strict
 gate view); `memory_delete` is governed by handle-scoped identity and the
 ledger's destructive-write authorization — it is not a free delete.
+`review_queue` names what is waiting on the human in the caller's own
+partition — pending gate ids and pending unconfirmed note ids — as
+coordinates only. It carries no confirm and no reject: those stay operator-tier
+on operator surfaces, and this tier has no decision verb at all.
 
-### Coordination — every worker (9 tools)
+The docs graph (ADR-0053) is the third leg: `docs_query` ranks the
+repository's own markdown sections lexically and labels each one's precedence
+tier, `docs_context` opens one document or one heading-addressed section with
+its links and code citations each carrying a resolution state, and
+`docs_impact` is the reverse index — which doc sections cite a given repository
+path. It reports citations and never a drift verdict, because a doc may be
+describing intent rather than shipped behaviour. Doc prose is imperative text,
+so all three carry the standard trust envelope as DATA and none of them feeds
+the worker brief: a doc may describe a rule, it never grants one.
+
+### Coordination — every worker (10 tools)
 
 `publish_finding`, `peer_message`, `peer_inbox`, `peer_wait`, `claim_files`,
-`release_files`, `question_ask`, `question_status`, `crew_roles`.
+`release_files`, `question_ask`, `question_status`, `question_withdraw`,
+`crew_roles`.
 
 Mission-bounded, horizontal, and deliberately authority-free: a peer message
 is untrusted data to its reader, a work claim is advisory, and `crew_roles`
@@ -96,25 +112,49 @@ agent LEARNED and announces it to the crew in one act — the note lands
 unconfirmed and the message carries its id, so a peer can look the finding up
 instead of receiving prose it cannot resolve. `question_ask` (ADR-0043) files a
 blocking question to the human inbox — it confers no authority, pauses
-nothing, and extends no budget; `question_status` reads back your own
-questions with their operator-authored answers.
+nothing, and extends no budget; when confirmed canon matches, the ask
+returns a MEMORY PRE-ANSWER (ADR-0069) beside the filed question.
+`question_status` reads back your own questions with their
+operator-authored answers, and `question_withdraw` closes your own
+question — optionally recording that the disclosed pre-answer settled it
+(typed reason + citations from that pre-answer; never a human close).
 
-### Control — the coordinator seat only (17 tools)
+### Control — the coordinator seat only (18 tools)
 
 `assign_roles`, `fleet_status`, `set_fleet`, `create_task`, `list_tasks`,
 `dispatch`, `read_stream`, `dispatch_status`, `budget_status`, `raise_budget`,
-`steer`, `interrupt`, `propose_workflow`, `apply_workflow`, `workflow_status`,
-`ship`, `check_approval`.
+`steer`, `interrupt`, `propose_workflow`, `apply_workflow`,
+`propose_amendment`, `workflow_status`, `ship`, `check_approval`.
 
 Dispatch rides the delegation manifest (depth / children / descendants /
 iterations / deadline caps, narrowing required); `ship` files the governed
-merge gate; approvals are decided by an operator-tier principal, never here.
+merge gate, and refuses to file it at all unless this session has run the
+context tier's review_diff for that task and the verdict was not review-blind —
+a preflight, not the gate, since the server-side review certification at
+approval time remains the authority. `propose_amendment` (ADR-0045) records an APPEND-ONLY
+draft of extra steps for a running plan and returns the gate tag a human
+approves; there is no amendment-apply verb at any tier. Approvals are decided
+by an operator-tier principal, never here.
 
 ### Delegate — governed sub-dispatch (1 tool)
 
 `delegate` — a child dispatch under the parent's own capped manifest. The
 delegate capability tier is context + coordination + this tool; it does not
 carry the control tier.
+
+## Babysit the crew in one turn (H4)
+
+For a seat that holds crew control: fleet_status (live seats, queueing,
+blockers) then dispatch_status (per-job truth — stall and watchdog reasons
+stated honestly, open blocking questions joined on, and a finished job's
+packet contract named, so a typed_degraded packet never reads as plain
+done). Then act: steer nudges a running job, interrupt stops a runaway,
+question_status shows what waits on a human, peer_wait waits boundedly on a
+peer's lifecycle. Every refusal is typed — rule, evidence, lawful next tool
+— and the attached remainder (set_fleet, raise_budget, apply_workflow)
+stays remainder: those are answered on operator surfaces, never in the
+session. A repair or continue-on-lane child cites its predecessor's packet
+via the dispatch tool's sourcePacketId argument.
 
 ## Environment contract (MUON-spawned sessions)
 
@@ -132,7 +172,7 @@ carry the control tier.
 
 Every tool listed above carries MCP annotations (`readOnlyHint` /
 `destructiveHint` / `idempotentHint` / `title`) from the `CONTRACTS` table in
-`packages/mcp/src/agent-ui.ts`, applied by `withAgentUiContracts` before the
+`packages/mcp/src/agent-ui.ts`, applied by `withAgentUi` before the
 stdio server advertises the tool. Example: `memory_delete` is
 `readOnlyHint: false`, `destructiveHint: true`, `idempotentHint: true`.
 

@@ -8,7 +8,12 @@ import type { DiffImpact } from "@muon/client/diff-impact";
 
 export type ReviewDiffChipTone = "clear" | "blind" | "neutral";
 
-export type ReviewDiffBlindReason = "unindexed" | "stale" | "new-files";
+export type ReviewDiffBlindReason =
+  | "unindexed"
+  | "stale"
+  /** Freshness could not be measured — neither current nor provably behind. */
+  | "unknown-freshness"
+  | "new-files";
 
 export type ReviewDiffSummary = {
   chip: { label: string; tone: ReviewDiffChipTone };
@@ -64,9 +69,17 @@ export function summarizeReviewDiff(impact: DiffImpact): ReviewDiffSummary {
     reason = "unindexed";
     message = `This workspace isn't indexed yet — ${blindCount} changed file${blindCount === 1 ? "" : "s"} can't be checked against the graph. Index it to review them.`;
     canReindex = true;
-  } else if (indexFreshness.stale) {
+  } else if (indexFreshness.stale === true) {
     reason = "stale";
     message = `The code graph is behind HEAD (indexed ${shortSha(indexFreshness.graphCommit)} vs ${shortSha(indexFreshness.headCommit)}) — ${blindCount} file${blindCount === 1 ? "" : "s"} unreviewed until you re-index.`;
+    canReindex = true;
+  } else if (indexFreshness.stale !== false) {
+    // UNKNOWN freshness. Previously fell through to the `new-files` arm and
+    // blamed "new/unindexed files" — a specific, wrong diagnosis for a graph
+    // whose own commit could not be read, and one that pointed the operator at
+    // reviewing files instead of at the index.
+    reason = "unknown-freshness";
+    message = `Can't tell whether the code graph matches HEAD (the diff's commit could not be read), so the flow evidence can't be trusted${blindCount > 0 ? ` and ${blindCount} file${blindCount === 1 ? "" : "s"} is blind` : ""}. Re-index to get a reviewable answer.`;
     canReindex = true;
   } else {
     reason = "new-files";

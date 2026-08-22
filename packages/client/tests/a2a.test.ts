@@ -46,7 +46,7 @@ describe("A2A agent tier (identity is never caller-supplied)", () => {
   it("POSTs only the sendable envelope — no chat, mission, or sender field", async () => {
     const fetcher = vi.fn(async () => json({ message: peerMessage() }));
 
-    const message = await sendPeerMessage({
+    const { message } = await sendPeerMessage({
       apiBase: "http://127.0.0.1:4000/",
       apiToken: "job-bearer",
       message: {
@@ -284,9 +284,21 @@ describe("A2A agent tier (identity is never caller-supplied)", () => {
 });
 
 describe("A2A operator tier", () => {
-  it("lists one chat's mission traffic", async () => {
-    const fetcher = vi.fn(async () => json({ messages: [peerMessage()] }));
-    const messages = await listPeerMessages({
+  it("lists one chat's mission traffic, with the citation-audit sibling when the server sends one", async () => {
+    const fetcher = vi.fn(async () =>
+      json({
+        messages: [peerMessage()],
+        // ADR-0086 D2: the operator envelope carries the same sibling the
+        // agent inbox does; older servers simply omit it.
+        citationAudits: [
+          {
+            messageId: "msg-1",
+            citations: [{ noteId: "mem-1", offered: false }],
+          },
+        ],
+      })
+    );
+    const transcript = await listPeerMessages({
       apiBase: "http://127.0.0.1:4000",
       apiToken: "operator-token",
       chatId: "chat-a",
@@ -302,7 +314,22 @@ describe("A2A operator tier", () => {
         }),
       })
     );
-    expect(messages).toHaveLength(1);
+    expect(transcript.messages).toHaveLength(1);
+    expect(transcript.citationAudits).toEqual([
+      { messageId: "msg-1", citations: [{ noteId: "mem-1", offered: false }] },
+    ]);
+  });
+
+  it("an older server's bare envelope still parses — the sibling is optional", async () => {
+    const fetcher = vi.fn(async () => json({ messages: [peerMessage()] }));
+    const transcript = await listPeerMessages({
+      apiBase: "http://127.0.0.1:4000",
+      apiToken: "operator-token",
+      chatId: "chat-a",
+      fetcher,
+    });
+    expect(transcript.messages).toHaveLength(1);
+    expect(transcript.citationAudits).toBeUndefined();
   });
 
   it("loads the coordinates-only coordination snapshot", async () => {

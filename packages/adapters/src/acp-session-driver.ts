@@ -97,7 +97,7 @@ type JsonRpcMessage = {
 export type AcpSessionDriverOptions = {
   /** The vendor lane this driver instance serves (registry id). */
   laneKey: string;
-  /** The vendor's ACP entrypoint, e.g. `gemini` / `openhands`. */
+  /** The vendor's ACP entrypoint, e.g. `gemini` / `productD`. */
   command: string;
   /** Args that put the binary into ACP mode, e.g. `["--experimental-acp"]`. */
   args?: readonly string[];

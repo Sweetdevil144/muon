@@ -183,7 +183,7 @@ describe("extractMemoriesViaLane", () => {
   });
 });
 
-// ── §7 prompt techniques ported from mem0 ────────────────────────────────────
+// ── §7 prompt techniques ported from productM1 ────────────────────────────────────
 
 describe("buildMemoryExtractionBrief", () => {
   const source = { type: "stream" as const, text: "the work log body" };
@@ -206,7 +206,7 @@ describe("buildMemoryExtractionBrief", () => {
     expect(brief).toMatch(/restatements of the task brief/i);
     expect(brief).toMatch(/commentary about itself/i);
     expect(brief).toContain("Return 0 to 4 notes");
-    // Still MUON's five kinds, never mem0's consumer-fact framing.
+    // Still MUON's five kinds, never productM1's consumer-fact framing.
     for (const kind of ["decision", "constraint", "convention", "attempt", "question"]) {
       expect(brief).toContain(`- ${kind}:`);
     }

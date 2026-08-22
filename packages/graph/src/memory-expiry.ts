@@ -140,3 +140,20 @@ export function memoryNotExpiredClause(now?: string | null): {
     params: { [MEMORY_EXPIRY_PARAM]: resolveExpiryNow(now) },
   };
 }
+
+/**
+ * ADR-0061 D1.2 — the EXPIRED-ONLY inverse, for the withheld-stub disclosure
+ * query and nothing else. Same inseparable clause+param shape (an unbound
+ * `$now` here would read every note as expired-only, silently disclosing the
+ * whole partition as stubs). `NOT(not-expired)` by construction, so the two
+ * views partition the same universe and cannot drift term by term.
+ */
+export function memoryExpiredOnlyClause(now?: string | null): {
+  condition: string;
+  params: Record<typeof MEMORY_EXPIRY_PARAM, string>;
+} {
+  return {
+    condition: `NOT ${NOT_EXPIRED_CLAUSE}`,
+    params: { [MEMORY_EXPIRY_PARAM]: resolveExpiryNow(now) },
+  };
+}

@@ -23,6 +23,17 @@ const graphMock = vi.hoisted(() => ({
   recallMemory: vi.fn(),
   relatedToTask: vi.fn(),
   searchMemory: vi.fn(),
+  // ADR-0061: the disclosed façades ride the SAME underlying fns, so every
+  // existing mockResolvedValue seeding keeps working; tests that want
+  // candidates override these directly.
+  searchMemoryDisclosed: vi.fn(async (...args: unknown[]) => ({
+    notes: await (graphMock.searchMemory as (...a: unknown[]) => Promise<unknown[]>)(...args),
+    withheldCandidates: [],
+  })),
+  recallMemoryDisclosed: vi.fn(async (...args: unknown[]) => ({
+    notes: await (graphMock.recallMemory as (...a: unknown[]) => Promise<unknown[]>)(...args),
+    withheldCandidates: [],
+  })),
 }));
 const ledgerMock = vi.hoisted(() => ({
   applyMemoryExpiry: vi.fn(),
@@ -42,6 +53,7 @@ vi.mock("../src/lib/operator-settings.js", () => settingsMock);
 vi.mock("../src/lib/memory-ledger.js", () => ({
   // Used by the route's SECOND, ledger-backed gate pass (redactExpiredNodes).
   applyMemoryExpiry: ledgerMock.applyMemoryExpiry,
+  mintContradictionEdge: vi.fn(),
   getMemoryNote: vi.fn(),
   ingestMemoryNote: vi.fn(),
   listMemoryLibrary: vi.fn(),

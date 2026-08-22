@@ -50,9 +50,9 @@ const emptySnapshot = {
 
 describe("ADR-0026 step 4: every CLI read DEFAULTS to the invoking workspace", () => {
   it("search sends the cwd with no flag at all", async () => {
-    const searchMemory = vi.fn().mockResolvedValue([]);
+    const searchMemory = vi.fn().mockResolvedValue({ notes: [] });
     await run(["memory", "search", "idempotency"], {
-      searchMemory,
+      searchMemoryDisclosed: searchMemory,
     } as unknown as Partial<MuonApiClient>);
     expect(searchMemory).toHaveBeenCalledWith(
       "idempotency",
@@ -63,9 +63,9 @@ describe("ADR-0026 step 4: every CLI read DEFAULTS to the invoking workspace", (
   });
 
   it("recall sends the cwd with no flag at all", async () => {
-    const recallMemory = vi.fn().mockResolvedValue([]);
+    const recallMemory = vi.fn().mockResolvedValue({ notes: [] });
     await run(["memory", "recall", "--module", "src/pay/charge.ts"], {
-      recallMemory,
+      recallMemoryDisclosed: recallMemory,
     } as unknown as Partial<MuonApiClient>);
     expect(recallMemory).toHaveBeenCalledWith(
       expect.objectContaining({ workspace: process.cwd() })
@@ -139,10 +139,10 @@ describe("ADR-0026 step 4: every CLI read DEFAULTS to the invoking workspace", (
 
 describe("ADR-0026 step 4: --workspace and --unscoped", () => {
   it("--workspace replaces the default", async () => {
-    const searchMemory = vi.fn().mockResolvedValue([]);
+    const searchMemory = vi.fn().mockResolvedValue({ notes: [] });
     await run(
       ["memory", "search", "--workspace", "/Users/dev/SWE/repo-b", "idempotency"],
-      { searchMemory } as unknown as Partial<MuonApiClient>
+      { searchMemoryDisclosed: searchMemory } as unknown as Partial<MuonApiClient>
     );
     expect(searchMemory).toHaveBeenCalledWith(
       "idempotency",
@@ -151,9 +151,9 @@ describe("ADR-0026 step 4: --workspace and --unscoped", () => {
   });
 
   it("--unscoped asks for the §8 residue and sends NO workspace", async () => {
-    const searchMemory = vi.fn().mockResolvedValue([]);
+    const searchMemory = vi.fn().mockResolvedValue({ notes: [] });
     await run(["memory", "search", "--unscoped", "idempotency"], {
-      searchMemory,
+      searchMemoryDisclosed: searchMemory,
     } as unknown as Partial<MuonApiClient>);
     const options = searchMemory.mock.calls[0]![1];
     expect(options.unscoped).toBe(true);
@@ -162,7 +162,7 @@ describe("ADR-0026 step 4: --workspace and --unscoped", () => {
   });
 
   it("refuses --workspace with --unscoped rather than preferring one", async () => {
-    const searchMemory = vi.fn().mockResolvedValue([]);
+    const searchMemory = vi.fn().mockResolvedValue({ notes: [] });
     await run(
       [
         "memory",
@@ -193,9 +193,9 @@ describe("ADR-0026 §8: every printed row is LABELLED with its workspace", () =>
       });
     try {
       await run(["memory", "search", "idempotency"], {
-        searchMemory: vi
-          .fn()
-          .mockResolvedValue([note, { ...note, id: "mem-2", workspacePath: null }]),
+        searchMemoryDisclosed: vi.fn().mockResolvedValue({
+          notes: [note, { ...note, id: "mem-2", workspacePath: null }],
+        }),
       } as unknown as Partial<MuonApiClient>);
     } finally {
       spy.mockRestore();

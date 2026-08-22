@@ -78,3 +78,60 @@ describe("summarizeReviewDiff", () => {
     expect(s.blind?.message).toMatch(/not a pass when files are blind/i);
   });
 });
+
+// Traced defect: the desktop builds its OWN IndexFreshness and used to spell
+// "could not measure" as `stale: false`, so an unreadable commit pair fell
+// through to the new-files arm — a confident, wrong diagnosis on the surface
+// that gates a merge, pointing the operator at reviewing files instead of at
+// the index.
+describe("summarizeReviewDiff — freshness that could not be measured", () => {
+  it("does not blame new files for an unreadable index", () => {
+    const s = summarizeReviewDiff(
+      impact({
+        verdict: "review-blind",
+        totals: { changedFiles: 2, resolvedFiles: 2, blindFiles: 0, changedSymbols: 0, affectedProcesses: 0 },
+        indexFreshness: { graphCommit: "abc1234", stale: null },
+      })
+    );
+    expect(s.blind?.reason).toBe("unknown-freshness");
+    expect(s.blind?.message).not.toMatch(/new\/unindexed/);
+    expect(s.blind?.message).toMatch(/could not be read/);
+    // Re-indexing IS the remedy here, unlike the new-files arm where it is not.
+    expect(s.blind?.canReindex).toBe(true);
+  });
+
+  it("names blind files when there are some, without misattributing the cause", () => {
+    const s = summarizeReviewDiff(
+      impact({
+        verdict: "review-blind",
+        totals: { changedFiles: 3, resolvedFiles: 1, blindFiles: 2, changedSymbols: 0, affectedProcesses: 0 },
+        indexFreshness: { graphCommit: "abc1234", stale: null },
+      })
+    );
+    expect(s.blind?.reason).toBe("unknown-freshness");
+    expect(s.blind?.message).toMatch(/2 files is blind/);
+  });
+
+  it("keeps the STALE arm for a freshness that was measured and is behind", () => {
+    const s = summarizeReviewDiff(
+      impact({
+        verdict: "review-blind",
+        totals: { changedFiles: 1, resolvedFiles: 1, blindFiles: 0, changedSymbols: 0, affectedProcesses: 0 },
+        indexFreshness: { graphCommit: "abc1234", headCommit: "def5678", stale: true },
+      })
+    );
+    expect(s.blind?.reason).toBe("stale");
+  });
+
+  it("keeps the NEW-FILES arm for a measured-current index with blind files", () => {
+    const s = summarizeReviewDiff(
+      impact({
+        verdict: "review-blind",
+        totals: { changedFiles: 2, resolvedFiles: 1, blindFiles: 1, changedSymbols: 0, affectedProcesses: 0 },
+        indexFreshness: { graphCommit: "abc1234", headCommit: "abc1234", stale: false },
+      })
+    );
+    expect(s.blind?.reason).toBe("new-files");
+    expect(s.blind?.canReindex).toBe(false);
+  });
+});

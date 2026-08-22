@@ -11,10 +11,13 @@ const ROOT_A_TOKEN = `root-a-${"a".repeat(58)}`;
 const WORKER_A_TOKEN = `worker-a-${"b".repeat(56)}`;
 const DELEGATE_A_TOKEN = `delegate-a-${"c".repeat(54)}`;
 const ROOT_B_TOKEN = `root-b-${"d".repeat(58)}`;
+const FORK_ROOT_TOKEN = `fork-root-${"e".repeat(54)}`;
+const FORK_BARE_TOKEN = `fork-bare-${"f".repeat(54)}`;
 const WORKSPACE = process.cwd();
 const auth = (token: string) => ({ authorization: `Bearer ${token}` });
 
 let dir: string;
+let previousDataDir: string | undefined;
 let db: typeof import("../src/lib/db.js");
 let graphLib: typeof import("../src/lib/graph.js");
 let app: FastifyInstance;
@@ -38,6 +41,10 @@ beforeAll(async () => {
   process.env.DATABASE_URL = `file:${path.join(dir, "test.db")}`;
   process.env.MUON_GRAPH_DIR = path.join(dir, "graph");
   process.env.MUON_OPERATOR_TOKEN = OPERATOR;
+  // ADR-0084: the fork-seed stash lives under the data dir; point it into
+  // the scratch so the inheritance pin never touches the real one.
+  previousDataDir = process.env.MUON_DATA_DIR;
+  process.env.MUON_DATA_DIR = path.join(dir, "data");
   process.env.MUON_AGENT_TOKEN = AGENT;
   delete process.env.MUON_API_TOKEN;
 
@@ -235,12 +242,84 @@ beforeAll(async () => {
       },
     ],
   });
+  // ADR-0084 fixtures: two fork missions — one whose root task holds a
+  // captured seed stash, one whose stash is gone (the refusal case).
+  await db.prisma.task.createMany({
+    data: [
+      {
+        id: "task-fork-root",
+        title: "Fork mission root",
+        description: "Fork-mission root task for inheritance tests.",
+        status: "in_progress",
+        workspacePath: WORKSPACE,
+        chatId: "chat-fork",
+        forkSourceTaskId: "task-orig-src",
+      },
+      {
+        id: "task-fork-bare",
+        title: "Fork mission without a stash",
+        description: "Fork-mission root whose seed stash is gone.",
+        status: "in_progress",
+        workspacePath: WORKSPACE,
+        chatId: "chat-fork-bare",
+        forkSourceTaskId: "task-orig-src",
+      },
+    ],
+  });
+  await db.prisma.orchestratorChat.createMany({
+    data: [
+      {
+        id: "chat-fork",
+        title: "Fork chat",
+        workspacePath: WORKSPACE,
+        taskId: "task-fork-root",
+      },
+      {
+        id: "chat-fork-bare",
+        title: "Fork chat, bare",
+        workspacePath: WORKSPACE,
+        taskId: "task-fork-bare",
+      },
+    ],
+  });
+  await db.prisma.dispatchJob.createMany({
+    data: [
+      {
+        id: "job-fork-root",
+        kind: "session",
+        vendor: "codex",
+        taskId: "task-fork-root",
+        chatId: "chat-fork",
+        brief: "Coordinate the fork mission.",
+        workspacePath: WORKSPACE,
+        capabilityMode: "orchestrator",
+        status: "running",
+        dispatchedBy: "human",
+        forkSourceTaskId: "task-orig-src",
+      },
+      {
+        id: "job-fork-bare",
+        kind: "session",
+        vendor: "codex",
+        taskId: "task-fork-bare",
+        chatId: "chat-fork-bare",
+        brief: "Coordinate the stashless fork mission.",
+        workspacePath: WORKSPACE,
+        capabilityMode: "orchestrator",
+        status: "running",
+        dispatchedBy: "human",
+        forkSourceTaskId: "task-orig-src",
+      },
+    ],
+  });
   await db.prisma.delegationGrant.createMany({
     data: [
       ["job-root-a", ROOT_A_TOKEN],
       ["job-worker-a", WORKER_A_TOKEN],
       ["job-delegate-a", DELEGATE_A_TOKEN],
       ["job-root-b", ROOT_B_TOKEN],
+      ["job-fork-root", FORK_ROOT_TOKEN],
+      ["job-fork-bare", FORK_BARE_TOKEN],
     ].map(([jobId, token]) => ({
       jobId: jobId!,
       tokenHash: createHash("sha256").update(token!).digest("hex"),
@@ -308,6 +387,12 @@ afterAll(async () => {
   await graphLib.closeGraph();
   await db.prisma.$disconnect();
   rmSync(dir, { recursive: true, force: true });
+  // Restore, never leak a deleted path into same-worker suites.
+  if (previousDataDir === undefined) {
+    delete process.env.MUON_DATA_DIR;
+  } else {
+    process.env.MUON_DATA_DIR = previousDataDir;
+  }
 });
 
 describe("job-scoped backend capability routes", () => {
@@ -474,6 +559,84 @@ describe("job-scoped backend capability routes", () => {
       .tasks.map((task: { id: string }) => task.id);
     expect(visibleIds).toContain(created.json().task.id);
     expect(visibleIds).not.toContain("task-child-b");
+  });
+
+  it("ADR-0084: a task minted under a fork mission inherits the recorded-state stash; an ordinary mission's does not; a vanished stash refuses", async () => {
+    const { forkSeedDir, hasForkSeed } = await import("@muon/core");
+    const { mkdirSync: mkdir, writeFileSync: write, existsSync } =
+      await import("node:fs");
+    // The coordinator's stash, exactly as captureForkSeed leaves it after
+    // the coordinator's own tree materialised (applied marker present).
+    const rootStash = forkSeedDir("task-fork-root");
+    mkdir(rootStash, { recursive: true });
+    write(
+      path.join(rootStash, "meta.json"),
+      JSON.stringify({
+        version: 1,
+        baseCommit: "abc123",
+        hasDiff: false,
+        untrackedCount: 0,
+        symlinks: [],
+        sourceTaskId: "task-orig-src",
+      }),
+      "utf8"
+    );
+    write(path.join(rootStash, "applied.json"), "{}", "utf8");
+
+    const inherited = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: auth(FORK_ROOT_TOKEN),
+      payload: {
+        title: "Worker slice of the fork",
+        description: "A delegated slice of the fork exploration.",
+      },
+    });
+    expect(inherited.statusCode).toBe(201);
+    const workerTask = inherited.json().task;
+    // The provenance stamp carries the ORIGINAL source task (from the
+    // stash itself), so dispatch's job stamp and applyForkSeed's
+    // stash/column agreement keep holding on the inherited copy.
+    expect(workerTask.forkSourceTaskId).toBe("task-orig-src");
+    expect(workerTask.chatId).toBe("chat-fork");
+    // The stash copy exists under the NEW task's key — the runner's
+    // existing gate (hasForkSeed) will materialise from it — and the
+    // applied marker did NOT travel (this task's tree was never seeded).
+    expect(hasForkSeed(workerTask.id)).toBe(true);
+    expect(
+      existsSync(path.join(forkSeedDir(workerTask.id), "applied.json"))
+    ).toBe(false);
+
+    // An ORDINARY mission's task creation is byte-identical to before:
+    // no stamp, no stash (D3 — no flag widens the fork boundary).
+    const plain = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: auth(ROOT_A_TOKEN),
+      payload: {
+        title: "Ordinary crew task",
+        description: "A task in an ordinary, unforked mission.",
+      },
+    });
+    expect(plain.statusCode).toBe(201);
+    expect(plain.json().task.forkSourceTaskId).toBeNull();
+    expect(hasForkSeed(plain.json().task.id)).toBe(false);
+
+    // A fork mission whose stash is GONE refuses the mint fail-closed —
+    // a crew task without the recorded state would stand on today's HEAD.
+    const before = await db.prisma.task.count();
+    const refused = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: auth(FORK_BARE_TOKEN),
+      payload: {
+        title: "Worker slice without a stash",
+        description: "Must refuse: the recorded state is gone.",
+      },
+    });
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json().message).toContain("recorded state");
+    expect(await db.prisma.task.count()).toBe(before);
   });
 
   it("denies generic control-plane routes and root dispatch to a vendor job bearer", async () => {

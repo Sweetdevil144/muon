@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
-import { MarketingShell } from "@/components/marketing/marketing-shell";
-import { PageIntro } from "@/components/marketing/page-intro";
+
+import { SiteShell } from "@/components/muon/SiteShell";
+import { PageHero } from "@/components/muon/PageHero";
 
 export const metadata: Metadata = {
   title: "Privacy, MUON",
@@ -56,39 +57,24 @@ const sections = [
   },
 ] as const;
 
-export default function PrivacyPage() {
+export default function Page() {
   return (
-    <MarketingShell>
-      <PageIntro
-        eyebrow="Privacy"
-        intro="A plain description of what MUON stores on your machine, what leaves it, and what this website collects. Checked against the code, not just the intent."
-        title="Your data stays on your machine"
+    <SiteShell>
+      <PageHero
+        eyebrow="Legal"
+        title="Privacy, MUON"
+        intro="What MUON stores locally, what leaves your machine, and what this website collects."
       />
-      <section className="mx-auto max-w-5xl px-4 py-20 sm:px-6 sm:py-28">
-        <p className="mb-10 max-w-3xl text-sm leading-7 text-black/55">
-          Last updated 2026-08-05.
-        </p>
-        <div className="border-t-2 border-[var(--bauhaus-ink)]">
-          {sections.map((section, index) => (
-            <div
-              className="grid gap-3 border-b-2 border-[var(--bauhaus-ink)] py-8 sm:grid-cols-[4rem_1fr] sm:gap-8 sm:py-10"
-              key={section.title}
-            >
-              <p className="text-sm font-black text-[var(--bauhaus-red)]">
-                {String(index + 1).padStart(2, "0")}
-              </p>
-              <div>
-                <h2 className="text-xl font-black uppercase tracking-[-0.03em] sm:text-2xl">
-                  {section.title}
-                </h2>
-                <p className="mt-4 max-w-3xl text-lg leading-8 text-black/60">
-                  {section.copy}
-                </p>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-    </MarketingShell>
+      <div className="mx-auto max-w-3xl pb-24">
+        {sections.map((section) => (
+          <section key={section.title} className="border-t border-rule py-8">
+            <h2 className="font-sans text-lg font-semibold tracking-[-0.02em] text-foreground">
+              {section.title}
+            </h2>
+            <p className="prose-body mt-3">{section.copy}</p>
+          </section>
+        ))}
+      </div>
+    </SiteShell>
   );
 }

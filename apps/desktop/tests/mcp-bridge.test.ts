@@ -10,7 +10,12 @@ import {
   MUON_MCP_ENTRY_NAME,
   type McpVendorIo,
 } from "@muon/client/mcp-vendor-config";
-import { installMcpForVendor, readMcpStatus } from "../src/lib/mcp-bridge.js";
+import { githubIdentityGateRefusal } from "@muon/client/github-identity-gate";
+import {
+  installMcpForVendor,
+  probeMcpServer,
+  readMcpStatus,
+} from "../src/lib/mcp-bridge.js";
 
 /**
  * The main-process side of Settings → Connections, S1 §5.
@@ -160,5 +165,112 @@ describe("installMcpForVendor — the shared writer, never a second one", () => 
       });
       expect(result.scope).toBe("user");
     }
+  });
+});
+
+/**
+ * ADR-0052 on the desk's probe, against REAL child processes.
+ *
+ * Mocking the spawn would test nothing here for the same reason it tests
+ * nothing in `@muon/client`'s own probe suite: the point of the measurement is
+ * that a build believed to be current, or a gate believed to be open, may not
+ * be — and the only witness is a process. So each case below launches an actual
+ * stdio server that answers `whoami` the way a real `muon-mcp` would.
+ */
+function fakeMuonMcp(gate: string | null): string {
+  const root = tempDir("muon-desktop-probe-");
+  const file = path.join(root, "muon-mcp");
+  // The interpreter is named ABSOLUTELY (`process.execPath`), not looked up
+  // through `env node`: these cases deliberately spawn with a near-empty
+  // environment, and a PATH-dependent shebang would fail as "the server never
+  // answered" — a passing-looking failure for a test about honest reporting.
+  fs.writeFileSync(
+    file,
+    `#!${process.execPath}
+let buf = "";
+process.stdin.on("data", (chunk) => {
+  buf += chunk.toString();
+  for (;;) {
+    const cut = buf.indexOf("\\n");
+    if (cut === -1) break;
+    const line = buf.slice(0, cut); buf = buf.slice(cut + 1);
+    if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    if (msg.method === "initialize") {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2024-11-05", capabilities: {} } }) + "\\n");
+    }
+    if (msg.method === "tools/list") {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "whoami" }] } }) + "\\n");
+    }
+    if (msg.method === "tools/call" && ${JSON.stringify(gate !== null)}) {
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { structuredContent: { identityGate: ${JSON.stringify(
+        gate
+      )} } } }) + "\\n");
+    }
+  }
+});
+`,
+    { mode: 0o755 }
+  );
+  return file;
+}
+
+function probeIo(command: string): McpVendorIo {
+  return io({
+    which: (c) => (c === "muon-mcp" ? command : null),
+    isExecutableFile: (p) => p === command,
+  });
+}
+
+describe("probeMcpServer — the desk reports the GATE, not just the tool count", () => {
+  it("carries a LOCKED gate with the CLI's exact refusal copy", async () => {
+    const report = await probeMcpServer(
+      { timeoutMs: 15_000 },
+      { io: probeIo(fakeMuonMcp("locked")), env: {} }
+    );
+    // A gated server answers `initialize` and `tools/list` in full, on purpose.
+    // Before this field existed the desk showed exactly this verdict and said
+    // nothing about the lock.
+    expect(report.identityGate).toBe("locked");
+    // AUTHORED ONCE. The same three sentences `muon mcp probe` prints for the
+    // same server — composed here rather than in the renderer only because the
+    // renderer is a browser bundle and this module reaches node:fs.
+    expect(report.identityGateRefusal).toBe(
+      githubIdentityGateRefusal({ what: "every MUON tool", surface: "mcp" })
+    );
+  }, 30_000);
+
+  it("an OPEN or UNARMED gate carries no refusal to show", async () => {
+    for (const gate of ["open", "unarmed"] as const) {
+      const report = await probeMcpServer(
+        { timeoutMs: 15_000 },
+        { io: probeIo(fakeMuonMcp(gate)), env: {} }
+      );
+      expect(report.identityGate, gate).toBe(gate);
+      expect(report.identityGateRefusal, gate).toBeNull();
+    }
+  }, 30_000);
+
+  it("an UNANSWERED gate question is NULL — an unknown, never an 'open'", async () => {
+    // A server that lists `whoami` and never answers the call: an old build, or
+    // one that died mid-conversation. The tool list it did serve still reports.
+    const report = await probeMcpServer(
+      { timeoutMs: 6_000 },
+      { io: probeIo(fakeMuonMcp(null)), env: {} }
+    );
+    expect(report.verdict.liveCount).toBe(1);
+    expect(report.identityGate).toBeNull();
+    expect(report.identityGateRefusal).toBeNull();
+  }, 30_000);
+
+  it("an unresolvable command reports null, not a gate it never asked about", async () => {
+    const report = await probeMcpServer(
+      {},
+      { io: io({ isExecutableFile: () => false }), env: {} }
+    );
+    expect(report.command).toBeNull();
+    expect(report.verdict.level).toBe("unevaluated");
+    expect(report.identityGate).toBeNull();
+    expect(report.identityGateRefusal).toBeNull();
   });
 });

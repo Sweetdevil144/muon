@@ -9,6 +9,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./symbol-id": {
+      "types": "./dist/symbol-id.d.ts",
+      "import": "./dist/symbol-id.js"
+    },
+    "./memory-ranking": {
+      "types": "./dist/memory-ranking.d.ts",
+      "import": "./dist/memory-ranking.js"
     }
   },
   "scripts": {

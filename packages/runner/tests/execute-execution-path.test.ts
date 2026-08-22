@@ -188,6 +188,98 @@ describe("executeJob records where the job actually ran", () => {
     expect(coreMocks.runLaneTask).not.toHaveBeenCalled();
   });
 
+  // ── T5/H11: pending setup confirmation files the gate and still runs ───────
+  //
+  // A repo that declares confirmation-bound setup must DISPATCH (without the
+  // setup), and the runner must file the `project-setup:<hash>` approval whose
+  // acceptance records the confirmation for the next dispatch. Before this,
+  // the pending state rode in `problems`, the worktree threw, and the gate
+  // was unreachable — the repo could never be dispatched into at all.
+  it("files the project-setup gate and proceeds when setup awaits confirmation", async () => {
+    const setupHash = "c0ffee".padEnd(64, "0");
+    coreMocks.ensureTaskWorktree.mockResolvedValue({
+      path: WORKTREE,
+      created: true,
+      preparation: {
+        links: [],
+        problems: [],
+        setupConfirmationRequired: {
+          setupHash,
+          confirmationBound: {
+            setup: [{ command: "touch", args: ["ran-setup"] }],
+            teardown: [],
+            run: [],
+          },
+        },
+      },
+    });
+    const client = clientFor(worktreeHarness);
+    (client as unknown as { requestApproval: ReturnType<typeof vi.fn> }).requestApproval =
+      vi.fn(async () => undefined);
+
+    const result = await executeJob(
+      client,
+      job(),
+      { id: "agent-1", name: "codex-1" },
+      { apiBase: "http://127.0.0.1:4000", runnerLease: LEASE }
+    );
+
+    expect(result.status).toBe("done");
+    expect(coreMocks.runLaneTask).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: WORKTREE })
+    );
+    expect(
+      (client as unknown as { requestApproval: ReturnType<typeof vi.fn> })
+        .requestApproval
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        gateTag: `project-setup:${setupHash}`,
+        kind: "command",
+        evidence: expect.objectContaining({
+          action: "project-setup",
+          details: expect.objectContaining({ setupHash }),
+        }),
+      })
+    );
+  });
+
+  it("still dispatches when the project-setup gate cannot be filed", async () => {
+    const setupHash = "dead".padEnd(64, "0");
+    coreMocks.ensureTaskWorktree.mockResolvedValue({
+      path: WORKTREE,
+      created: true,
+      preparation: {
+        links: [],
+        problems: [],
+        setupConfirmationRequired: {
+          setupHash,
+          confirmationBound: {
+            setup: [{ command: "touch", args: ["ran-setup"] }],
+            teardown: [],
+            run: [],
+          },
+        },
+      },
+    });
+    const client = clientFor(worktreeHarness);
+    (client as unknown as { requestApproval: ReturnType<typeof vi.fn> }).requestApproval =
+      vi.fn(async () => {
+        throw new Error("approvals endpoint unreachable");
+      });
+
+    const result = await executeJob(
+      client,
+      job(),
+      { id: "agent-1", name: "codex-1" },
+      { apiBase: "http://127.0.0.1:4000", runnerLease: LEASE }
+    );
+
+    // Filing failure only logs: the dispatch already refused to run the
+    // commands, so a gate hiccup must not take the run down with it.
+    expect(result.status).toBe("done");
+    expect(coreMocks.runLaneTask).toHaveBeenCalled();
+  });
+
   it("says out loud what the prepared worktree was handed", async () => {
     coreMocks.ensureTaskWorktree.mockResolvedValue({
       path: WORKTREE,

@@ -136,6 +136,7 @@ const prismaMock = vi.hoisted(() => ({
 }));
 
 const ledgerMock = vi.hoisted(() => ({
+  mintContradictionEdge: vi.fn(),
   ingestMemoryNote: vi.fn(),
   updateMemoryNote: vi.fn(),
   getMemoryNote: vi.fn(),

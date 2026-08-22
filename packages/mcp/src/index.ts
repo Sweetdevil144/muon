@@ -23,6 +23,9 @@ import {
   createObserverToolDefinitions,
 } from "./observer-tools.js";
 import { createAttachedCoordinatorToolDefinitions } from "./attached-coordinator-tools.js";
+import { createReviewDiffLedger } from "./review-session.js";
+import { resolveMcpIdentityGate } from "./identity-gate.js";
+import { createMcpObservatoryTaps } from "./observatory.js";
 import { buildMuonServer } from "./server-factory.js";
 
 export { createToolDefinitions } from "./handlers.js";
@@ -36,6 +39,22 @@ export { createAttachedCoordinatorToolDefinitions } from "./attached-coordinator
 export { toMcpToolDefinition } from "./agent-ui.js";
 export { dataOnlyMcpError } from "./agent-ui.js";
 export { buildMuonServer } from "./server-factory.js";
+export {
+  MCP_IDENTITY_GATE_EXEMPT_TOOLS,
+  type McpIdentityGate,
+} from "./server-factory.js";
+export { resolveMcpIdentityGate } from "./identity-gate.js";
+export {
+  BLIND_RECOVERY_LIMIT,
+  blindRecoveryActions,
+  computeReviewDiffId,
+  createReviewDiffLedger,
+  reviewDiffKey,
+} from "./review-session.js";
+export type {
+  ReviewDiffLedger,
+  ReviewDiffRecord,
+} from "./review-session.js";
 export type { BuildMuonServerOptions } from "./server-factory.js";
 export type { ToolDefinition, ToolScope } from "./handlers.js";
 export type { OrchestratorScope } from "./orchestrator-tools.js";
@@ -193,11 +212,35 @@ export async function runAttachedCoordinator(): Promise<void> {
     }
   );
 
+  // H14 — the seat's own lease facts, threaded into `whoami` so it can answer
+  // "how long may I act" without a network call. COORDINATES ONLY: expiry,
+  // bootstrap state and vendor. The file's `apiToken`/`delegationToken` are
+  // deliberately not among them — `whoami` reports where a session stands, and
+  // a credential is not a coordinate.
+  //
+  // Held as one mutable object rather than copied into the scope, because the
+  // heartbeat below renews the lease and a launch-time snapshot would have the
+  // seat report its FIRST expiry for the rest of its life.
+  const attachedLease = {
+    expiresAt: capability.expiresAt,
+    bootstrap: capability.bootstrap === true,
+    vendor: capability.vendor,
+  };
+  // A4: ONE ledger for this seat, written by `review_diff` (a base tool) and
+  // read by `ship` (a control tool). The two tool sets are composed separately,
+  // so the shared object is the only thing connecting them — created here, at
+  // the one place that builds both.
+  const reviewLedger = createReviewDiffLedger();
   const baseTools = createToolDefinitions(client, {
     jobId: capability.jobId,
     chatId: capability.chatId,
     apiBase: capability.apiBase,
     apiToken: capability.apiToken,
+    // Diagnostic only (see `ToolScope.seat`): a lane-scoped refusal here is a
+    // designed boundary, not a broken runner, and must not read as one.
+    seat: "attached-coordinator",
+    attached: attachedLease,
+    reviewLedger,
   });
   const tools = createAttachedCoordinatorToolDefinitions(client, baseTools, {
     jobId: capability.jobId,
@@ -207,8 +250,21 @@ export async function runAttachedCoordinator(): Promise<void> {
     workspacePath: capability.workspacePath,
     apiBase: capability.apiBase,
     apiToken: capability.apiToken,
+    reviewLedger,
   });
-  const server = buildMuonServer(tools, { mode: "attached-coordinator" });
+  const identityGate = resolveMcpIdentityGate();
+  // ADR-0095 — clientInfo exists only after `initialize`, so the tap reads it
+  // through this late-bound reference rather than at build time.
+  let serverRef: ReturnType<typeof buildMuonServer> | undefined;
+  const server = buildMuonServer(tools, {
+    mode: "attached-coordinator",
+    ...(identityGate ? { identityGate } : {}),
+    telemetry: createMcpObservatoryTaps({
+      identityGate,
+      clientName: () => serverRef?.getClientVersion()?.name,
+    }),
+  });
+  serverRef = server;
 
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let heartbeatInFlight = false;
@@ -243,6 +299,11 @@ export async function runAttachedCoordinator(): Promise<void> {
           capability,
           expiresAt
         );
+        // H14: keep the seat's own answer about its lease current. Without
+        // this, `whoami` would keep quoting the expiry this process started
+        // with — a confidently wrong timestamp, which is worse than none.
+        attachedLease.expiresAt = capability.expiresAt;
+        attachedLease.bootstrap = capability.bootstrap === true;
       })
       .catch((error) => {
         failClosed(error instanceof Error ? error.message : String(error));
@@ -294,6 +355,10 @@ async function main() {
     apiToken: resolveMcpApiToken(),
   }));
   const jobId = process.env.MUON_JOB_ID?.trim() || undefined;
+  // A4: one per PROCESS, shared by the base tools that record a review and the
+  // control tools that require one before filing a merge gate. See
+  // `review-session.ts` for why it is deliberately session-scoped.
+  const reviewLedger = createReviewDiffLedger();
 
   // Two modes, one binary: sub-agents get the shared-brain toolset;
   // MUON_MCP_MODE=orchestrator adds the crew-control toolset for the
@@ -314,6 +379,7 @@ async function main() {
     // under an ambient identity.
     apiBase,
     apiToken,
+    reviewLedger,
   });
   const delegationToken = process.env.MUON_DELEGATION_TOKEN?.trim();
   const delegateCanSpawn =
@@ -360,6 +426,7 @@ async function main() {
             workspacePath: process.env.MUON_WORKSPACE?.trim() || undefined,
             apiBase,
             apiToken,
+            reviewLedger,
           }),
         ]
       : mode === "observer"
@@ -377,7 +444,19 @@ async function main() {
             workspacePath: process.env.MUON_WORKSPACE?.trim() || undefined,
           })
       : baseTools;
-  const server = buildMuonServer(tools, { mode });
+  const identityGate = resolveMcpIdentityGate();
+  // ADR-0095 — same late-bound clientInfo read as the attached-coordinator
+  // path above; the taps themselves come from the ONE shared module.
+  let serverRef: ReturnType<typeof buildMuonServer> | undefined;
+  const server = buildMuonServer(tools, {
+    mode,
+    ...(identityGate ? { identityGate } : {}),
+    telemetry: createMcpObservatoryTaps({
+      identityGate,
+      clientName: () => serverRef?.getClientVersion()?.name,
+    }),
+  });
+  serverRef = server;
 
   process.on("SIGTERM", async () => {
     process.exit(0);
@@ -390,8 +469,17 @@ async function main() {
 }
 
 // Only start the stdio server when run as a binary, not when imported.
+//
+// `muon-mcp.mjs` is here because the release bundle now SHIPS that file
+// (`bundle-release.mjs`), and matching only the extensionless `muon-mcp` meant
+// `node muon-mcp.mjs` exited 0 having written nothing to stdout or stderr —
+// a silent no-op, which is the one failure shape ADR-0049 exists to forbid.
+// The POSIX bin link is extensionless and worked; npm's Windows shim invokes
+// `node "…\muon-mcp.mjs"` and did not, and neither does any operator or doc
+// that registers the file path rather than the bin name.
 const isDirectRun =
   process.argv[1]?.endsWith("muon-mcp") ||
+  process.argv[1]?.endsWith("muon-mcp.mjs") ||
   process.argv[1]?.endsWith("index.js") ||
   process.argv[1]?.endsWith("index.ts");
 

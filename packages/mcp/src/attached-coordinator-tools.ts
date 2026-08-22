@@ -1,6 +1,7 @@
 import type { MuonApiClient } from "@muon/client";
 import { MUON_ATTACHED_COORDINATOR_CONTROL_TOOL_NAMES } from "@muon/protocol";
 import type { ToolDefinition } from "./agent-ui.js";
+import type { ReviewDiffLedger } from "./review-session.js";
 import {
   createObserverModeToolDefinitions,
   type ObserverScope,
@@ -18,6 +19,13 @@ import {
  * capability file (`@muon/client/attached-coordinator-capability`), so there
  * is no "absent lineage, degrade gracefully" branch here: main() refuses to
  * start rather than construct this scope partially.
+ *
+ * INVARIANT the factory cannot check: the `baseTools` handed in must have been
+ * built with `seat: "attached-coordinator"` on their `ToolScope` (main() does
+ * this in index.ts). The seat marker is diagnostic-only — it selects honest
+ * refusal text for lane-scoped tools — so composing base tools built without
+ * it loses no authority, only the correct diagnosis: the seat would be told it
+ * "was hand-launched", the misdiagnosis measured live on 2026-08-13.
  */
 export type AttachedCoordinatorScope = {
   jobId: string;
@@ -27,6 +35,14 @@ export type AttachedCoordinatorScope = {
   workspacePath: string;
   apiBase: string;
   apiToken: string;
+  /**
+   * A4: the SAME ledger object the `baseTools` above were built with, so this
+   * seat's `ship` can see what its own `review_diff` proved. Optional for the
+   * same reason every other A4 wiring point is: a composition that forgets it
+   * gets a `ship` that refuses for want of evidence, never one that files a
+   * merge gate it never looked at.
+   */
+  reviewLedger?: ReviewDiffLedger;
 };
 
 /**
@@ -54,6 +70,17 @@ export function createAttachedCoordinatorToolDefinitions(
     apiToken: scope.apiToken,
     chatId: scope.chatId,
     workspacePath: scope.workspacePath,
+    // Tier C has a job and a delegation grant, and the workflow routes
+    // authenticate BOTH. Without this the seat could call `propose_workflow`
+    // (a granted control tool, which sends them) and then be refused 403 by
+    // `workflow_status` reading back the run it had just created.
+    workflowControl: {
+      callerJobId: scope.jobId,
+      delegationToken: scope.delegationToken,
+    },
+    // The seat's attach-minted root job IS this chat's mission job:
+    // `budget_status` with no argument reads the seat's own mission budget.
+    missionJobId: scope.jobId,
   };
   const withObserverReads = createObserverModeToolDefinitions(
     client,
@@ -69,6 +96,9 @@ export function createAttachedCoordinatorToolDefinitions(
     workspacePath: scope.workspacePath,
     apiBase: scope.apiBase,
     apiToken: scope.apiToken,
+    // A4: forwarded, never re-created — a fresh Map here would be a different
+    // object from the one review_diff writes, and `ship` would refuse forever.
+    reviewLedger: scope.reviewLedger,
   };
   const controlByName = new Map(
     createOrchestratorToolDefinitions(client, orchestratorScope, {

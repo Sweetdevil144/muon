@@ -347,3 +347,4 @@ describe("repo_map tool (end-to-end over an injected CLI runner)", () => {
     expect(result.isError).toBe(true);
   });
 });
+

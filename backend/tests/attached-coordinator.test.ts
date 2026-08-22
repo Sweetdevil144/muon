@@ -168,8 +168,11 @@ describe("POST /api/dispatch/attached", () => {
   });
 
   it("refuses a vendor that cannot hold the coordinator seat (400)", async () => {
+    // ADR-0057 seated all four PUBLIC vendors, so `cursor` no longer exercises
+    // this guard. `fake` is the only remaining unseated id, and the guard is
+    // fail-closed machinery that must stay tested.
     const chat = await makeChat();
-    const res = await attach("cursor", chat.id);
+    const res = await attach("fake", chat.id);
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toMatch(/cannot hold MUON's coordinator seat/);
   });

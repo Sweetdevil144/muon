@@ -250,8 +250,9 @@ const EXPECTED: Record<VendorId, ExpectedPosture> = {
     provider: "cursor",
     visibility: "public",
     cost: 0.4,
-    supportedRoles: ["reviewer", "qa", "architect", "scout"],
-    coordinatorSeat: false,
+    // ADR-0057: `orchestrator` is the SEAT's role, not a worker widening.
+    supportedRoles: ["orchestrator", "reviewer", "qa", "architect", "scout"],
+    coordinatorSeat: true,
     dispatchable: true,
     delegatable: true,
     fleetSizeable: true,
@@ -359,8 +360,11 @@ const EXPECTED: Record<VendorId, ExpectedPosture> = {
     // here as well as in the registry — two independent statements, per ADR-0022
     // mechanism 5. A compile error catches an omitted field; only this catches a
     // wrong VALUE.
-    supportedRoles: ["scout"],
-    coordinatorSeat: false,
+    // ONE WORKER role still. `orchestrator` is the SEAT's role (ADR-0057 D4):
+    // a seat without it is a seat nothing can occupy, so the two travel
+    // together. Dispatch into OpenCode stays scout-only.
+    supportedRoles: ["orchestrator", "scout"],
+    coordinatorSeat: true,
     dispatchable: true,
     delegatable: true,
     fleetSizeable: true,
@@ -505,7 +509,14 @@ const EXPECTED_DELEGATABLE: readonly string[] = [
   "opencode",
   "fake",
 ];
-const EXPECTED_COORDINATOR: readonly string[] = ["claude-code", "codex"];
+// ADR-0057 opened the seat to all four public vendors. `fake` is still absent,
+// and that absence is the point of writing this list out by hand.
+const EXPECTED_COORDINATOR: readonly string[] = [
+  "claude-code",
+  "codex",
+  "cursor",
+  "opencode",
+];
 const EXPECTED_EVALUATOR: readonly string[] = ["claude-code", "codex"];
 const EXPECTED_PLANNER: readonly string[] = ["claude-code", "codex"];
 const EXPECTED_TERMINAL_TAKEOVER: readonly string[] = [
@@ -746,6 +757,8 @@ describe("vendor registry — accessors fail closed", () => {
 
   it("a registered vendor still gets its real posture", () => {
     expect(vendorRoleCeiling("cursor")).toEqual([
+      // ADR-0057: the seat's role. Cursor still holds no `implementer`.
+      "orchestrator",
       "reviewer",
       "qa",
       "architect",
@@ -1151,8 +1164,14 @@ describe("routing prose is generated, and names no vendor as a default (ADR-0022
       for (const role of entry.authority.supportedRoles) {
         expect(line).toContain(role);
       }
+      // The predicate is `=== "write"`, not `!== "read-only"`. ADR-0057 put
+      // `orchestrator` (authority `coordinate`) into two ceilings that still
+      // cannot write, and the subtractive form counted that as writing — which
+      // is what advertised "may write" to the planner for a lane the dispatch
+      // route would then refuse. Mirroring the source's old shape here is why
+      // the suite could not catch it.
       const writes = entry.authority.supportedRoles.some(
-        (role) => ROLE_SPECS[role].authority !== "read-only"
+        (role) => ROLE_SPECS[role].authority === "write"
       );
       expect(line).toContain(writes ? "may write" : "READ-ONLY");
       if (entry.session.canSend) {
@@ -1179,7 +1198,7 @@ describe("routing prose is generated, and names no vendor as a default (ADR-0022
     for (const id of publicVendorIds()) {
       const entry = VENDOR_REGISTRY[id];
       const writes = entry.authority.supportedRoles.some(
-        (role) => ROLE_SPECS[role].authority !== "read-only"
+        (role) => ROLE_SPECS[role].authority === "write"
       );
       if (writes) continue;
       const line = vendorRoutingLines().find((candidate) =>
@@ -1187,6 +1206,14 @@ describe("routing prose is generated, and names no vendor as a default (ADR-0022
       )!;
       expect(line).not.toContain("implementer");
       expect(line).toContain("READ-ONLY");
+      // A lane that coordinates but cannot write must say BOTH, or the planner
+      // reads "READ-ONLY" and never considers it for the seat it does hold.
+      const coordinates = entry.authority.supportedRoles.some(
+        (role) => ROLE_SPECS[role].authority === "coordinate"
+      );
+      if (coordinates) {
+        expect(line).toContain("it may coordinate, never write");
+      }
     }
   });
 });

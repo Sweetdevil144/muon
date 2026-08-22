@@ -1,6 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { EVASION_CORPUS, residualDanger } from "@muon/protocol";
-import { buildApprovalReview } from "../src/approval-review.js";
+import {
+  APPROVAL_GRANT_DURATION_TTL_MS,
+  EVASION_CORPUS,
+  GRANTABLE_APPROVAL_KINDS,
+  isGrantableApprovalKind,
+  residualDanger,
+} from "@muon/protocol";
+import {
+  ALWAYS_ACTION_GRANT_DURATION,
+  ALWAYS_ACTION_INELIGIBLE_SENTENCE,
+  ALWAYS_ACTION_SCOPE_SENTENCE,
+  REMEMBER_ACTION_INELIGIBLE_SENTENCE,
+  buildApprovalReview,
+} from "../src/approval-review.js";
 import type { ApprovalRequest } from "../src/types.js";
 
 function approval(input: Partial<ApprovalRequest> = {}): ApprovalRequest {
@@ -185,6 +197,75 @@ describe("approval review projection", () => {
         approval({ kind: "command", gateTag: null, reason: "legacy" })
       ).receiptEligible
     ).toBe(false);
+  });
+
+  // ── ADR-0056: the `always` grade's eligibility ─────────────────────────────
+  //
+  // The surface must NEVER offer a durable grade for an approval the backend
+  // refuses one for: a merge carrying a grade is a hard 400 that leaves the
+  // approval PENDING, and a button that always fails teaches the operator the
+  // app is broken. So this flag is derived from the protocol's own POSITIVE
+  // allow-list, not from a per-surface list and not as "everything except
+  // merge".
+
+  it("marks a bindable command grant-eligible, alongside the receipt", () => {
+    const review = buildApprovalReview(
+      commandApproval({ action: "Edit", details: { path: "src/parser.ts" } })
+    );
+    expect(review.grantEligible).toBe(true);
+    expect(review.receiptEligible).toBe(true);
+  });
+
+  it("refuses the grade for every kind that is not on GRANTABLE_APPROVAL_KINDS", () => {
+    // The literal allow-list is `["command"]`; assert against IT, so shrinking
+    // or growing the protocol's list moves this test rather than surprising it.
+    expect(GRANTABLE_APPROVAL_KINDS).toEqual(["command"]);
+    for (const kind of ["merge", "deploy", "dangerous_action", "gate"]) {
+      expect(isGrantableApprovalKind(kind)).toBe(false);
+      expect(
+        buildApprovalReview(
+          approval({ kind, gateTag: null, reason: `${kind} request` })
+        ).grantEligible
+      ).toBe(false);
+    }
+    // A route gate (gateTag-bound) is authority-shaped: no tool, no digest, no
+    // target — nothing a content-bound grant could be a sentence about.
+    expect(buildApprovalReview(approval()).grantEligible).toBe(false);
+  });
+
+  it("never grants what a receipt could not cover either", () => {
+    // `always` rides the SAME derivation `session` does, plus the kind clause —
+    // it can never reach further than the shipped receipt already does.
+    for (const evidence of [
+      { action: "WebFetch", details: { url: "https://example.com" } },
+      { action: "mcp__github__push", details: {} },
+      { action: "Edit", details: {} },
+      {
+        action: "Edit",
+        details: { path: "src/parser.ts" },
+        payloadDigest: undefined,
+      },
+    ]) {
+      const review = buildApprovalReview(commandApproval(evidence));
+      expect(review.receiptEligible).toBe(false);
+      expect(review.grantEligible).toBe(false);
+    }
+  });
+
+  it("the two on-screen sentences say different, true things", () => {
+    // A merge shows BOTH ineligible sentences at once; if they restated each
+    // other the decision surface would just be noisier, not clearer.
+    expect(ALWAYS_ACTION_INELIGIBLE_SENTENCE).not.toBe(
+      REMEMBER_ACTION_INELIGIBLE_SENTENCE
+    );
+    expect(ALWAYS_ACTION_SCOPE_SENTENCE).toContain("in this chat only");
+    // The days are READ OFF the protocol's TTL table, never retyped.
+    expect(ALWAYS_ACTION_SCOPE_SENTENCE).toContain(
+      `${APPROVAL_GRANT_DURATION_TTL_MS.always / (24 * 60 * 60 * 1000)} days`
+    );
+    expect(ALWAYS_ACTION_SCOPE_SENTENCE).toMatch(/revoke it any time/i);
+    // The grade is a NAME, never a number — no TTL crosses the wire from a UI.
+    expect(ALWAYS_ACTION_GRANT_DURATION).toBe("always");
   });
 });
 

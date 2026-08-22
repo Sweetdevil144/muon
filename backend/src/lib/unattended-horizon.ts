@@ -9,7 +9,12 @@ import { prisma } from "./db.js";
 import { terminalizeJobLineage } from "./attached-coordinator.js";
 // Attendance is a LEAF module (see its header): the auth hook imports it
 // directly and must never reach this file's dependency tree.
-import { daemonAttachState, hydrateAttendance } from "./surface-attendance.js";
+import {
+  daemonAttachState,
+  hydrateAttendance,
+  hydratePreviousSessionEnd,
+  previousSessionEnd,
+} from "./surface-attendance.js";
 
 /**
  * ADR-0040 D3 + D3a — the bound on a daemon nobody returns to.
@@ -41,6 +46,14 @@ export const UNATTENDED_HORIZON_SETTING_KEY = "unattended.horizonMs";
 /** Persisted so the clock survives a brain restart (D3a.4). */
 export const LAST_ATTENDED_SETTING_KEY = "unattended.lastAttendedAt";
 
+/** ADR-0085 D1: the digest boundary survives a restart the same way.
+ *  NAMED RESIDUAL (review): this module owned attendance persistence
+ *  before 0085 (LAST_ATTENDED_SETTING_KEY above), so the boundary key
+ *  follows the existing seam; an attendance-store extraction is the
+ *  module family's own refactor, taken when a third presence-derived
+ *  consumer appears — not as a side effect of the digest. */
+export const PREVIOUS_SESSION_SETTING_KEY = "unattended.previousSessionEndedAt";
+
 /**
  * WRITE the horizon. Clamped on the way in, so an out-of-range value is
  * stored as the value that will actually be honoured rather than as a number
@@ -63,6 +76,10 @@ export async function hydrateAttendanceFromStore(): Promise<void> {
       where: { key: LAST_ATTENDED_SETTING_KEY },
     });
     if (row) hydrateAttendance(Number(row.value));
+    const boundary = await prisma.operatorSetting.findUnique({
+      where: { key: PREVIOUS_SESSION_SETTING_KEY },
+    });
+    if (boundary) hydratePreviousSessionEnd(Number(boundary.value));
   } catch {
     // An unreadable stamp means "we do not know when anyone was last here",
     // and the safe reading of that is the conservative one: leave it null so
@@ -78,15 +95,35 @@ export async function hydrateAttendanceFromStore(): Promise<void> {
  * write the database every tick.
  */
 export async function persistAttendance(atMs: number): Promise<void> {
-  await prisma.operatorSetting
-    .upsert({
-      where: { key: LAST_ATTENDED_SETTING_KEY },
-      create: { key: LAST_ATTENDED_SETTING_KEY, value: String(atMs) },
-      update: { value: String(atMs) },
-    })
+  // ADR-0085: the boundary persists WITH the stamp, in one transaction
+  // (review finding: two independently swallowed upserts let a restart
+  // hydrate the new stamp without its rolled boundary — the pair IS the
+  // session boundary, so it lands atomically or not at all). Same failure
+  // posture as before: a failed persist costs restart-durability, not
+  // correctness — the in-memory state already moved.
+  const boundary = previousSessionEnd();
+  await prisma
+    .$transaction([
+      prisma.operatorSetting.upsert({
+        where: { key: LAST_ATTENDED_SETTING_KEY },
+        create: { key: LAST_ATTENDED_SETTING_KEY, value: String(atMs) },
+        update: { value: String(atMs) },
+      }),
+      ...(boundary !== null
+        ? [
+            prisma.operatorSetting.upsert({
+              where: { key: PREVIOUS_SESSION_SETTING_KEY },
+              create: {
+                key: PREVIOUS_SESSION_SETTING_KEY,
+                value: String(boundary),
+              },
+              update: { value: String(boundary) },
+            }),
+          ]
+        : []),
+    ])
     .catch(() => {
-      // A failed persist costs restart-durability, not correctness: the
-      // in-memory clock is already moved and the bound still holds this run.
+      // See above: durability cost only, loudness lives with the sweep.
     });
 }
 

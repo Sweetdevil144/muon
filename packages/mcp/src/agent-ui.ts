@@ -1,5 +1,6 @@
 import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { LoopRunRecord } from "@muon/client";
+import type { IdentityGateState } from "@muon/client/github-identity-gate";
 import {
   buildObjectiveLoopStatus,
   extractLoopMissing,
@@ -88,6 +89,21 @@ export type SessionSurface = {
   readonly mode: string;
   /** Every tool actually registered — the honest answer to "what may I do". */
   readonly toolNames: readonly string[];
+  /**
+   * ADR-0052 — the state of the identity gate THIS SERVER ENFORCES.
+   *
+   * A THUNK, not a value, for the same reason `McpIdentityGate.active` is one:
+   * a `muon login` in another terminal opens a live session with no restart,
+   * and a state captured at build time would have `whoami` quoting the lock
+   * for the rest of the process's life.
+   *
+   * Bound from the gate `buildMuonServer` was HANDED, never re-resolved from
+   * the environment here — a second independent resolution could report "open"
+   * beside a handler that refuses, which is the confusion `whoami` exists to
+   * end. Absent (a tool list nobody built a server around) means the session
+   * cannot say, and `whoami` reports `unarmed` rather than inventing a lock.
+   */
+  readonly identityGate?: () => IdentityGateState;
 };
 
 export type ToolPrincipal = "agent" | "orchestrator";
@@ -178,6 +194,19 @@ const CONTRACTS: Record<string, ToolContract> = {
     destructive: false,
     idempotent: false,
   },
+  memory_ground: {
+    title: "Ground a memory note",
+    authority: "propose",
+    sideEffects:
+      "persists one grounding stamp; on mismatch files one unconfirmed contradiction proposal",
+    outputBound: "3 check verdicts and one stamp",
+    degradation:
+      "an unresolvable anchor reads as mismatch and an uncheckable kind says so; nothing is guessed",
+    maxItems: 3,
+    readOnly: false,
+    destructive: false,
+    idempotent: false,
+  },
   memory_preedit: {
     title: "Run governed pre-edit",
     authority: "read",
@@ -262,6 +291,18 @@ const CONTRACTS: Record<string, ToolContract> = {
     destructive: false,
     idempotent: true,
   },
+  review_queue: {
+    title: "Read what is waiting on the human",
+    authority: "read",
+    sideEffects: "none",
+    outputBound: "20 pending gates and 20 pending unconfirmed notes",
+    degradation:
+      "each half degrades independently and says which one could not be read, so an unavailable queue never renders as an empty one",
+    maxItems: 20,
+    readOnly: true,
+    destructive: false,
+    idempotent: true,
+  },
   code_query: {
     title: "Search workspace code graph",
     authority: "read",
@@ -339,6 +380,45 @@ const CONTRACTS: Record<string, ToolContract> = {
     destructive: false,
     idempotent: true,
   },
+  // ADR-0053 — the docs graph. `sideEffects` says "and git index" for all three
+  // because the anchor resolver reads `git ls-files` and never `stat`s a path: on
+  // a case-insensitive volume a filesystem probe accepts the wrong spelling, and
+  // the wrong spelling is a different citation.
+  docs_query: {
+    title: "Search the repository's docs graph",
+    authority: "read",
+    sideEffects: "reads the workspace's own markdown files and git index only",
+    outputBound: "10 doc sections and 24,000 response characters",
+    degradation:
+      "a historical-only answer, an unreadable canon set, and an unreadable git are each named on the response",
+    maxItems: 10,
+    readOnly: true,
+    destructive: false,
+    idempotent: true,
+  },
+  docs_context: {
+    title: "Read one doc or doc section",
+    authority: "read",
+    sideEffects: "reads the workspace's own markdown files and git index only",
+    outputBound: "one document or section with 50 backlinks",
+    degradation: "an unresolvable target refuses and names the nearest section ids",
+    maxItems: 50,
+    readOnly: true,
+    destructive: false,
+    idempotent: true,
+  },
+  docs_impact: {
+    title: "Find the docs that cite a path",
+    authority: "read",
+    sideEffects: "reads the workspace's own markdown files and git index only",
+    outputBound: "50 citing doc sections",
+    degradation:
+      "reports each citation's resolution state; never a drift verdict, and an uncited path is an explicit empty",
+    maxItems: 50,
+    readOnly: true,
+    destructive: false,
+    idempotent: true,
+  },
   question_ask: {
     title: "Ask the human a blocking question",
     authority: "direct",
@@ -361,6 +441,18 @@ const CONTRACTS: Record<string, ToolContract> = {
     readOnly: true,
     destructive: false,
     idempotent: true,
+  },
+  question_withdraw: {
+    title: "Withdraw your own blocking question",
+    authority: "direct",
+    sideEffects:
+      "closes ONE of the caller's own open questions; with reason answered_from_memory it records the disclosed pre-answer citations that settled it — never a human answer, never an approval",
+    outputBound: "1 withdrawn question coordinate",
+    degradation: "a missing job scope fails closed; foreign or undisclosed citations are refused by the route",
+    maxItems: 1,
+    readOnly: false,
+    destructive: false,
+    idempotent: false,
   },
   publish_finding: {
     title: "Publish a finding to the crew",
@@ -618,6 +710,19 @@ const CONTRACTS: Record<string, ToolContract> = {
     destructive: false,
     idempotent: false,
   },
+  propose_amendment: {
+    title: "Propose extra workflow steps",
+    authority: "propose",
+    sideEffects:
+      "records one inert amendment draft; the run is unchanged until a human approves its gate",
+    outputBound: "1 amendment coordinate and its gate tag",
+    degradation:
+      "a run whose status cannot gain a step is refused by typed rule naming that status; append-only is enforced server-side",
+    maxItems: 1,
+    readOnly: false,
+    destructive: false,
+    idempotent: false,
+  },
   workflow_status: {
     title: "Read workflow status",
     authority: "read",
@@ -634,7 +739,8 @@ const CONTRACTS: Record<string, ToolContract> = {
     authority: "propose",
     sideEffects: "files one merge approval; never completes the task",
     outputBound: "1 approval",
-    degradation: "reports approval filing failure",
+    degradation:
+      "refuses by typed rule when this session has run no review_diff for the task, or when that review came back review-blind; the server-side certification at approval time remains the authority",
     maxItems: 1,
     readOnly: false,
     destructive: false,
@@ -693,14 +799,26 @@ export function ok(payload: unknown, ui?: ToolUiHints): ToolResult {
  * `prefix` names the operation that was refused ("could not enqueue dispatch");
  * the refusal supplies why. Projection to the agent audience happens here, so a
  * caller forwarding a refusal it received from elsewhere cannot widen it.
+ *
+ * `nextActions` is for the refusals whose lawful recovery is a SEQUENCE rather
+ * than one move — REVIEW BLIND is the case that needed it (A6: re-index, bound
+ * the diff, or escalate to an operator attestation). `Refusal.nextAction` holds
+ * exactly one action by design, and collapsing three real options into it would
+ * mean naming two of them nowhere. Omitted → the single action renders exactly
+ * as before. These are still EVIDENCE, never authority: reading that an
+ * operator may attest is not permission to attest.
  */
 export function failWithRefusal(
   refusal: Refusal,
-  prefix?: string
+  prefix?: string,
+  nextActions?: string[]
 ): ToolResult {
   const projected = projectRefusal(refusal, "agent");
   const line = renderRefusalLine(projected, "agent");
-  return fail(prefix ? `${prefix}: ${line}` : line, { refusal: projected });
+  return fail(prefix ? `${prefix}: ${line}` : line, {
+    refusal: projected,
+    ...(nextActions && nextActions.length > 0 ? { nextActions } : {}),
+  });
 }
 
 export function fail(message: string, ui?: ToolUiHints): ToolResult {
@@ -864,7 +982,7 @@ function finalize(
           because: "this refusal names no lawful next action",
         })]
       : result.isError
-        ? ["Correct the reported input or state, then retry this tool."]
+        ? refusalNextActions(payload)
         : humanDecisionRequired
           ? ["Wait for the human decision, then retry with the approved gate."]
           : []);
@@ -937,8 +1055,102 @@ function finalize(
 export function remedyFor(message: string): {
   action: string;
   nextActions: string[];
+  /** True when a SPECIFIC rule matched. False means the generic fallback, which
+   *  callers with their own default must not prefer over it — "inspect muon
+   *  doctor" is worse than "correct the input" for `query is required`. */
+  matched: boolean;
 } {
+  // TWO PHRASINGS, ONE FACT. The backend answers "requires the exact active
+  // job capability"; the MCP-side scope guards say "requires a job-scoped
+  // agent session … hand-launched". Only the first was matched, so twenty of
+  // the thirty tools refused with a thorough explanation in their error text
+  // and the GENERIC "correct the reported input or state, then retry this
+  // tool" in their structured `nextActions` — telling an agent to retry
+  // something no retry can fix, which is the same defect as the 401 this
+  // family of fixes started from.
+  // THREE DIFFERENT FAULTS, THREE DIFFERENT ANSWERS. One rule answered all of
+  // them and was wrong for two: it told a session whose JOB HAD FINISHED that
+  // it was hand-launched and never had one, and it told a governed session
+  // with a broken scope injection to go start governed work it is already in.
+  //
+  // 1. A GOVERNED session missing a coordinate — a runner injection fault. Its
+  //    own text says "report it rather than retrying", and the generic "correct
+  //    and retry" contradicted that. Checked FIRST: this branch also contains
+  //    the `needs` phrase, so a looser rule below would swallow it.
+  if (/this governed session \(job /i.test(message)) {
+    return {
+      action:
+        "This session IS governed — it carries a job, and part of its scope did not reach it. That points at the runner's environment injection, not at anything this agent did. Report it; retrying will not repair it.",
+      nextActions: [
+        "Do NOT retry — the missing scope is injected at spawn, not on retry.",
+        "Report this to the human with the job id from the message.",
+        "Continue with the code-graph tools, which need no scope.",
+      ],
+      matched: true,
+    };
+  }
+  // 2. NO LIVE JOB BEHIND THE TOKEN. Two different histories reach here and the
+  //    message cannot always tell them apart: a capability whose job has ENDED
+  //    (`backend/src/app.ts`, which says "no longer active") and a bearer that
+  //    NEVER had one (`requireAgentJobCapability` in backend/src/lib/auth.ts,
+  //    which emits the same short phrase for a hand-launched session on the
+  //    shared agent bearer). The remedy is identical for both, so this arm
+  //    states only what is certainly true — there is no live job — and asserts
+  //    the history ONLY when the message itself carries it.
   if (/exact active job capability/i.test(message)) {
+    const jobEnded = /no longer active/i.test(message);
+    return {
+      action:
+        (jobEnded
+          ? "This is a SCOPE refusal, not a fault. The token is one MUON issued, but its job is no longer active, so memory and coordination have no partition to answer in. "
+          : "This is a SCOPE refusal, not a fault. No LIVE job stands behind this session's token — either its job ended or it never had one — so memory and coordination have no partition to answer in. ") +
+        "`muon doctor` will report a healthy brain and retrying will fail identically. Start fresh governed work with `muon chat`, or use an operator surface (CLI/TUI/desktop).",
+      nextActions: [
+        "Do NOT retry this tool from this session — the result will not change.",
+        // Qualified BY TRANSPORT, because this is the one arm whose refusal an
+        // HTTP-attached session can receive: the HTTP gate re-probes each
+        // request and refuses the WHOLE surface for a job that is no longer
+        // active — code-graph tools included (http-transport.ts says exactly
+        // this). Unqualified, this line promised those sessions a next action
+        // their transport blocks.
+        "Over the stdio transport, the code-graph tools (code_query, code_context, code_impact, repo_map) still work — they need no job. Over the HTTP transport nothing does; re-attach there instead.",
+        "Start fresh governed work with `muon chat` to get a live job.",
+      ],
+      matched: true,
+    };
+  }
+  // 3. An ATTACHED COORDINATOR SEAT asking for a lane-scoped tool. Structural
+  //    and permanent, but for the opposite reason to the two above: nothing is
+  //    broken and nothing should be reported — this seat simply is not a crew
+  //    member, and the work belongs to one.
+  if (/attached coordinator seat/i.test(message)) {
+    return {
+      action:
+        "This seat coordinates; it does not hold a lane. Dispatch a crew member to do this, or do it yourself on a MUON surface. Retrying from here cannot work.",
+      nextActions: [
+        "Do NOT retry — a coordinator seat never has a lane.",
+        "Dispatch a crew member (`dispatch`) and let it do the lane-scoped work.",
+        "Or do it on a MUON surface, where the human holds the authority.",
+      ],
+      matched: true,
+    };
+  }
+  // 4. A session missing the control-plane bearer. Also structural: the bearer
+  //    is injected at spawn, so no retry from here produces one.
+  if (/governed exact-job control-plane bearer/i.test(message)) {
+    return {
+      action:
+        "This session has no server-derivable identity — the exact-job control-plane bearer is injected at spawn and did not arrive. Retrying cannot mint one. Report it, and use the code-graph tools meanwhile.",
+      nextActions: [
+        "Do NOT retry — the bearer is injected at spawn, not on retry.",
+        "Report this to the human; it points at the runner's environment.",
+        "Continue with the code-graph tools, which need no bearer.",
+      ],
+      matched: true,
+    };
+  }
+  // 5. A HAND-LAUNCHED session, which never had a job at all.
+  if (/hand-launched/i.test(message)) {
     return {
       action:
         "This is a SCOPE refusal, not a fault — memory and coordination are partitioned by job, and this session has no job. `muon doctor` will report a healthy brain and retrying will fail identically. Start governed work with `muon chat`, or use an operator surface (CLI/TUI/desktop).",
@@ -947,6 +1159,7 @@ export function remedyFor(message: string): {
         "Use the code-graph tools (code_query, code_context, code_impact, repo_map), which need no job.",
         "For memory or coordination, start governed work with `muon chat`.",
       ],
+      matched: true,
     };
   }
   return {
@@ -956,8 +1169,33 @@ export function remedyFor(message: string): {
       "Inspect `muon doctor` and the task activity log.",
       "Correct the reported state, then retry this tool.",
     ],
+    matched: false,
   };
 }
+
+/**
+ * The next actions for a RETURNED failure (as opposed to a thrown one).
+ *
+ * `remedyFor` was consulted only in the `catch` path, and the structural scope
+ * guards return a failure rather than throwing — so their thorough explanation
+ * never reached the field agents parse. Lifted out of the conditional chain it
+ * used to sit inside as an IIFE: a four-arm ternary with a function body in the
+ * middle of it is not readable, and this is the arm most likely to change.
+ */
+function refusalNextActions(payload: unknown): string[] {
+  const errorText =
+    typeof (payload as { error?: unknown })?.error === "string"
+      ? (payload as { error: string }).error
+      : "";
+  const remedy = remedyFor(errorText);
+  // Only a SPECIFIC match wins: remedyFor always returns something, and its
+  // fallback ("inspect muon doctor") is worse than this default for an ordinary
+  // "query is required".
+  return remedy.matched
+    ? remedy.nextActions
+    : ["Correct the reported input or state, then retry this tool."];
+}
+
 
 export function withAgentUi(
   definitions: ToolDefinition[],

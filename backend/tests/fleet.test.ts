@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { coordinatorVendorIds } from "@muon/protocol";
 import { buildApp } from "../src/app.js";
 import { setReadinessProber } from "../src/routes/fleet.js";
 
@@ -373,7 +374,7 @@ describe("fleet API (agents per vendor, claim semaphore)", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json().message).toMatch(
-      /managed for read-only crew roles only/i
+      /cannot hold the 'implementer' role an unscoped claim resolves to/i
     );
     expect(prismaMock.agent.findFirst).not.toHaveBeenCalled();
     expect(prismaMock.agent.updateMany).not.toHaveBeenCalled();
@@ -406,6 +407,29 @@ describe("fleet API (agents per vendor, claim semaphore)", () => {
     expect(claimed.statusCode).toBe(201);
     expect(claimed.json().agent.vendor).toBe("cursor");
     await app.close();
+  });
+
+  it("rejects an EXPLICIT coordinator-seat claim on every seat-holding vendor", async () => {
+    // ADR-0057 put `orchestrator` in all four ceilings, so it now passes
+    // `assertVendorMayHoldRole` — but this route only ever hands out
+    // `WORKER_ORDINAL` seats. Before the guard, this returned 201 with a plain
+    // worker agent labelled `orchestrator`: the caller believes it holds the
+    // coordinator seat and nothing it does behaves like one. Worse than a
+    // refusal, because it is silent.
+    for (const vendor of coordinatorVendorIds()) {
+      const app = buildApp();
+      prismaMock.agent.findFirst.mockClear();
+      const refused = await app.inject({
+        method: "POST",
+        url: "/api/fleet/agents/claim",
+        payload: { vendor, role: "orchestrator", taskId: "task-1" },
+      });
+      expect(refused.statusCode, vendor).toBe(400);
+      expect(refused.json().message).toMatch(/root coordinator seat/i);
+      // Refused BEFORE the semaphore, so no seat is consumed or mutated.
+      expect(prismaMock.agent.findFirst).not.toHaveBeenCalled();
+      await app.close();
+    }
   });
 
   it("rejects an opencode claim for a role its adapter does not declare", async () => {

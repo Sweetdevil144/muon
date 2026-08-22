@@ -1,7 +1,8 @@
 import {
+  isDispatchableRole,
   GOVERNED_MCP_SERVER_NAME,
   isWriteClassTool,
-  isReadOnlyRole,
+  roleAuthorityOf,
   type AgentRole,
   type LaneCapabilities,
   type LaneEvent,
@@ -46,19 +47,45 @@ import {
  * permission-widening Cursor flag past the boundary.
  */
 
-/** The read-only crew roles managed Cursor may hold. */
-export const CURSOR_READ_ONLY_ROLES = [
+/**
+ * The crew roles managed Cursor may hold.
+ *
+ * `orchestrator` is here for the SEAT (ADR-0057), not as a widening: the
+ * registry invariant holds that a coordinator seat without the role is a seat
+ * nothing can occupy, and this adapter declaration is drift-locked against the
+ * registry, so the two move together or the lock fires. It is still a
+ * NON-WRITE ceiling — `orchestrator`'s authority is `coordinate`, it never
+ * edits, and `implementer` remains refused up front.
+ */
+// NAMED for what it is: the ceiling. It was `CURSOR_READ_ONLY_ROLES` until
+// ADR-0057 put `orchestrator` (authority `coordinate`) in it — at which point
+// the name asserted a property the list no longer had, to every importer, and
+// the scope sentence below had to filter the name back out to stay truthful.
+// ADR-0057 D4a records the same correction: this ceiling is non-write, not
+// read-only.
+export const CURSOR_SUPPORTED_ROLES = [
+  "orchestrator",
   "reviewer",
   "qa",
   "architect",
   "scout",
 ] as const satisfies readonly AgentRole[];
 
-const CURSOR_ROLE_SET: ReadonlySet<string> = new Set(CURSOR_READ_ONLY_ROLES);
+const CURSOR_ROLE_SET: ReadonlySet<string> = new Set(CURSOR_SUPPORTED_ROLES);
 
-/** Shown in health, and the refusal message for any role outside the slice. */
-export const CURSOR_READ_ONLY_SCOPE =
-  "Managed for read-only review roles only (reviewer, qa, architect, scout): MUON runs `cursor-agent --print --mode plan`, which never edits the workspace.";
+/**
+ * Shown in health, and the refusal message for any role outside the slice.
+ *
+ * RENDERED from the role list eight lines above rather than restated: that
+ * list gained `orchestrator` (the ADR-0057 seat) and this sentence went on
+ * describing the ceiling it used to have. The seat is named separately,
+ * because it is not a role Cursor can be dispatched work under.
+ */
+export const CURSOR_READ_ONLY_SCOPE = `Managed for read-only review roles only (${CURSOR_SUPPORTED_ROLES.filter(
+  (role) => isDispatchableRole(role)
+).join(
+  ", "
+)}): MUON runs \`cursor-agent --print --mode plan\`, which never edits the workspace. It may also hold MUON's coordinator seat, which coordinates a crew rather than doing the work.`;
 
 /** The exact recovery when no agent CLI is on PATH. */
 export const CURSOR_INSTALL_HINT =
@@ -441,7 +468,22 @@ function assertCursorRole(role: AgentRole | undefined): void {
   if (role === undefined) {
     return;
   }
-  if (!cursorSupportsRole(role) || !isReadOnlyRole(role)) {
+  // WRITE is what is refused, not "anything that is not read-only".
+  //
+  // The check used to be `!isReadOnlyRole(role)`, which also refused
+  // `orchestrator` — whose authority is `coordinate`, a third thing. That was
+  // harmless while Cursor held no seat and became a runtime failure the moment
+  // it did: `ensureCoordinatorAgent` creates a reserved coordinator lane per
+  // seated vendor, so a Cursor orchestrator turn would have been refused by
+  // its own adapter (ADR-0057).
+  //
+  // Admitting `coordinate` grants no write, and the reason is structural
+  // rather than a promise: this lane's enforcement is the ARGV, not the label
+  // — every permission-widening flag is stripped categorically, for every run,
+  // labelled or not. An orchestrator also never edits by construction; its
+  // whole prompt forbids touching the workspace. `implementer` and every other
+  // write role stay refused here, which is the ceiling this guard exists for.
+  if (!cursorSupportsRole(role) || roleAuthorityOf(role) === "write") {
     throw new CursorRoleRefusedError(role);
   }
 }
@@ -587,7 +629,7 @@ export class CursorAdapter extends BaseLaneAdapter {
   };
 
   /** The read-only slice, and nothing wider. */
-  readonly supportedRoles: readonly AgentRole[] = CURSOR_READ_ONLY_ROLES;
+  readonly supportedRoles: readonly AgentRole[] = CURSOR_SUPPORTED_ROLES;
 
   /**
    * Cursor's strength is reading an existing codebase and judging a diff, which

@@ -64,3 +64,36 @@ describe("the confirmation defaults to NO", () => {
     expect(confirmPrompt()).toContain("[y/N]");
   });
 });
+
+// The uninstaller used to print the PLAN as if it were the outcome, so a
+// machine that only had `muon-cli` was told `@muon/cli` had been removed too.
+// An uninstaller that overstates what it deleted is the last thing anyone can
+// independently check.
+describe("describePlan reports the real outcome", () => {
+  const plan = buildUninstallPlan({
+    dataDir: "/tmp/muon-data",
+    brainRunning: false,
+  });
+
+  it("names only the packages npm actually removed", () => {
+    const text = describePlan(plan, ["muon-cli"]);
+    expect(text).toContain("Removed: muon-cli");
+    expect(text).not.toContain("@muon/cli");
+  });
+
+  it("says plainly when npm removed nothing", () => {
+    const text = describePlan(plan, []);
+    expect(text).toContain("Removed: nothing");
+    expect(text).toContain("no MUON package was installed through npm");
+  });
+
+  it("still preserves the data dir, and still says why", () => {
+    const text = describePlan(plan, ["muon-cli"]);
+    expect(text).toContain("Kept:");
+    expect(text).toContain("/tmp/muon-data");
+  });
+
+  it("defaults to the plan only when no outcome is supplied", () => {
+    expect(describePlan(plan)).toContain(plan.remove.join(", "));
+  });
+});

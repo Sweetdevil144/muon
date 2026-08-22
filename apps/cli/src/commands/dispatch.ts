@@ -1,4 +1,5 @@
 import type { Command } from "commander";
+import { sessionSlug } from "@muon/protocol";
 import { MuonApiClient } from "../lib/api-client.js";
 import { printError, printJson } from "../lib/output.js";
 import { exitCodeForError, formatRefusal } from "../lib/refusal.js";
@@ -15,6 +16,57 @@ export function registerDispatchCommands(
   const dispatch = program
     .command("dispatch")
     .description("Inspect and control dispatched jobs (the governed crew)");
+
+  dispatch
+    .command("fork <sourceJobId>")
+    .description(
+      "Branch a NEW mission from a RECORDED step (a terminal job): fresh chat, fresh worktree seeded from the step's recorded state, authority and budgets re-derived — nothing copied (ADR-0044/0071)"
+    )
+    .requiredOption(
+      "--brief <text>",
+      "What the fork explores (becomes the new mission's root turn)"
+    )
+    .requiredOption("--vendor <vendor>", "Coordinator vendor for the fork's root")
+    .option("--title <title>", "Mission title (default: 'Fork of <step slug>')")
+    .option("--model <model>", "Per-dispatch model override for the root")
+    .option("--json", "Print as JSON")
+    .action(
+      async (
+        sourceJobId: string,
+        options: {
+          brief: string;
+          vendor: string;
+          title?: string;
+          model?: string;
+          json?: boolean;
+        }
+      ) => {
+        const client = createClient();
+        try {
+          const forked = await client.forkMission({
+            sourceJobId,
+            brief: options.brief,
+            vendor: options.vendor,
+            ...(options.title ? { title: options.title } : {}),
+            ...(options.model ? { model: options.model } : {}),
+          });
+          if (options.json) {
+            printJson(forked);
+            return;
+          }
+          process.stdout.write(
+            `Forked from ${sessionSlug(sourceJobId)} (${sourceJobId})\n` +
+              `  mission: ${forked.chat.title} (chat ${forked.chat.id})\n` +
+              `  root:    ${sessionSlug(forked.job.id)} (${forked.job.id}) on ${forked.job.vendor}\n` +
+              `  The worktree seeds from the step's RECORDED state at first claim;\n` +
+              `  budgets and authority were derived fresh — nothing crossed from the source.\n`
+          );
+        } catch (error) {
+          printError(formatRefusal(error, "dispatch fork"));
+          process.exitCode = exitCodeForError(error);
+        }
+      }
+    );
 
   dispatch
     .command("status")
@@ -42,7 +94,7 @@ export function registerDispatchCommands(
               return;
             }
             process.stdout.write(
-              `job ${job.id}\n` +
+              `job ${sessionSlug(job.id)} (${job.id})\n` +
                 `  status: ${job.status}   vendor: ${job.vendor}   kind: ${job.kind}\n` +
                 `  task:   ${job.taskId}\n` +
                 (job.parentJobId ? `  parent: ${job.parentJobId}\n` : "") +
@@ -74,8 +126,10 @@ export function registerDispatchCommands(
             return;
           }
           for (const job of active) {
+            // H10: the slug is speakable in a review; the id stays the
+            // grep/paste coordinate right beside it.
             process.stdout.write(
-              `${job.id}  ${job.status.padEnd(11)} ${job.vendor.padEnd(11)} task ${job.taskId}\n`
+              `${sessionSlug(job.id).padEnd(22)} ${job.id}  ${job.status.padEnd(11)} ${job.vendor.padEnd(11)} task ${job.taskId}\n`
             );
           }
         } catch (error) {

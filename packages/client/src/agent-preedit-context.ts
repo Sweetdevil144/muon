@@ -29,6 +29,7 @@ const MEMORY_KINDS = new Set([
   "convention",
   "attempt",
   "question",
+  "ownership",
 ]);
 const MEMORY_TRUST = new Set(["low", "medium", "high"]);
 const MEMORY_STATUS = new Set(["active", "rejected"]);
