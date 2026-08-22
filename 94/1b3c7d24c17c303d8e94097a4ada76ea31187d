@@ -1,0 +1,131 @@
+apps/cli/package-lock.json
+  s_9f23abc397c58c::t_c45a9dc792e120 3,9,14,26,49,64,73-85,117,127-129,144-146,161-163,178-180,195-197,212-214,229-231,246-248,263-265,280-282,297-299,314-316,331-333,348-350,365-367,382-384,399-401,416-418,433-435,450-452,467-469,484-486,501-503,518-520,535-537,552-554,587-590,1234-1236,1247-1272,1613-1619,1621-1625,1627,1630-1636,1638-1645,1647-1653,1656-1659,1661,1664-1670,1673-1676,1678-2697
+apps/cli/package.json
+  s_9f23abc397c58c::t_a1a564f409c48e 3,21
+apps/cli/scripts/bundle-release.mjs
+  s_9f23abc397c58c::t_4d4a78ec0dc40a 1,3-10,15,18,31-53,60-64,66-85,130-131,135,149-192,205-208,229-292,299-300,304-316,319-320,323-325
+apps/cli/scripts/lib/client-id-guard.mjs
+  s_9f23abc397c58c::t_be7ac20a51dcef 1-175
+apps/cli/src/commands/approve.ts
+  s_9f23abc397c58c::t_bbb31a706b0668 7-12,134-137,149,155,181-204,212,214,248-264,277-287
+apps/cli/src/commands/crew.ts
+  s_9f23abc397c58c::t_2aebef699d3ffd 5,13,142-143,231-246,459,463,466-474,477-481
+apps/cli/src/commands/dispatch.ts
+  s_9f23abc397c58c::t_6e129fc8210c55 2,20-70,97,129-130,132
+apps/cli/src/commands/docs.ts
+  s_9f23abc397c58c::t_ce9e1f7c8725ee 1-570
+apps/cli/src/commands/github.ts
+  s_9f23abc397c58c::t_d0c40819d5dcbc 4-7,23-26,75-78
+apps/cli/src/commands/graph.ts
+  s_9f23abc397c58c::t_cfd03a428b1523 1-279
+apps/cli/src/commands/login.ts
+  s_9f23abc397c58c::t_9665ae6dfcece2 1-378
+apps/cli/src/commands/mcp.ts
+  s_9f23abc397c58c::t_56e153cdddc5c6 7,39-42,61,205,230-269,558-567,576-580,587-588,590-594,598-608,611-616,640-704,709-717,720-733,735-739,746-768
+apps/cli/src/commands/memory.ts
+  s_9f23abc397c58c::t_cc9e0f7a259ce5 5-6,32,405-424,433-577,654,659,661-667,671,673,680-682,935,944,946-952,956,958,963,1078-1114
+apps/cli/src/commands/policy.ts
+  s_9f23abc397c58c::t_86265164768260 257-303,388,390-392,397-416,421
+apps/cli/src/commands/setup.ts
+  s_9f23abc397c58c::t_23fbe92075400e 13,16-17,41-42,66-73,82-83,87-113,116-122,138-140,142-144,208-210,219-224,355-360,366,399-402,408,414
+apps/cli/src/commands/uninstall.ts
+  s_9f23abc397c58c::t_8928838a3d33d6 90-92,94,96,105
+apps/cli/src/commands/update.ts
+  s_9f23abc397c58c::t_07d8373696ade7 5-12,52-55,57-65,67,69-72,75-77,79-81,88-94,96-102,105-113,116-117,119,123-127,129-227
+apps/cli/src/commands/wrap.ts
+  s_9f23abc397c58c::t_bb092d83b57db4 1-8,11,13-24,26-88
+apps/cli/src/index.ts
+  s_9f23abc397c58c::t_7a034ee26037ad 3,19-20,24,27,55,57-67,91-140,142,144-147,149-155,157-160,187-189,199,217-223,246
+apps/cli/src/lib/brain-commit.ts
+  s_9f23abc397c58c::t_85a64d260b2d8f 4,8-13,83-96,100,102,104,106-165,199-230
+apps/cli/src/lib/brain-exempt.ts
+  s_9f23abc397c58c::t_683baf0ea4bda4 1-2,4,6-12,14-18,22-23,25-35,37-45,48-62,64-65,67-79
+apps/cli/src/lib/desktop-update.ts
+  s_9f23abc397c58c::t_d4ca4def3b2cf9 1-435
+apps/cli/src/lib/device-code-prompt.ts
+  s_9f23abc397c58c::t_ab5ce1a34498c7 1-35,38-49,51-72,74-75,77-88,90-110,112-125,127,130-160,163-167,169-228
+apps/cli/src/lib/ensure-brain.ts
+  s_9f23abc397c58c::t_9d8683fdd5444c 9-35
+apps/cli/src/lib/gitnexus-analyze.ts
+  s_9f23abc397c58c::t_50ac1ab6eb8c15 1-3,5-20,23-27,29-94
+apps/cli/src/lib/identity-gate.ts
+  s_9f23abc397c58c::t_c171cf917130dc 1-214
+apps/cli/src/lib/memory-seed.ts
+  s_9f23abc397c58c::t_9b708e39be2d15 1-181
+apps/cli/src/lib/observatory.ts
+  s_9f23abc397c58c::t_7852e8264894ae 1-96
+apps/cli/src/lib/setup-wizard-run.ts
+  s_9f23abc397c58c::t_b579b4bf9663ec 1-336
+apps/cli/src/lib/setup-wizard.ts
+  s_9f23abc397c58c::t_83eda22c766892 1-304
+apps/cli/src/lib/uninstall-plan.ts
+  s_9f23abc397c58c::t_7306ff5478a1c1 61-78
+apps/cli/tests/approve-command.test.ts
+  s_9f23abc397c58c::t_48c19657fa15ef 184-320
+apps/cli/tests/baked-client-id-guard.test.ts
+  s_9f23abc397c58c::t_b2c4543d57ae76 1-221
+apps/cli/tests/brain-exempt.test.ts
+  s_9f23abc397c58c::t_243c4273c95df5 1,4-7,9-11,13-51,54-56,59-68,71-73
+apps/cli/tests/bundle-release-bins.test.ts
+  s_9f23abc397c58c::t_2d50ffb78eedcf 1-3,6-30,32-34,36-39,41-64,66-72,75-83,86-93,95-99,102-107,109-116,119-198,200-232,235-243,246-273,276-284,287-296
+apps/cli/tests/crew.test.ts
+  s_9f23abc397c58c::t_fc8aa4ad995796 239-261
+apps/cli/tests/desktop-update.test.ts
+  s_9f23abc397c58c::t_b248da4537878a 1-257
+apps/cli/tests/device-code-prompt.test.ts
+  s_9f23abc397c58c::t_d9b19b6869114e 1-8,10-37,41-48,51-53,56-59,63-66,70-115,118-153
+apps/cli/tests/docs-command.test.ts
+  s_9f23abc397c58c::t_2c4c1f5cfbd456 1-393
+apps/cli/tests/graph-command.test.ts
+  s_9f23abc397c58c::t_b83339f3bbacb0 1-363
+apps/cli/tests/identity-gate.test.ts
+  s_9f23abc397c58c::t_bc87aecf570a74 1-512
+apps/cli/tests/login-command.test.ts
+  s_9f23abc397c58c::t_0dafece6d2fdc2 1-516
+apps/cli/tests/mcp-attach.test.ts
+  s_9f23abc397c58c::t_569417d8550f14 13-32,42-47,56-61,108-113,255-258,276-304
+apps/cli/tests/mcp-install.test.ts
+  s_9f23abc397c58c::t_42c5fc98acb3e5 2,619,621-627,671,723-791
+apps/cli/tests/mcp-probe-timeout.test.ts
+  s_9f23abc397c58c::t_ebe9d8844c6737 2-8,30-164
+apps/cli/tests/mcp-status.test.ts
+  s_9f23abc397c58c::t_300f54c8cfad08 16,173-176,179-182,202-205,315,318,322,327,333,338
+apps/cli/tests/mcp-vendor-registry.test.ts
+  s_9f23abc397c58c::t_d39d0a69776cac 1-2,4-5,10,20-26,63-65,69-84,214-259
+apps/cli/tests/memory-command.test.ts
+  s_9f23abc397c58c::t_cbec323349c4e3 165,175,186,196,207-253
+apps/cli/tests/memory-pack.test.ts
+  s_9f23abc397c58c::t_c2999edea788b1 506-507,548
+apps/cli/tests/memory-seed.test.ts
+  s_9f23abc397c58c::t_0ee3a9b16153c3 4-10,12-16,24-27,30-54,56-58,61-62,64,66-86,88-98,100-116,118-121,123-140
+apps/cli/tests/memory-workspace-surface.test.ts
+  s_9f23abc397c58c::t_9ff7fda38b9b19 53,55,66,68,142,145,154,156,165,196-198
+apps/cli/tests/observatory.test.ts
+  s_9f23abc397c58c::t_ee694f3e279106 1-173
+apps/cli/tests/setup-command.test.ts
+  s_9f23abc397c58c::t_92f000cce0cb77 12,93-94,96,107,247-291
+apps/cli/tests/setup-wizard.test.ts
+  s_9f23abc397c58c::t_4250dc234a363e 4,7-23,26-29,44,46,49-51,55,57-58,63-74,78-79,81-82,86-94,97-99,101-105,107-113,116-119,124,128-135,137-143,146-170,172-195,197,200-203,207-213,216-222,225-235,239-246,248-261,263-276,279-286
+apps/cli/tests/uninstall-plan.test.ts
+  s_9f23abc397c58c::t_7713d5c5547cb5 67-99
+apps/cli/tests/update-command.test.ts
+  s_9f23abc397c58c::t_8568161475018c 1-167
+apps/cli/tests/wrap-command.test.ts
+  s_9f23abc397c58c::t_8f33ddf80c4cf9 1-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "941b3c7d24c17c303d8e94097a4ada76ea31187d",
+  "prompts": {},
+  "sessions": {
+    "s_9f23abc397c58c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f2ad7444-0262-4e41-8698-f20ffe0853ad",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Abhinav Pandey <abhinavpandey1230@gmail.com>"
+    }
+  }
+}
